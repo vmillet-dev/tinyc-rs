@@ -6,6 +6,13 @@ use std::path::Path;
 use tinyc::codegen::Target;
 use tinyc::diag::SourceFile;
 
+/// The examples these tests compile.
+///
+/// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
+/// things out by hand, so it is allowed to be broken at any time. Anything that
+/// should stay working belongs in its own example listed here.
+const EXAMPLES: [&str; 4] = ["arith.tc", "spill.tc", "reassign.tc", "bool.tc"];
+
 /// Compile an example and return the `line:col` of each diagnostic it produces.
 fn error_positions(file: &str) -> Vec<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/errors").join(file);
@@ -65,6 +72,13 @@ fn an_int_initializer_for_a_bool_points_at_the_initializer() {
 }
 
 #[test]
+fn a_reserved_word_cannot_be_used_as_a_variable_name() {
+    // `true` and `false` became keywords with the bool type, so they are no
+    // longer available as identifiers.
+    assert_error_at("reserved_word_as_name.tc", "1:6");
+}
+
+#[test]
 fn arithmetic_on_a_bool_points_at_the_bool_operand() {
     assert_error_at("bool_arithmetic.tc", "2:7");
 }
@@ -96,14 +110,14 @@ fn redeclaration_points_at_both_declarations() {
 /// the comments in them promise.
 #[test]
 fn the_working_examples_compile() {
-    for file in ["hello.tc", "arith.tc", "spill.tc", "reassign.tc", "bool.tc"] {
+    for file in EXAMPLES {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
         let text = std::fs::read_to_string(&path).unwrap();
         let compiled = tinyc::compile(&text, Target::X86_64Windows)
             .unwrap_or_else(|errors| panic!("{file} failed to compile: {errors:?}"));
 
-        assert!(compiled.asm.contains("main PROC"));
-        assert!(compiled.asm.contains("main ENDP"));
+        assert!(compiled.asm.contains("global main"));
+        assert!(compiled.asm.contains("section .text"));
         // Every pushed register must be popped again.
         assert_eq!(
             compiled.asm.matches("push ").count(),
@@ -118,7 +132,7 @@ fn the_working_examples_compile() {
 fn allocations_are_valid() {
     use tinyc::codegen::{backend_for, regalloc};
 
-    for file in ["hello.tc", "arith.tc", "spill.tc", "reassign.tc", "bool.tc"] {
+    for file in EXAMPLES {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
         let text = std::fs::read_to_string(&path).unwrap();
         let compiled = tinyc::compile(&text, Target::X86_64Windows).unwrap();

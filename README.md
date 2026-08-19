@@ -28,7 +28,7 @@ Each arrow is a module, and each stage can be inspected on its own with
 | type checking | [`src/sema.rs`](src/sema.rs) | the type of every expression |
 | lowering | [`src/ir.rs`](src/ir.rs) | three-address code over virtual registers |
 | register allocation | [`src/codegen/regalloc.rs`](src/codegen/regalloc.rs) | a machine register or stack slot per value |
-| emission | [`src/codegen/x64_win.rs`](src/codegen/x64_win.rs) | MASM assembly |
+| emission | [`src/codegen/x64_win.rs`](src/codegen/x64_win.rs) | NASM assembly |
 
 ```bash
 cargo run -- examples/hello.tc --emit tokens
@@ -66,20 +66,26 @@ Options:
 
 ## Building an executable
 
-`tinyc` emits assembly; `scripts/build.ps1` takes it the rest of the way using
-the Microsoft assembler and linker from a Visual Studio installation
-(`ml64` + `link`, with the "Desktop development with C++" workload installed):
+The emitted assembly is **NASM syntax**. `tinyc` stops there; `scripts/build.ps1`
+takes it the rest of the way with `nasm` and the Microsoft linker:
 
 ```powershell
 .\scripts\build.ps1 examples\hello.tc
 ```
 
-By hand, from a *x64 Native Tools Command Prompt*:
+You need `nasm` (`winget install nasm` — the script finds it even when winget
+does not add it to `PATH`) and a Visual Studio installation with the "Desktop
+development with C++" workload, for `link.exe` and the CRT import libraries.
+
+By hand, with `link` on `PATH` from a *x64 Native Tools Command Prompt*:
 
 ```
-ml64 /c /Fo out\hello.obj out\hello.asm
+nasm -f win64 -o out\hello.obj out\hello.asm
 link /subsystem:console /entry:mainCRTStartup /out:out\hello.exe out\hello.obj msvcrt.lib legacy_stdio_definitions.lib
 ```
+
+`-f win64` produces a COFF object, which is exactly what `link.exe` expects — so
+NASM and the Microsoft linker work together without anything in between.
 
 `print` is compiled into a call to the C runtime's `printf`, which is why the
 CRT is linked in. `legacy_stdio_definitions.lib` provides `printf` as a real
