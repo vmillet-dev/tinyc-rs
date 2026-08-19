@@ -1,0 +1,14 @@
+// Exercises precedence, parentheses, unary minus and division.
+// Each nested product becomes a temporary that dies as soon as it is consumed,
+// so the register allocator reuses the same machine registers over and over.
+int a = 6;
+int b = 7;
+int c = 2;
+
+print(a + b * c);        // 6 + 14        = 20
+print((a + b) * c);      // 13 * 2        = 26
+print(-a + b);           // -6 + 7        = 1
+print(a * b - c * 100);  // 42 - 200      = -158
+print(a * b / c);        // 42 / 2        = 21
+print(100 / c / c);      // 50 / 2        = 25
+print(a * a + b * b + c * c);  // 36 + 49 + 4 = 89

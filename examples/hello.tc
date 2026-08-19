@@ -1,0 +1,6 @@
+// The sample program: typed variables, integer arithmetic and printing.
+int x = 10;
+int y = 20;
+string s = "Hello World";
+print(x + y);
+print(s);

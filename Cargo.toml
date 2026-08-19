@@ -3,4 +3,13 @@ name = "TinyC"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "tinyc"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tinyc"
+path = "src/main.rs"
+
 [dependencies]
+clap = { version = "4", features = ["derive"] }
