@@ -84,6 +84,7 @@ impl<'a> Parser<'a> {
         match self.peek().kind {
             TokenKind::KwInt => self.decl(Ty::Int),
             TokenKind::KwString => self.decl(Ty::Str),
+            TokenKind::KwBool => self.decl(Ty::Bool),
             TokenKind::KwPrint => self.print_stmt(),
             TokenKind::Ident(_) => self.assign(),
             _ => {
@@ -194,6 +195,7 @@ impl<'a> Parser<'a> {
         let kind = match &token.kind {
             TokenKind::Int(v) => ExprKind::Int(*v),
             TokenKind::Str(bytes) => ExprKind::Str(bytes.clone()),
+            TokenKind::Bool(v) => ExprKind::Bool(*v),
             TokenKind::Ident(name) => ExprKind::Var(name.clone()),
             TokenKind::LParen => {
                 let open = self.bump().span;
@@ -274,6 +276,15 @@ mod tests {
         assert_eq!(
             ast::dump(&program),
             "decl int x\n  int 1\nassign x\n  +\n    var x\n    int 2\n"
+        );
+    }
+
+    #[test]
+    fn parses_a_bool_declaration_and_assignment() {
+        let program = parse_src("bool ready = true;\nready = false;").unwrap();
+        assert_eq!(
+            ast::dump(&program),
+            "decl bool ready\n  bool true\nassign ready\n  bool false\n"
         );
     }
 

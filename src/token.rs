@@ -9,11 +9,13 @@ pub enum TokenKind {
     /// Decoded bytes of a string literal, without the surrounding quotes and
     /// without a NUL terminator.
     Str(Vec<u8>),
+    Bool(bool),
     Ident(String),
 
     // Keywords.
     KwInt,
     KwString,
+    KwBool,
     KwPrint,
 
     // Punctuation.
@@ -36,6 +38,7 @@ impl TokenKind {
         match self {
             TokenKind::Int(v) => format!("`{v}`"),
             TokenKind::Str(_) => "string literal".to_string(),
+            TokenKind::Bool(v) => format!("`{v}`"),
             TokenKind::Ident(name) => format!("`{name}`"),
             TokenKind::Eof => "end of file".to_string(),
             other => format!("`{}`", other.text()),
@@ -61,6 +64,8 @@ impl TokenKind {
             TokenKind::Str(_) => "string literal",
             TokenKind::Ident(_) => "identifier",
             TokenKind::Eof => "end of file",
+            TokenKind::KwBool => "bool",
+            TokenKind::Bool(_) => "boolean literal"
         }
     }
 }

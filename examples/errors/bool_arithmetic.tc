@@ -1,0 +1,2 @@
+bool ready = true;
+print(ready + 1);

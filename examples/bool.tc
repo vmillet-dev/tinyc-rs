@@ -1,0 +1,8 @@
+// Booleans: literals, variables, reassignment and printing.
+bool ready = true;
+bool done = false;
+print(ready);    // true
+print(done);     // false
+done = true;
+print(done);     // true
+print(false);    // a literal can be printed directly

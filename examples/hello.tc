@@ -4,4 +4,5 @@ int y = 20;
 string s = "Hello World";
 print(x + y);
 print(s);
-s = 20;
+bool isReady = true;
+print(isReady);

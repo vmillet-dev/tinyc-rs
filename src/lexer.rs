@@ -110,7 +110,10 @@ impl<'a> Lexer<'a> {
         match &self.src[start..self.offset()] {
             "int" => TokenKind::KwInt,
             "string" => TokenKind::KwString,
+            "bool" => TokenKind::KwBool,
             "print" => TokenKind::KwPrint,
+            "true" => TokenKind::Bool(true),
+            "false" => TokenKind::Bool(false),
             name => TokenKind::Ident(name.to_string()),
         }
     }
@@ -241,6 +244,29 @@ mod tests {
     #[test]
     fn decodes_escapes() {
         assert_eq!(kinds(r#""a\n\"b""#), vec![TokenKind::Str(b"a\n\"b".to_vec()), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn lexes_the_bool_keyword_and_its_literals() {
+        assert_eq!(
+            kinds("bool b = true;"),
+            vec![
+                TokenKind::KwBool,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eq,
+                TokenKind::Bool(true),
+                TokenKind::Semi,
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(kinds("false"), vec![TokenKind::Bool(false), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn only_the_exact_spellings_are_reserved() {
+        // The keyword match runs on the whole identifier, not on a prefix.
+        assert_eq!(kinds("trueish"), vec![TokenKind::Ident("trueish".into()), TokenKind::Eof]);
+        assert_eq!(kinds("_true"), vec![TokenKind::Ident("_true".into()), TokenKind::Eof]);
     }
 
     #[test]

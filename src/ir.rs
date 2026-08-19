@@ -231,6 +231,7 @@ impl Lowering {
                 self.program.instrs.push(Instr::StrAddr { dst, id });
                 Value::Reg(dst)
             }
+            ExprKind::Bool(v) => Value::Const(i64::from(*v)),
             ExprKind::Var(name) => Value::Reg(self.vars[name]),
             // `-x` lowers to `0 - x`, which needs no separate instruction kind.
             ExprKind::Neg(operand) => {
@@ -341,6 +342,29 @@ mod tests {
                 "  3  print int %a\n",
             )
         );
+    }
+
+    #[test]
+    fn bools_lower_to_integer_constants() {
+        // A bool is just a 0 or a 1, so it needs no instruction of its own and
+        // the register allocator never has to know the type exists.
+        let ir = lower_src("bool ready = true;\nbool done = false;\nprint(ready);\nprint(done);");
+        assert_eq!(
+            ir.dump(),
+            concat!(
+                "  0  %ready = const 1\n",
+                "  1  %done = const 0\n",
+                "  2  print bool %ready\n",
+                "  3  print bool %done\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_printed_bool_literal_stays_an_immediate() {
+        let ir = lower_src("print(false);");
+        assert_eq!(ir.instrs.len(), 1);
+        assert!(matches!(ir.instrs[0], Instr::Print { ty: Ty::Bool, val: Value::Const(0) }));
     }
 
     #[test]

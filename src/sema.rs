@@ -127,6 +127,7 @@ impl Checker {
         let ty = match &expr.kind {
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Str(_) => Ty::Str,
+            ExprKind::Bool(_) => Ty::Bool,
             ExprKind::Var(name) => match self.scope.get(name) {
                 Some((ty, _)) => *ty,
                 None => {
@@ -252,6 +253,44 @@ mod tests {
         let errors = check_src("nope = 1;").unwrap_err();
         assert!(errors[0].message.contains("undeclared variable `nope`"));
         assert_eq!(errors[0].span, Span::new(0, 4));
+    }
+
+    #[test]
+    fn accepts_bool_declarations_assignment_and_printing() {
+        assert!(check_src("bool ready = true;\nready = false;\nprint(ready);").is_ok());
+        assert!(check_src("print(true);").is_ok());
+    }
+
+    #[test]
+    fn rejects_an_int_initializer_for_a_bool() {
+        let errors = check_src("bool ready = 1;").unwrap_err();
+        assert!(errors[0].message.contains("cannot initialize"), "{}", errors[0].message);
+        assert_eq!(errors[0].span, Span::new(13, 1));
+    }
+
+    #[test]
+    fn rejects_a_bool_initializer_for_an_int() {
+        let errors = check_src("int n = true;").unwrap_err();
+        assert!(errors[0].message.contains("cannot initialize"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_assigning_a_bool_to_a_string() {
+        let errors = check_src("string s = \"hi\";\ns = true;").unwrap_err();
+        assert!(errors[0].message.contains("cannot assign"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_arithmetic_on_bools() {
+        let errors = check_src("bool ready = true;\nprint(ready + 1);").unwrap_err();
+        assert!(errors[0].message.contains("cannot apply `+`"), "{}", errors[0].message);
+        assert_eq!(errors[0].span, Span::new(25, 5)); // the `ready` operand
+    }
+
+    #[test]
+    fn rejects_negating_a_bool() {
+        let errors = check_src("bool ready = true;\nprint(-ready);").unwrap_err();
+        assert!(errors[0].message.contains("cannot apply `-`"), "{}", errors[0].message);
     }
 
     #[test]

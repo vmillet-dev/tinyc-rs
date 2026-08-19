@@ -9,6 +9,8 @@ pub enum Ty {
     Int,
     /// Pointer to NUL-terminated static bytes.
     Str,
+    ///
+    Bool
 }
 
 impl Ty {
@@ -16,6 +18,7 @@ impl Ty {
         match self {
             Ty::Int => "int",
             Ty::Str => "string",
+            Ty::Bool => "bool"
         }
     }
 
@@ -24,6 +27,7 @@ impl Ty {
         match self {
             Ty::Int => "an `int`",
             Ty::Str => "a `string`",
+            Ty::Bool => "a `boolean`"
         }
     }
 }
@@ -70,6 +74,7 @@ pub struct Expr {
 pub enum ExprKind {
     Int(i64),
     Str(Vec<u8>),
+    Bool(bool),
     Var(String),
     /// Unary minus; the only unary operator in v0.
     Neg(Box<Expr>),
@@ -134,6 +139,7 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
         ExprKind::Str(bytes) => {
             out.push_str(&format!("{pad}string {:?}\n", String::from_utf8_lossy(bytes)))
         }
+        ExprKind::Bool(v) => out.push_str(&format!("{pad}bool {v}\n")),
         ExprKind::Var(name) => out.push_str(&format!("{pad}var {name}\n")),
         ExprKind::Neg(operand) => {
             out.push_str(&format!("{pad}neg\n"));

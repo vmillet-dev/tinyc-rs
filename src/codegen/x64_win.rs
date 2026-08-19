@@ -42,6 +42,9 @@ const SCRATCH1: &str = "r11";
 
 const FMT_INT: &str = "fmt_int";
 const FMT_STR: &str = "fmt_str";
+const FMT_BOOL: &str = "fmt_bool";
+const BOOL_TRUE: &str = "bool_true";
+const BOOL_FALSE: &str = "bool_false";
 
 /// Bytes of shadow space every caller must reserve on Windows.
 const SHADOW_SPACE: u32 = 32;
@@ -180,6 +183,11 @@ impl<'a> Emitter<'a> {
         if self.uses_format(Ty::Str) {
             self.asm(&format!("{FMT_STR} db \"%s\", 10, 0"));
         }
+        if self.uses_format(Ty::Bool) {
+            self.asm(&format!("{FMT_BOOL} db \"%s\", 10, 0"));
+            self.asm(&format!("{BOOL_TRUE} db \"true\", 0"));
+            self.asm(&format!("{BOOL_FALSE} db \"false\", 0"));
+        }
         for (index, bytes) in program.strings.iter().enumerate() {
             // Emitting raw bytes avoids every MASM string-quoting corner case.
             let values: Vec<String> = bytes
@@ -286,8 +294,21 @@ impl<'a> Emitter<'a> {
                 // Load the value first: the format string is a constant, so it
                 // can never be clobbered by the argument move.
                 let value = self.value(val, frame);
-                self.mov(RDX, &value);
-                let format = if *ty == Ty::Int { FMT_INT } else { FMT_STR };
+                match ty {
+                    Ty::Bool => {
+                        self.mov(SCRATCH0, &value);
+                        self.asm(&format!("lea  {RDX}, {BOOL_FALSE}"));
+                        self.asm(&format!("lea  {SCRATCH1}, {BOOL_TRUE}"));
+                        self.asm(&format!("test {SCRATCH0}, {SCRATCH0}"));
+                        self.asm(&format!("cmovnz {RDX}, {SCRATCH1}"));
+                    }
+                    _ => self.mov(RDX, &value),
+                }
+                let format = match ty {
+                    Ty::Int => FMT_INT,
+                    Ty::Str => FMT_STR,
+                    Ty::Bool => FMT_BOOL,
+                };
                 self.asm(&format!("lea  {RCX}, {format}"));
                 self.asm("call printf");
             }
@@ -482,6 +503,43 @@ mod tests {
         let asm = compile("print(1 + 2);");
         assert!(!asm.contains("push"), "{asm}");
         assert!(asm.contains("sub  rsp, 40"), "{asm}");
+    }
+
+    #[test]
+    fn printing_a_bool_picks_its_text_without_branching() {
+        let asm = compile("bool ready = true;\nprint(ready);");
+        // `false` is loaded first and overwritten only when the value is not 0.
+        assert!(asm.contains("lea  rdx, bool_false"), "{asm}");
+        assert!(asm.contains("lea  r11, bool_true"), "{asm}");
+        assert!(asm.contains("cmovnz rdx, r11"), "{asm}");
+        assert!(asm.contains("lea  rcx, fmt_bool"), "{asm}");
+        // A conditional move, not a jump: the backend has no labels.
+        assert!(!asm.contains("jmp"), "{asm}");
+        assert!(!asm.contains("jnz"), "{asm}");
+    }
+
+    #[test]
+    fn a_bool_literal_reaches_a_register_before_being_tested() {
+        // `test` has no form that takes an immediate on both sides, so a
+        // literal has to be materialised into the scratch register first.
+        let asm = compile("print(true);");
+        assert!(asm.contains("mov  r10, 1"), "{asm}");
+        assert!(asm.contains("test r10, r10"), "{asm}");
+    }
+
+    #[test]
+    fn bool_data_is_emitted_only_when_a_bool_is_printed() {
+        let with_bool = compile("print(true);");
+        assert!(with_bool.contains("fmt_bool db \"%s\", 10, 0"), "{with_bool}");
+        assert!(with_bool.contains("bool_true db \"true\", 0"), "{with_bool}");
+        assert!(with_bool.contains("bool_false db \"false\", 0"), "{with_bool}");
+
+        // A bool-free program must not carry the strings, and a bool-only
+        // program must not depend on the string format it never emits.
+        let without = compile("print(1 + 2);");
+        assert!(!without.contains("bool_true"), "{without}");
+        assert!(!without.contains("fmt_bool"), "{without}");
+        assert!(!with_bool.contains("fmt_str"), "{with_bool}");
     }
 
     #[test]

@@ -60,6 +60,16 @@ fn division_by_zero_points_at_the_divisor() {
 }
 
 #[test]
+fn an_int_initializer_for_a_bool_points_at_the_initializer() {
+    assert_error_at("bool_type_mismatch.tc", "1:14");
+}
+
+#[test]
+fn arithmetic_on_a_bool_points_at_the_bool_operand() {
+    assert_error_at("bool_arithmetic.tc", "2:7");
+}
+
+#[test]
 fn assigning_the_wrong_type_points_at_the_value() {
     assert_error_at("assign_wrong_type.tc", "2:9");
 }
@@ -86,7 +96,7 @@ fn redeclaration_points_at_both_declarations() {
 /// the comments in them promise.
 #[test]
 fn the_working_examples_compile() {
-    for file in ["hello.tc", "arith.tc", "spill.tc", "reassign.tc"] {
+    for file in ["hello.tc", "arith.tc", "spill.tc", "reassign.tc", "bool.tc"] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
         let text = std::fs::read_to_string(&path).unwrap();
         let compiled = tinyc::compile(&text, Target::X86_64Windows)
@@ -108,7 +118,7 @@ fn the_working_examples_compile() {
 fn allocations_are_valid() {
     use tinyc::codegen::{backend_for, regalloc};
 
-    for file in ["hello.tc", "arith.tc", "spill.tc", "reassign.tc"] {
+    for file in ["hello.tc", "arith.tc", "spill.tc", "reassign.tc", "bool.tc"] {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
         let text = std::fs::read_to_string(&path).unwrap();
         let compiled = tinyc::compile(&text, Target::X86_64Windows).unwrap();
