@@ -88,14 +88,24 @@ impl Allocation {
 
     /// Render intervals and assignments for `--dump-regalloc`.
     pub fn dump(&self, program: &Program, rf: &RegisterFile) -> String {
-        let mut out = String::from("vreg  live range   across call  location\n");
+        // Names grow with reassignment (`%n`, `%n.1`, ...), so size the first
+        // column to the widest one.
+        let width = self
+            .intervals
+            .iter()
+            .map(|i| program.name_of(i.vreg).len() + 2)
+            .chain(std::iter::once(6))
+            .max()
+            .unwrap_or(6);
+
+        let mut out = format!("{:<width$}live range   across call  location\n", "vreg");
         for interval in &self.intervals {
             let location = match self.location(interval.vreg) {
                 Location::Reg(reg) => rf.name(reg).to_string(),
                 Location::Spill(slot) => format!("spill slot {slot}"),
             };
             out.push_str(&format!(
-                "{:<6}[{:>2}, {:>2}]{:>10}  {:>10}\n",
+                "{:<width$}[{:>2}, {:>2}]{:>10}  {:>10}\n",
                 format!("%{}", program.name_of(interval.vreg)),
                 interval.start,
                 interval.end,

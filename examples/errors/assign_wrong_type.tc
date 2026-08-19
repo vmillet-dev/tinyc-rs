@@ -1,0 +1,3 @@
+int count = 1;
+count = "many";
+print(count);

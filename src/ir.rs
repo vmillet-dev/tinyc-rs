@@ -143,30 +143,21 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
     let mut lowering = Lowering {
         program: Program { instrs: Vec::new(), strings: Vec::new(), vreg_names: Vec::new() },
         vars: HashMap::new(),
+        versions: HashMap::new(),
     };
 
     for stmt in &ast.stmts {
         match stmt {
             Stmt::Decl { name, init, .. } => {
-                let value = lowering.expr(init);
-                // Give the variable a register of its own unless the initializer
-                // already produced one (`int b = a;` simply shares `a`'s value).
-                let reg = match value {
-                    Value::Reg(reg) => {
-                        // The initializer's result register becomes the
-                        // variable's home; rename it so dumps read `%s` and not
-                        // `%t2`, unless it is another variable's register.
-                        if !lowering.vars.values().any(|&v| v == reg) {
-                            lowering.program.vreg_names[reg.0 as usize] = name.clone();
-                        }
-                        reg
-                    }
-                    Value::Const(val) => {
-                        let dst = lowering.fresh(name);
-                        lowering.program.instrs.push(Instr::Const { dst, val });
-                        dst
-                    }
-                };
+                let reg = lowering.bind(name, init);
+                lowering.vars.insert(name.clone(), reg);
+            }
+            // Assignment is renaming: the variable starts pointing at a new
+            // virtual register, so every register still has exactly one
+            // definition and live intervals stay exact. With no control flow
+            // this is all the SSA construction the IR needs.
+            Stmt::Assign { name, value, .. } => {
+                let reg = lowering.bind(name, value);
                 lowering.vars.insert(name.clone(), reg);
             }
             Stmt::Print { value, .. } => {
@@ -182,8 +173,11 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
 
 struct Lowering {
     program: Program,
-    /// Variable name -> the virtual register holding its value.
+    /// Variable name -> the virtual register currently holding its value.
     vars: HashMap<String, VReg>,
+    /// How many times each variable has been written, so successive values can
+    /// be told apart in dumps: `%s`, then `%s.1`, then `%s.2`.
+    versions: HashMap<String, u32>,
 }
 
 impl Lowering {
@@ -191,6 +185,32 @@ impl Lowering {
         let reg = VReg(self.program.vreg_names.len() as u32);
         self.program.vreg_names.push(name.to_string());
         reg
+    }
+
+    /// Lower `value` and return the virtual register that becomes `name`'s new
+    /// home.
+    fn bind(&mut self, name: &str, value: &Expr) -> VReg {
+        let version = self.versions.entry(name.to_string()).or_insert(0);
+        let label = if *version == 0 { name.to_string() } else { format!("{name}.{version}") };
+        *version += 1;
+
+        match self.expr(value) {
+            // The expression already produced a register: adopt it as the
+            // variable's home and relabel it, so dumps read `%s` rather than
+            // `%t2`. A register that is some *other* variable's home is left
+            // alone — `int b = a;` simply shares `a`'s value.
+            Value::Reg(reg) => {
+                if !self.vars.values().any(|&v| v == reg) {
+                    self.program.vreg_names[reg.0 as usize] = label;
+                }
+                reg
+            }
+            Value::Const(val) => {
+                let dst = self.fresh(&label);
+                self.program.instrs.push(Instr::Const { dst, val });
+                dst
+            }
+        }
     }
 
     /// Temporaries are named after their own index, so `%t3` is always virtual
@@ -283,6 +303,44 @@ mod tests {
             ir.instrs[0],
             Instr::Bin { lhs: Value::Const(1), rhs: Value::Const(2), .. }
         ));
+    }
+
+    #[test]
+    fn assignment_gives_the_variable_a_new_register() {
+        let ir = lower_src("int n = 1;\nprint(n);\nn = n + 10;\nprint(n);");
+        assert_eq!(
+            ir.dump(),
+            concat!(
+                "  0  %n = const 1\n",
+                "  1  print int %n\n",
+                "  2  %n.1 = add %n, 10\n",
+                "  3  print int %n.1\n",
+            )
+        );
+
+        // Every virtual register still has exactly one definition, which is what
+        // keeps the live intervals exact.
+        let mut defined = std::collections::HashSet::new();
+        for instr in &ir.instrs {
+            if let Some(dst) = instr.def() {
+                assert!(defined.insert(dst), "{dst:?} is defined twice");
+            }
+        }
+    }
+
+    #[test]
+    fn assignment_does_not_disturb_a_variable_copied_from_it() {
+        // `b` took `a`'s value, so reassigning `a` must leave `b` alone.
+        let ir = lower_src("int a = 1;\nint b = a;\na = 2;\nprint(a);\nprint(b);");
+        assert_eq!(
+            ir.dump(),
+            concat!(
+                "  0  %a = const 1\n",
+                "  1  %a.1 = const 2\n",
+                "  2  print int %a.1\n",
+                "  3  print int %a\n",
+            )
+        );
     }
 
     #[test]

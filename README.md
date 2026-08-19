@@ -89,8 +89,9 @@ symbol, since the UCRT headers normally supply it as an inline function.
 
 ```
 program := stmt*
-stmt    := decl | print
+stmt    := decl | assign | print
 decl    := ("int" | "string") IDENT "=" expr ";"
+assign  := IDENT "=" expr ";"
 print   := "print" "(" expr ")" ";"
 expr    := term (("+" | "-") term)*
 term    := unary (("*" | "/") unary)*
@@ -99,9 +100,34 @@ primary := INT | STRING | IDENT | "(" expr ")"
 ```
 
 `int` is a 64-bit signed integer, `string` is a pointer to static bytes.
-Arithmetic is `int`-only, `//` starts a comment, and variables are declared with
-an initializer and never reassigned. There are deliberately no functions, loops
-or conditionals yet.
+Arithmetic is `int`-only, `//` starts a comment, and a variable keeps the type
+it was declared with — assigning a `string` to an `int` is an error. There are
+deliberately no functions, loops or conditionals yet.
+
+### Reassignment
+
+A variable can be given a new value ([`examples/reassign.tc`](examples/reassign.tc)):
+
+```c
+int n = 1;
+n = n + 41;
+print(n);      // 42
+```
+
+In the IR this becomes *renaming* rather than mutation — each assignment
+introduces a fresh virtual register and the variable starts pointing at it:
+
+```
+  0  %n = const 1
+  1  %n.1 = add %n, 41
+  2  print int %n.1
+```
+
+Every virtual register therefore still has exactly one definition, which is what
+keeps live intervals exact and lets the allocator stay as simple as it is. With
+no control flow in the language, that is all the SSA construction the IR needs.
+It also means `%n` and `%n.1` are independent values, so the allocator is free
+to put the new one wherever the old one just died.
 
 ## Errors
 

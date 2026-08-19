@@ -79,6 +79,44 @@ impl Checker {
                     self.scope.insert(name.clone(), (*ty, *name_span));
                 }
             }
+            Stmt::Assign { name, name_span, value } => {
+                let actual = self.expr(value);
+                match self.scope.get(name) {
+                    // A variable keeps the type it was declared with.
+                    Some((declared, declared_span)) => {
+                        if actual != *declared {
+                            let (declared, declared_span) = (*declared, *declared_span);
+                            self.errors.push(
+                                Diagnostic::new(
+                                    format!(
+                                        "cannot assign {} value to {} variable",
+                                        actual.with_article(),
+                                        declared.with_article()
+                                    ),
+                                    value.span,
+                                )
+                                .with_label(format!(
+                                    "expected {}, found {}",
+                                    declared.name(),
+                                    actual.name()
+                                ))
+                                .with_note(
+                                    format!("`{name}` was declared here"),
+                                    Some(declared_span),
+                                ),
+                            );
+                        }
+                    }
+                    None => self.errors.push(
+                        Diagnostic::new(format!("undeclared variable `{name}`"), *name_span)
+                            .with_label("assign to it after declaring it")
+                            .with_note(
+                                format!("a declaration gives it a type, as in `int {name} = 0;`"),
+                                None,
+                            ),
+                    ),
+                }
+            }
             Stmt::Print { value, .. } => {
                 self.expr(value);
             }
@@ -193,6 +231,27 @@ mod tests {
         let errors = check_src("int x = 1;\nint x = 2;").unwrap_err();
         assert!(errors[0].message.contains("already declared"));
         assert_eq!(errors[0].note.as_ref().unwrap().1, Some(Span::new(4, 1)));
+    }
+
+    #[test]
+    fn accepts_assignment_of_the_declared_type() {
+        assert!(check_src("string s = \"a\";\ns = \"b\";\nprint(s);").is_ok());
+        assert!(check_src("int n = 1;\nn = n * 2;\nprint(n);").is_ok());
+    }
+
+    #[test]
+    fn rejects_assignment_of_the_wrong_type() {
+        let errors = check_src("int n = 1;\nn = \"two\";").unwrap_err();
+        assert!(errors[0].message.contains("cannot assign"), "{}", errors[0].message);
+        // The note points back at the declaration that fixed the type.
+        assert_eq!(errors[0].note.as_ref().unwrap().1, Some(Span::new(4, 1)));
+    }
+
+    #[test]
+    fn rejects_assignment_to_an_undeclared_variable() {
+        let errors = check_src("nope = 1;").unwrap_err();
+        assert!(errors[0].message.contains("undeclared variable `nope`"));
+        assert_eq!(errors[0].span, Span::new(0, 4));
     }
 
     #[test]

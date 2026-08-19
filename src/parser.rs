@@ -4,8 +4,9 @@
 //!
 //! ```text
 //! program := stmt*
-//! stmt    := decl | print
+//! stmt    := decl | assign | print
 //! decl    := ("int" | "string") IDENT "=" expr ";"
+//! assign  := IDENT "=" expr ";"
 //! print   := "print" "(" expr ")" ";"
 //! expr    := term (("+" | "-") term)*
 //! term    := unary (("*" | "/") unary)*
@@ -84,13 +85,14 @@ impl<'a> Parser<'a> {
             TokenKind::KwInt => self.decl(Ty::Int),
             TokenKind::KwString => self.decl(Ty::Str),
             TokenKind::KwPrint => self.print_stmt(),
+            TokenKind::Ident(_) => self.assign(),
             _ => {
                 let found = self.peek();
                 Err(Diagnostic::new(
                     format!("expected a statement, found {}", found.kind.describe()),
                     found.span,
                 )
-                .with_label("statements start with `int`, `string` or `print`"))
+                .with_label("statements start with `int`, `string`, `print` or a variable name"))
             }
         }
     }
@@ -113,6 +115,19 @@ impl<'a> Parser<'a> {
         let init = self.expr()?;
         self.expect(TokenKind::Semi)?;
         Ok(Stmt::Decl { ty, ty_span, name, name_span, init })
+    }
+
+    fn assign(&mut self) -> PResult<Stmt> {
+        let token = self.bump();
+        let TokenKind::Ident(name) = &token.kind else {
+            unreachable!("only called when the next token is an identifier")
+        };
+        let (name, name_span) = (name.clone(), token.span);
+
+        self.expect(TokenKind::Eq)?;
+        let value = self.expr()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(Stmt::Assign { name, name_span, value })
     }
 
     fn print_stmt(&mut self) -> PResult<Stmt> {
@@ -251,6 +266,15 @@ mod tests {
     fn addition_is_left_associative() {
         let program = parse_src("print(1 - 2 - 3);").unwrap();
         assert_eq!(ast::dump(&program), "print\n  -\n    -\n      int 1\n      int 2\n    int 3\n");
+    }
+
+    #[test]
+    fn parses_an_assignment() {
+        let program = parse_src("int x = 1;\nx = x + 2;").unwrap();
+        assert_eq!(
+            ast::dump(&program),
+            "decl int x\n  int 1\nassign x\n  +\n    var x\n    int 2\n"
+        );
     }
 
     #[test]

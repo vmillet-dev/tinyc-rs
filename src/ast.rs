@@ -85,6 +85,12 @@ pub enum Stmt {
         name_span: Span,
         init: Expr,
     },
+    /// Assignment to an already declared variable.
+    Assign {
+        name: String,
+        name_span: Span,
+        value: Expr,
+    },
     Print {
         /// Span of the `print` keyword, for diagnostics about the statement.
         span: Span,
@@ -107,6 +113,10 @@ pub fn dump(program: &Program) -> String {
             Stmt::Decl { ty, name, init, .. } => {
                 out.push_str(&format!("decl {} {name}\n", ty.name()));
                 dump_expr(&mut out, init, 1);
+            }
+            Stmt::Assign { name, value, .. } => {
+                out.push_str(&format!("assign {name}\n"));
+                dump_expr(&mut out, value, 1);
             }
             Stmt::Print { value, .. } => {
                 out.push_str("print\n");

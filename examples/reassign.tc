@@ -1,0 +1,11 @@
+// Variables can be reassigned, as long as the new value keeps their type.
+int n = 1;
+string label = "counting up:";
+print(label);
+print(n);
+n = n + 41;      // reads the old value, then becomes the new one
+print(n);        // 42
+n = n * n;
+print(n);        // 1764
+label = "done";
+print(label);
