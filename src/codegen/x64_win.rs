@@ -22,9 +22,9 @@
 //! Keeping the ABI-critical registers out of the allocator's hands is what lets
 //! the allocator stay target-independent: it only ever sees the last two rows.
 
-use crate::ast::{BinOp, Ty};
+use crate::ast::{BinOp, CmpOp, Ty};
 use crate::codegen::{Allocation, Backend, Location, PhysReg, RegisterFile};
-use crate::ir::{Instr, Program, VReg, Value};
+use crate::ir::{Block, Instr, Program, Terminator, VReg, Value};
 
 /// Register numbers follow the usual x86-64 encoding order.
 const NAMES: [&str; 16] = [
@@ -39,6 +39,8 @@ const RDX: &str = "rdx";
 const SCRATCH0: &str = "r10";
 /// Holds an immediate or divisor that cannot be an instruction operand.
 const SCRATCH1: &str = "r11";
+/// The low byte of [`SCRATCH1`], which is where `setcc` deposits its result.
+const SCRATCH1_8: &str = "r11b";
 
 const FMT_INT: &str = "fmt_int";
 const FMT_STR: &str = "fmt_str";
@@ -112,16 +114,47 @@ impl<'a> Emitter<'a> {
         self.line("main:");
         self.prologue(&frame);
 
-        for instr in &program.instrs {
+        for (index, block) in program.blocks.iter().enumerate() {
             self.blank();
-            let described = self.describe(instr);
-            self.comment(&described);
-            self.instr(instr, &frame);
+            self.line(&format!(".{}:", block.label));
+            for instr in &block.instrs {
+                let described = self.describe(instr);
+                self.comment(&described);
+                self.instr(instr, &frame);
+            }
+            self.terminator(block, index, &frame);
         }
-
-        self.blank();
-        self.epilogue(&frame);
         self.out
+    }
+
+    /// Emit a block's exit. A jump to the very next block is left out: control
+    /// simply falls through.
+    fn terminator(&mut self, block: &Block, index: usize, frame: &FrameLayout) {
+        let next = index + 1;
+        match &block.term {
+            Terminator::Jump(target) => {
+                let label = self.program.block(*target).label.clone();
+                if target.0 as usize != next {
+                    self.comment(&format!("jump {label}"));
+                    self.asm(&format!("jmp  .{label}"));
+                }
+            }
+            Terminator::Branch { cond, then_blk, else_blk } => {
+                let then_label = self.program.block(*then_blk).label.clone();
+                let else_label = self.program.block(*else_blk).label.clone();
+                self.comment(&format!("branch to {then_label} or {else_label}"));
+
+                // `test` needs a register, and the condition may be a literal.
+                let cond = self.value(cond, frame);
+                self.mov(SCRATCH0, &cond);
+                self.asm(&format!("test {SCRATCH0}, {SCRATCH0}"));
+                self.asm(&format!("jz   .{else_label}"));
+                if then_blk.0 as usize != next {
+                    self.asm(&format!("jmp  .{then_label}"));
+                }
+            }
+            Terminator::Return => self.epilogue(frame),
+        }
     }
 
     // -- output helpers ----------------------------------------------------
@@ -203,8 +236,9 @@ impl<'a> Emitter<'a> {
 
     fn uses_format(&self, ty: Ty) -> bool {
         self.program
-            .instrs
+            .blocks
             .iter()
+            .flat_map(|block| &block.instrs)
             .any(|instr| matches!(instr, Instr::Print { ty: t, .. } if *t == ty))
     }
 
@@ -257,6 +291,25 @@ impl<'a> Emitter<'a> {
             Instr::StrAddr { dst, id } => {
                 let work = self.work_reg(*dst, false);
                 self.asm(&format!("lea  {work}, [str{}]", id.0));
+                self.store_back(*dst, &work, frame);
+            }
+            Instr::Copy { dst, src } => {
+                let src = self.value(src, frame);
+                let work = self.work_reg(*dst, false);
+                self.mov(&work, &src);
+                self.store_back(*dst, &work, frame);
+            }
+            // `cmp` sets the flags; `setcc` turns the one that matters into a
+            // 0 or 1 byte, and `movzx` widens it to the 64-bit value a bool is.
+            Instr::Cmp { op, dst, lhs, rhs } => {
+                let lhs = self.value(lhs, frame);
+                self.mov(SCRATCH0, &lhs);
+                let (rhs, _) = self.operand_for_alu(rhs, frame);
+                self.asm(&format!("cmp  {SCRATCH0}, {rhs}"));
+                self.asm(&format!("{} {SCRATCH1_8}", setcc(*op)));
+
+                let work = self.work_reg(*dst, false);
+                self.asm(&format!("movzx {work}, {SCRATCH1_8}"));
                 self.store_back(*dst, &work, frame);
             }
             Instr::Bin { op: BinOp::Div, dst, lhs, rhs } => self.division(*dst, lhs, rhs, frame),
@@ -413,7 +466,17 @@ impl<'a> Emitter<'a> {
             Instr::StrAddr { dst, id } => {
                 format!("%{} = &str{}", self.program.name_of(*dst), id.0)
             }
+            Instr::Copy { dst, src } => {
+                format!("%{} = {}", self.program.name_of(*dst), value(src))
+            }
             Instr::Bin { op, dst, lhs, rhs } => format!(
+                "%{} = {} {} {}",
+                self.program.name_of(*dst),
+                value(lhs),
+                op.symbol(),
+                value(rhs)
+            ),
+            Instr::Cmp { op, dst, lhs, rhs } => format!(
                 "%{} = {} {} {}",
                 self.program.name_of(*dst),
                 value(lhs),
@@ -422,6 +485,19 @@ impl<'a> Emitter<'a> {
             ),
             Instr::Print { ty, val } => format!("print {} {}", ty.name(), value(val)),
         }
+    }
+}
+
+/// The `setcc` variant that materialises each comparison. Signed, because
+/// `int` is signed.
+fn setcc(op: CmpOp) -> &'static str {
+    match op {
+        CmpOp::Eq => "sete",
+        CmpOp::Ne => "setne",
+        CmpOp::Lt => "setl",
+        CmpOp::Le => "setle",
+        CmpOp::Gt => "setg",
+        CmpOp::Ge => "setge",
     }
 }
 
@@ -540,6 +616,57 @@ mod tests {
         assert!(!without.contains("bool_true"), "{without}");
         assert!(!without.contains("fmt_bool"), "{without}");
         assert!(!with_bool.contains("fmt_str"), "{with_bool}");
+    }
+
+    #[test]
+    fn a_branch_tests_the_condition_and_jumps() {
+        let asm = compile("int n = 0;\nif (n < 1) {\n  print(1);\n} else {\n  print(2);\n}");
+        assert!(asm.contains(".then1:"), "{asm}");
+        assert!(asm.contains(".else2:"), "{asm}");
+        assert!(asm.contains(".join3:"), "{asm}");
+        assert!(asm.contains("jz   .else2"), "{asm}");
+        // The `then` block falls through to `else` unless it jumps past it.
+        assert!(asm.contains("jmp  .join3"), "{asm}");
+    }
+
+    #[test]
+    fn a_comparison_becomes_cmp_plus_setcc() {
+        let asm = compile("bool ok = 1 < 2;\nprint(ok);");
+        assert!(asm.contains("cmp  r10, 2"), "{asm}");
+        assert!(asm.contains("setl r11b"), "{asm}");
+        assert!(asm.contains("movzx"), "{asm}");
+    }
+
+    #[test]
+    fn each_comparison_picks_its_own_setcc() {
+        for (source, expected) in [
+            ("1 == 2", "sete"),
+            ("1 != 2", "setne"),
+            ("1 < 2", "setl"),
+            ("1 <= 2", "setle"),
+            ("1 > 2", "setg"),
+            ("1 >= 2", "setge"),
+        ] {
+            let asm = compile(&format!("bool ok = {source};\nprint(ok);"));
+            assert!(asm.contains(&format!("{expected} r11b")), "{source}: {asm}");
+        }
+    }
+
+    #[test]
+    fn a_loop_body_jumps_back_to_its_header() {
+        let asm = compile("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
+        assert!(asm.contains(".loop1:"), "{asm}");
+        assert!(asm.contains(".body2:"), "{asm}");
+        assert!(asm.contains("jmp  .loop1"), "{asm}");
+        assert!(asm.contains("jz   .done3"), "{asm}");
+    }
+
+    #[test]
+    fn a_jump_to_the_next_block_is_left_out() {
+        // `entry` is followed immediately by the loop header, so the jump
+        // between them is a fallthrough and must not be emitted.
+        let asm = compile("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
+        assert_eq!(asm.matches("jmp  .loop1").count(), 1, "{asm}");
     }
 
     #[test]

@@ -24,7 +24,7 @@
 //! replaces it — at the cost of one aliasing case the backend has to guard
 //! against (see `x64_win`'s `work_reg`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::{Program, VReg};
 
@@ -130,34 +130,152 @@ impl Allocation {
     }
 }
 
-/// Compute one live interval per virtual register, in order of definition.
-pub fn live_intervals(program: &Program) -> Vec<Interval> {
-    let mut start = vec![u32::MAX; program.vreg_count()];
-    let mut end = vec![0u32; program.vreg_count()];
+/// Where each block sits once the CFG is laid out as a flat instruction list.
+struct Layout {
+    /// Index of a block's first instruction.
+    start: Vec<u32>,
+    /// Index of a block's terminator, i.e. its last index.
+    end: Vec<u32>,
+    /// Indices of instructions that perform a call.
+    call_sites: Vec<u32>,
+}
 
-    for (index, instr) in program.instrs.iter().enumerate() {
-        let index = index as u32;
-        if let Some(dst) = instr.def() {
-            let slot = dst.0 as usize;
-            start[slot] = start[slot].min(index);
-            end[slot] = end[slot].max(index);
+impl Layout {
+    fn new(program: &Program) -> Layout {
+        let (mut start, mut end, mut call_sites) = (Vec::new(), Vec::new(), Vec::new());
+        let mut index = 0;
+        for block in &program.blocks {
+            start.push(index);
+            for instr in &block.instrs {
+                if instr.is_call() {
+                    call_sites.push(index);
+                }
+                index += 1;
+            }
+            end.push(index); // the terminator
+            index += 1;
         }
-        for used in instr.uses() {
-            end[used.0 as usize] = index;
+        Layout { start, end, call_sites }
+    }
+}
+
+/// Live-in and live-out sets, one per block.
+struct Liveness {
+    live_in: Vec<HashSet<VReg>>,
+    live_out: Vec<HashSet<VReg>>,
+}
+
+/// Which registers are live where, by backward dataflow over the CFG.
+///
+/// A single forward pass was enough while the program was one straight run of
+/// instructions, but a loop's back edge means a value can be live *before* the
+/// instruction that defines it is reached again. The standard answer is to
+/// iterate to a fixpoint:
+///
+/// ```text
+/// live_out(B) = union of live_in(S) for every successor S of B
+/// live_in(B)  = used_before_written(B) + (live_out(B) - written(B))
+/// ```
+fn liveness(program: &Program) -> Liveness {
+    let count = program.blocks.len();
+
+    // Per block: registers read before being written, and registers written.
+    let mut upward_exposed = vec![HashSet::new(); count];
+    let mut written = vec![HashSet::new(); count];
+    for (b, block) in program.blocks.iter().enumerate() {
+        for instr in &block.instrs {
+            for used in instr.uses() {
+                if !written[b].contains(&used) {
+                    upward_exposed[b].insert(used);
+                }
+            }
+            if let Some(def) = instr.def() {
+                written[b].insert(def);
+            }
+        }
+        for used in block.term.uses() {
+            if !written[b].contains(&used) {
+                upward_exposed[b].insert(used);
+            }
         }
     }
 
-    let call_sites: Vec<u32> = program
-        .instrs
-        .iter()
-        .enumerate()
-        .filter(|(_, instr)| instr.is_call())
-        .map(|(index, _)| index as u32)
-        .collect();
+    let mut live_in = vec![HashSet::new(); count];
+    let mut live_out: Vec<HashSet<VReg>> = vec![HashSet::new(); count];
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        // Blocks are emitted roughly in forward order, so walking backwards
+        // reaches the fixpoint in few passes.
+        for b in (0..count).rev() {
+            let mut out = HashSet::new();
+            for successor in program.blocks[b].term.successors() {
+                out.extend(live_in[successor.0 as usize].iter().copied());
+            }
+
+            let mut in_ = upward_exposed[b].clone();
+            in_.extend(out.iter().filter(|reg| !written[b].contains(reg)).copied());
+
+            if out != live_out[b] || in_ != live_in[b] {
+                live_out[b] = out;
+                live_in[b] = in_;
+                changed = true;
+            }
+        }
+    }
+
+    Liveness { live_in, live_out }
+}
+
+/// Compute one live interval per virtual register, in order of definition.
+///
+/// Intervals are contiguous ranges over the flattened block layout, which is a
+/// conservative approximation: a register live at the top and bottom of a loop
+/// is treated as live throughout, so it cannot be handed to anything else in
+/// between. That is exactly what a back edge requires.
+pub fn live_intervals(program: &Program) -> Vec<Interval> {
+    let layout = Layout::new(program);
+    let live = liveness(program);
+
+    let mut start = vec![u32::MAX; program.vreg_count()];
+    let mut end = vec![0u32; program.vreg_count()];
+    let mut seen = vec![false; program.vreg_count()];
+
+    let mut extend = |reg: VReg, at: u32, start: &mut Vec<u32>, end: &mut Vec<u32>| {
+        let slot = reg.0 as usize;
+        start[slot] = start[slot].min(at);
+        end[slot] = end[slot].max(at);
+        seen[slot] = true;
+    };
+
+    for (b, block) in program.blocks.iter().enumerate() {
+        // Live across the whole block boundary, so the interval must span it.
+        for &reg in &live.live_in[b] {
+            extend(reg, layout.start[b], &mut start, &mut end);
+        }
+        for &reg in &live.live_out[b] {
+            extend(reg, layout.end[b], &mut start, &mut end);
+        }
+
+        let mut index = layout.start[b];
+        for instr in &block.instrs {
+            if let Some(def) = instr.def() {
+                extend(def, index, &mut start, &mut end);
+            }
+            for used in instr.uses() {
+                extend(used, index, &mut start, &mut end);
+            }
+            index += 1;
+        }
+        for used in block.term.uses() {
+            extend(used, layout.end[b], &mut start, &mut end);
+        }
+    }
 
     let mut intervals: Vec<Interval> = (0..program.vreg_count() as u32)
         .map(VReg)
-        .filter(|reg| start[reg.0 as usize] != u32::MAX)
+        .filter(|reg| seen[reg.0 as usize])
         .map(|vreg| {
             let (start, end) = (start[vreg.0 as usize], end[vreg.0 as usize]);
             Interval {
@@ -165,7 +283,7 @@ pub fn live_intervals(program: &Program) -> Vec<Interval> {
                 start,
                 end,
                 // A value used *by* the call does not survive it.
-                crosses_call: call_sites.iter().any(|&call| start < call && call < end),
+                crosses_call: layout.call_sites.iter().any(|&call| start < call && call < end),
             }
         })
         .collect();
@@ -387,7 +505,7 @@ mod tests {
         let ir = ir_of("string s = \"hi\";\nprint(1 + 2);\nprint(s);");
         let rf = tiny_file();
         let allocation = allocate(&ir, &rf);
-        let s = ir.instrs.iter().find_map(|i| i.def()).unwrap();
+        let s = ir.blocks[0].instrs.iter().find_map(|i| i.def()).unwrap();
         assert!(live_intervals(&ir)[0].crosses_call);
         match allocation.location(s) {
             Location::Reg(reg) => assert!(rf.callee_saved.contains(&reg)),
@@ -405,6 +523,61 @@ mod tests {
         let allocation = allocate(&ir, &rf);
         assert_eq!(allocation.spill_slots, 0, "{}", allocation.dump(&ir, &rf));
         assert!(verify(&allocation, &rf).is_ok());
+    }
+
+    #[test]
+    fn a_loop_carried_value_stays_live_across_the_back_edge() {
+        // `i` is written at the bottom of the body and read at the top of the
+        // header, so its interval has to cover the whole loop even though the
+        // definition comes *after* the use in program order. A single forward
+        // pass would end its interval at the last instruction that mentions it.
+        let ir = ir_of("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
+        let intervals = live_intervals(&ir);
+        let i = intervals.iter().find(|interval| ir.name_of(interval.vreg) == "i").unwrap();
+
+        // The interval has to reach past the bottom of the body, where `i` is
+        // redefined, and back to the header that reads it again.
+        assert_eq!(i.start, 0, "`i` is defined before the loop");
+        assert!(
+            i.end > block_end(&ir, "body2"),
+            "`i` must outlive the loop body, got {i:?}"
+        );
+    }
+
+    /// Index of a block's terminator in the flattened layout.
+    fn block_end(program: &Program, label: &str) -> u32 {
+        let mut index = 0;
+        for block in &program.blocks {
+            index += block.instrs.len() as u32;
+            if block.label == label {
+                return index;
+            }
+            index += 1;
+        }
+        panic!("no block labelled {label}");
+    }
+
+    #[test]
+    fn a_temporary_inside_a_loop_does_not_escape_it() {
+        let ir = ir_of("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
+        let intervals = live_intervals(&ir);
+        let t = intervals.iter().find(|interval| ir.name_of(interval.vreg).starts_with('t')).unwrap();
+        // The comparison result is consumed by the branch in the same block.
+        assert!(t.end - t.start <= 1, "{t:?}");
+    }
+
+    #[test]
+    fn allocations_for_loops_are_valid() {
+        let rf = tiny_file();
+        for src in [
+            "int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);",
+            "int t = 0;\nfor (int i = 0; i < 4; i = i + 1) {\n  t = t + i;\n  print(t);\n}",
+            "int a = 1;\nif (a < 2) {\n  a = 2;\n} else {\n  a = 3;\n}\nprint(a);",
+        ] {
+            let ir = ir_of(src);
+            let allocation = allocate(&ir, &rf);
+            assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(&ir, &rf));
+        }
     }
 
     #[test]

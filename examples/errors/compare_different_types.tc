@@ -1,0 +1,3 @@
+int n = 1;
+string s = "one";
+print(n == s);

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr, ExprKind, NodeId, Program, Stmt, Ty};
+use crate::ast::{BinOp, Block, Expr, ExprKind, NodeId, Program, Stmt, Ty};
 use crate::diag::{Diagnostic, Result, Span};
 
 /// Type of every expression node, indexed by [`NodeId`].
@@ -28,7 +28,7 @@ pub fn check(program: &Program) -> Result<Types> {
         // `Int` is the recovery type: an expression that failed to check is
         // treated as an int so a single mistake does not cascade.
         types: Types { expr_ty: vec![Ty::Int; program.node_count] },
-        scope: HashMap::new(),
+        scopes: vec![HashMap::new()],
         errors: Vec::new(),
     };
 
@@ -45,12 +45,41 @@ pub fn check(program: &Program) -> Result<Types> {
 
 struct Checker {
     types: Types,
-    /// Variable name -> (type, span of its declaration).
-    scope: HashMap<String, (Ty, Span)>,
+    /// One map per open block, innermost last. A name is looked up from the
+    /// inside out, and a block's declarations disappear when it closes.
+    scopes: Vec<HashMap<String, (Ty, Span)>>,
     errors: Vec<Diagnostic>,
 }
 
 impl Checker {
+    /// The type and declaration span of a visible variable.
+    fn lookup(&self, name: &str) -> Option<(Ty, Span)> {
+        self.scopes.iter().rev().find_map(|scope| scope.get(name).copied())
+    }
+
+    fn block(&mut self, block: &Block) {
+        self.scopes.push(HashMap::new());
+        for stmt in &block.stmts {
+            self.stmt(stmt);
+        }
+        self.scopes.pop();
+    }
+
+    /// `if`, `while` and `for` all require a `bool` here.
+    fn condition(&mut self, cond: &Expr, keyword: &str) {
+        let ty = self.expr(cond);
+        if ty != Ty::Bool {
+            self.errors.push(
+                Diagnostic::new(
+                    format!("the condition of `{keyword}` must be a `bool`"),
+                    cond.span,
+                )
+                .with_label(format!("expected bool, found {}", ty.name()))
+                .with_note("comparisons like `i < 10` produce a bool", None),
+            );
+        }
+    }
+
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Decl { ty, name, name_span, init, .. } => {
@@ -69,23 +98,26 @@ impl Checker {
                     );
                 }
 
-                if let Some((_, previous)) = self.scope.get(name) {
+                // Only the innermost scope is consulted: an inner block may
+                // shadow an outer name, but may not declare the same one twice.
+                let innermost = self.scopes.last_mut().expect("a scope is always open");
+                if let Some((_, previous)) = innermost.get(name) {
+                    let previous = *previous;
                     self.errors.push(
                         Diagnostic::new(format!("`{name}` is already declared"), *name_span)
                             .with_label("declared a second time here")
-                            .with_note("previous declaration", Some(*previous)),
+                            .with_note("previous declaration", Some(previous)),
                     );
                 } else {
-                    self.scope.insert(name.clone(), (*ty, *name_span));
+                    innermost.insert(name.clone(), (*ty, *name_span));
                 }
             }
             Stmt::Assign { name, name_span, value } => {
                 let actual = self.expr(value);
-                match self.scope.get(name) {
+                match self.lookup(name) {
                     // A variable keeps the type it was declared with.
                     Some((declared, declared_span)) => {
-                        if actual != *declared {
-                            let (declared, declared_span) = (*declared, *declared_span);
+                        if actual != declared {
                             self.errors.push(
                                 Diagnostic::new(
                                     format!(
@@ -120,6 +152,28 @@ impl Checker {
             Stmt::Print { value, .. } => {
                 self.expr(value);
             }
+            Stmt::If { cond, then_block, else_block } => {
+                self.condition(cond, "if");
+                self.block(then_block);
+                if let Some(block) = else_block {
+                    self.block(block);
+                }
+            }
+            Stmt::While { cond, body } => {
+                self.condition(cond, "while");
+                self.block(body);
+            }
+            Stmt::For { init, cond, step, body } => {
+                // The initialiser's variable is visible to the condition, the
+                // step and the body, but not after the loop — so the whole
+                // `for` gets a scope of its own.
+                self.scopes.push(HashMap::new());
+                self.stmt(init);
+                self.condition(cond, "for");
+                self.stmt(step);
+                self.block(body);
+                self.scopes.pop();
+            }
         }
     }
 
@@ -128,8 +182,8 @@ impl Checker {
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Str(_) => Ty::Str,
             ExprKind::Bool(_) => Ty::Bool,
-            ExprKind::Var(name) => match self.scope.get(name) {
-                Some((ty, _)) => *ty,
+            ExprKind::Var(name) => match self.lookup(name) {
+                Some((ty, _)) => ty,
                 None => {
                     self.errors.push(
                         Diagnostic::new(format!("undeclared variable `{name}`"), expr.span)
@@ -181,12 +235,46 @@ impl Checker {
                 }
                 Ty::Int
             }
+            ExprKind::Cmp { op, lhs, rhs } => {
+                let lhs_ty = self.expr(lhs);
+                let rhs_ty = self.expr(rhs);
+
+                if lhs_ty != rhs_ty {
+                    self.errors.push(
+                        Diagnostic::new(
+                            format!(
+                                "cannot compare `{}` with `{}`",
+                                lhs_ty.name(),
+                                rhs_ty.name()
+                            ),
+                            rhs.span,
+                        )
+                        .with_label(format!("expected {}, found {}", lhs_ty.name(), rhs_ty.name())),
+                    );
+                } else if lhs_ty == Ty::Str || (lhs_ty == Ty::Bool && op.is_ordering()) {
+                    // `==` works on bools; ordering does not, and strings have
+                    // no comparison at all without a runtime routine.
+                    self.errors.push(
+                        Diagnostic::new(
+                            format!("`{}` values cannot be compared with `{}`", lhs_ty.name(), op.symbol()),
+                            expr.span,
+                        )
+                        .with_label(if lhs_ty == Ty::Str {
+                            "strings support no comparisons yet".to_string()
+                        } else {
+                            "bools only support `==` and `!=`".to_string()
+                        }),
+                    );
+                }
+                Ty::Bool
+            }
         };
 
         self.types.expr_ty[expr.id.0 as usize] = ty;
         ty
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -291,6 +379,61 @@ mod tests {
     fn rejects_negating_a_bool() {
         let errors = check_src("bool ready = true;\nprint(-ready);").unwrap_err();
         assert!(errors[0].message.contains("cannot apply `-`"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_comparison_produces_a_bool() {
+        assert!(check_src("bool ok = 1 < 2;\nprint(ok);").is_ok());
+        assert!(check_src("if (1 == 2) {\n  print(1);\n}").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_condition_that_is_not_a_bool() {
+        for src in ["if (1) {\n}", "while (1) {\n}", "for (int i = 0; i; i = i + 1) {\n}"] {
+            let errors = check_src(src).unwrap_err();
+            assert!(errors[0].message.contains("must be a `bool`"), "{src}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn rejects_comparing_different_types() {
+        let errors = check_src("string s = \"a\";\nprint(s == 1);").unwrap_err();
+        assert!(errors[0].message.contains("cannot compare"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_ordering_comparisons_that_make_no_sense() {
+        let bools = check_src("print(true < false);").unwrap_err();
+        assert!(bools[0].message.contains("cannot be compared"), "{}", bools[0].message);
+
+        let strings = check_src("print(\"a\" == \"b\");").unwrap_err();
+        assert!(strings[0].message.contains("cannot be compared"), "{}", strings[0].message);
+    }
+
+    #[test]
+    fn a_block_scopes_its_declarations() {
+        // `inner` does not survive the block it was declared in.
+        let errors = check_src("if (true) {\n  int inner = 1;\n}\nprint(inner);").unwrap_err();
+        assert!(errors[0].message.contains("undeclared variable `inner`"));
+    }
+
+    #[test]
+    fn an_inner_block_may_shadow_an_outer_name() {
+        assert!(check_src("int i = 1;\nif (true) {\n  string i = \"x\";\n  print(i);\n}\nprint(i);").is_ok());
+    }
+
+    #[test]
+    fn a_for_variable_does_not_escape_its_loop() {
+        assert!(check_src("for (int i = 0; i < 1; i = i + 1) {\n}\nfor (int i = 0; i < 1; i = i + 1) {\n}").is_ok());
+        let errors = check_src("for (int i = 0; i < 1; i = i + 1) {\n}\nprint(i);").unwrap_err();
+        assert!(errors[0].message.contains("undeclared variable `i`"));
+    }
+
+    #[test]
+    fn rejects_redeclaration_in_the_same_block_only() {
+        assert!(check_src("int x = 1;\nx = 2;\nprint(x);").is_ok());
+        let errors = check_src("int x = 1;\nint x = 2;").unwrap_err();
+        assert!(errors[0].message.contains("already declared"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 4] = ["arith.tc", "spill.tc", "reassign.tc", "bool.tc"];
+const EXAMPLES: [&str; 5] = ["arith.tc", "spill.tc", "reassign.tc", "bool.tc", "control_flow.tc"];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
 fn error_positions(file: &str) -> Vec<String> {
@@ -81,6 +81,21 @@ fn a_reserved_word_cannot_be_used_as_a_variable_name() {
 #[test]
 fn arithmetic_on_a_bool_points_at_the_bool_operand() {
     assert_error_at("bool_arithmetic.tc", "2:7");
+}
+
+#[test]
+fn a_non_bool_condition_points_at_the_condition() {
+    assert_error_at("non_bool_condition.tc", "2:8");
+}
+
+#[test]
+fn comparing_different_types_points_at_the_right_operand() {
+    assert_error_at("compare_different_types.tc", "3:12");
+}
+
+#[test]
+fn a_variable_used_outside_its_block_points_at_the_use() {
+    assert_error_at("out_of_scope.tc", "4:7");
 }
 
 #[test]

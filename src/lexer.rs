@@ -53,8 +53,26 @@ impl<'a> Lexer<'a> {
             let kind = match c {
                 '(' => self.single(TokenKind::LParen),
                 ')' => self.single(TokenKind::RParen),
+                '{' => self.single(TokenKind::LBrace),
+                '}' => self.single(TokenKind::RBrace),
                 ';' => self.single(TokenKind::Semi),
-                '=' => self.single(TokenKind::Eq),
+                // Two-character operators are recognised before their prefixes.
+                '=' => self.one_or_two('=', TokenKind::EqEq, TokenKind::Eq),
+                '<' => self.one_or_two('=', TokenKind::Le, TokenKind::Lt),
+                '>' => self.one_or_two('=', TokenKind::Ge, TokenKind::Gt),
+                '!' => {
+                    self.bump();
+                    if self.peek() == Some('=') {
+                        self.bump();
+                        TokenKind::BangEq
+                    } else {
+                        return Err(Diagnostic::new(
+                            "unexpected character `!`",
+                            Span::new(start, self.offset() - start),
+                        )
+                        .with_label("did you mean `!=`?"));
+                    }
+                }
                 '+' => self.single(TokenKind::Plus),
                 '-' => self.single(TokenKind::Minus),
                 '*' => self.single(TokenKind::Star),
@@ -80,6 +98,18 @@ impl<'a> Lexer<'a> {
     fn single(&mut self, kind: TokenKind) -> TokenKind {
         self.bump();
         kind
+    }
+
+    /// Consume a one-character token, or a two-character one when `second`
+    /// follows: this is what keeps `<=` from lexing as `<` then `=`.
+    fn one_or_two(&mut self, second: char, both: TokenKind, first: TokenKind) -> TokenKind {
+        self.bump();
+        if self.peek() == Some(second) {
+            self.bump();
+            both
+        } else {
+            first
+        }
     }
 
     fn skip_trivia(&mut self) {
@@ -112,6 +142,10 @@ impl<'a> Lexer<'a> {
             "string" => TokenKind::KwString,
             "bool" => TokenKind::KwBool,
             "print" => TokenKind::KwPrint,
+            "if" => TokenKind::KwIf,
+            "else" => TokenKind::KwElse,
+            "while" => TokenKind::KwWhile,
+            "for" => TokenKind::KwFor,
             "true" => TokenKind::Bool(true),
             "false" => TokenKind::Bool(false),
             name => TokenKind::Ident(name.to_string()),
@@ -260,6 +294,47 @@ mod tests {
             ]
         );
         assert_eq!(kinds("false"), vec![TokenKind::Bool(false), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn two_character_operators_win_over_their_prefixes() {
+        assert_eq!(
+            kinds("<= < == = >= > !="),
+            vec![
+                TokenKind::Le,
+                TokenKind::Lt,
+                TokenKind::EqEq,
+                TokenKind::Eq,
+                TokenKind::Ge,
+                TokenKind::Gt,
+                TokenKind::BangEq,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_lone_bang_is_an_error() {
+        // There is no `!` operator, so the only way `!` can appear is in `!=`.
+        let errors = lex("if (!x) { }").unwrap_err();
+        assert!(errors[0].message.contains("unexpected character `!`"));
+        assert_eq!(errors[0].span, Span::new(4, 1));
+    }
+
+    #[test]
+    fn lexes_control_flow_keywords_and_braces() {
+        assert_eq!(
+            kinds("if else while for { }"),
+            vec![
+                TokenKind::KwIf,
+                TokenKind::KwElse,
+                TokenKind::KwWhile,
+                TokenKind::KwFor,
+                TokenKind::LBrace,
+                TokenKind::RBrace,
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]

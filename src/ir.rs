@@ -1,25 +1,45 @@
 //! Stage 4: AST -> intermediate representation.
 //!
-//! The IR is straight-line three-address code over an unbounded supply of
-//! *virtual* registers. There is no control flow in v0, so the whole program is
-//! a single instruction vector and live ranges are plain intervals — which is
-//! exactly what [`crate::codegen::regalloc`] needs.
+//! The IR is three-address code over an unbounded supply of *virtual*
+//! registers, arranged as a **control flow graph**: a list of basic blocks,
+//! each a straight run of instructions ending in a terminator that names its
+//! successors.
 //!
-//! Every variable and every intermediate result gets its own virtual register,
-//! and (because v0 has no reassignment) each one is written exactly once.
+//! ## Why variables are not in SSA form
+//!
+//! Before control flow existed, each assignment could simply introduce a new
+//! virtual register (`%n`, `%n.1`, ...) and every register had exactly one
+//! definition. That breaks as soon as two paths can reach the same point:
+//!
+//! ```text
+//! if (c) { n = 1; } else { n = 2; }
+//! print(n);                          // which register is `n`?
+//! ```
+//!
+//! Answering that in SSA needs phi nodes. Instead a variable keeps **one**
+//! virtual register for its whole life and may be written many times, so both
+//! branches assign the same register and the join needs nothing. The cost is
+//! that live ranges can no longer be read off in one forward pass — see
+//! [`crate::codegen::regalloc`], which computes them with a dataflow analysis.
+//!
+//! Temporaries are still written exactly once each.
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Expr, ExprKind, Program as Ast, Stmt, Ty};
+use crate::ast::{BinOp, Block as AstBlock, CmpOp, Expr, ExprKind, Program as Ast, Stmt, Ty};
 use crate::sema::Types;
 
-/// A virtual register: an SSA-like value name, not yet a machine register.
+/// A virtual register: a value name, not yet a machine register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VReg(pub u32);
 
 /// Index into [`Program::strings`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StrId(pub u32);
+
+/// Index into [`Program::blocks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockId(pub u32);
 
 /// An instruction operand: either an immediate or a virtual register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,10 +54,51 @@ pub enum Instr {
     Const { dst: VReg, val: i64 },
     /// `dst = &strings[id]`
     StrAddr { dst: VReg, id: StrId },
+    /// `dst = src`
+    Copy { dst: VReg, src: Value },
     /// `dst = lhs op rhs`
     Bin { op: BinOp, dst: VReg, lhs: Value, rhs: Value },
-    /// The only call site in v0; clobbers the caller-saved registers.
+    /// `dst = (lhs op rhs)`, producing 0 or 1.
+    Cmp { op: CmpOp, dst: VReg, lhs: Value, rhs: Value },
+    /// The only call site, and so the only thing that clobbers caller-saved
+    /// registers.
     Print { ty: Ty, val: Value },
+}
+
+/// How a basic block ends. Every block has exactly one.
+#[derive(Clone, Debug)]
+pub enum Terminator {
+    Jump(BlockId),
+    /// Continue at `then_blk` when `cond` is non-zero, `else_blk` otherwise.
+    Branch { cond: Value, then_blk: BlockId, else_blk: BlockId },
+    /// Leave `main`. Lowering produces exactly one of these, in the last block.
+    Return,
+}
+
+impl Terminator {
+    pub fn successors(&self) -> Vec<BlockId> {
+        match self {
+            Terminator::Jump(target) => vec![*target],
+            Terminator::Branch { then_blk, else_blk, .. } => vec![*then_blk, *else_blk],
+            Terminator::Return => Vec::new(),
+        }
+    }
+
+    /// Virtual registers read by the terminator itself.
+    pub fn uses(&self) -> Vec<VReg> {
+        match self {
+            Terminator::Branch { cond: Value::Reg(reg), .. } => vec![*reg],
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Block {
+    /// Assembly label and dump name, e.g. `then0` or `loop2`.
+    pub label: String,
+    pub instrs: Vec<Instr>,
+    pub term: Terminator,
 }
 
 impl Instr {
@@ -54,7 +115,8 @@ impl Instr {
         };
         match self {
             Instr::Const { .. } | Instr::StrAddr { .. } => Vec::new(),
-            Instr::Bin { lhs, rhs, .. } => regs(&[*lhs, *rhs]),
+            Instr::Copy { src, .. } => regs(&[*src]),
+            Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => regs(&[*lhs, *rhs]),
             Instr::Print { val, .. } => regs(&[*val]),
         }
     }
@@ -62,9 +124,11 @@ impl Instr {
     /// The virtual register written by this instruction, if any.
     pub fn def(&self) -> Option<VReg> {
         match self {
-            Instr::Const { dst, .. } | Instr::StrAddr { dst, .. } | Instr::Bin { dst, .. } => {
-                Some(*dst)
-            }
+            Instr::Const { dst, .. }
+            | Instr::StrAddr { dst, .. }
+            | Instr::Copy { dst, .. }
+            | Instr::Bin { dst, .. }
+            | Instr::Cmp { dst, .. } => Some(*dst),
             Instr::Print { .. } => None,
         }
     }
@@ -77,7 +141,8 @@ impl Instr {
 }
 
 pub struct Program {
-    pub instrs: Vec<Instr>,
+    /// Basic blocks in the order they will be emitted; block 0 is the entry.
+    pub blocks: Vec<Block>,
     /// Interned string literals, each stored without its NUL terminator.
     pub strings: Vec<Vec<u8>>,
     /// Human-readable name per virtual register, used by IR and allocator dumps.
@@ -93,6 +158,17 @@ impl Program {
         &self.vreg_names[reg.0 as usize]
     }
 
+    pub fn block(&self, id: BlockId) -> &Block {
+        &self.blocks[id.0 as usize]
+    }
+
+    fn value_name(&self, value: &Value) -> String {
+        match value {
+            Value::Const(c) => c.to_string(),
+            Value::Reg(r) => format!("%{}", self.name_of(*r)),
+        }
+    }
+
     /// Render the IR for `--emit ir`.
     pub fn dump(&self) -> String {
         let mut out = String::new();
@@ -102,28 +178,53 @@ impl Program {
         if !self.strings.is_empty() {
             out.push('\n');
         }
-        for (i, instr) in self.instrs.iter().enumerate() {
-            let value = |v: &Value| match v {
-                Value::Const(c) => c.to_string(),
-                Value::Reg(r) => format!("%{}", self.name_of(*r)),
-            };
-            let text = match instr {
-                Instr::Const { dst, val } => {
-                    format!("%{} = const {val}", self.name_of(*dst))
-                }
-                Instr::StrAddr { dst, id } => {
-                    format!("%{} = straddr str{}", self.name_of(*dst), id.0)
-                }
-                Instr::Bin { op, dst, lhs, rhs } => format!(
-                    "%{} = {} {}, {}",
-                    self.name_of(*dst),
-                    op_name(*op),
-                    value(lhs),
-                    value(rhs)
+
+        let mut index = 0;
+        for block in &self.blocks {
+            out.push_str(&format!("{}:\n", block.label));
+            for instr in &block.instrs {
+                let text = match instr {
+                    Instr::Const { dst, val } => format!("%{} = const {val}", self.name_of(*dst)),
+                    Instr::StrAddr { dst, id } => {
+                        format!("%{} = straddr str{}", self.name_of(*dst), id.0)
+                    }
+                    Instr::Copy { dst, src } => {
+                        format!("%{} = copy {}", self.name_of(*dst), self.value_name(src))
+                    }
+                    Instr::Bin { op, dst, lhs, rhs } => format!(
+                        "%{} = {} {}, {}",
+                        self.name_of(*dst),
+                        op_name(*op),
+                        self.value_name(lhs),
+                        self.value_name(rhs)
+                    ),
+                    Instr::Cmp { op, dst, lhs, rhs } => format!(
+                        "%{} = cmp {} {}, {}",
+                        self.name_of(*dst),
+                        op.symbol(),
+                        self.value_name(lhs),
+                        self.value_name(rhs)
+                    ),
+                    Instr::Print { ty, val } => {
+                        format!("print {} {}", ty.name(), self.value_name(val))
+                    }
+                };
+                out.push_str(&format!("{index:>3}  {text}\n"));
+                index += 1;
+            }
+
+            let text = match &block.term {
+                Terminator::Jump(target) => format!("jump {}", self.block(*target).label),
+                Terminator::Branch { cond, then_blk, else_blk } => format!(
+                    "branch {} ? {} : {}",
+                    self.value_name(cond),
+                    self.block(*then_blk).label,
+                    self.block(*else_blk).label
                 ),
-                Instr::Print { ty, val } => format!("print {} {}", ty.name(), value(val)),
+                Terminator::Return => "return".to_string(),
             };
-            out.push_str(&format!("{i:>3}  {text}\n"));
+            out.push_str(&format!("{index:>3}  {text}\n"));
+            index += 1;
         }
         out
     }
@@ -141,129 +242,271 @@ fn op_name(op: BinOp) -> &'static str {
 /// Lower a type-checked AST to IR. Assumes [`crate::sema::check`] succeeded.
 pub fn lower(ast: &Ast, types: &Types) -> Program {
     let mut lowering = Lowering {
-        program: Program { instrs: Vec::new(), strings: Vec::new(), vreg_names: Vec::new() },
-        vars: HashMap::new(),
-        versions: HashMap::new(),
+        blocks: Vec::new(),
+        strings: Vec::new(),
+        vreg_names: Vec::new(),
+        current: BlockId(0),
+        scopes: vec![HashMap::new()],
+        name_counts: HashMap::new(),
+        types,
     };
 
+    lowering.new_block("entry");
     for stmt in &ast.stmts {
-        match stmt {
-            Stmt::Decl { name, init, .. } => {
-                let reg = lowering.bind(name, init);
-                lowering.vars.insert(name.clone(), reg);
-            }
-            // Assignment is renaming: the variable starts pointing at a new
-            // virtual register, so every register still has exactly one
-            // definition and live intervals stay exact. With no control flow
-            // this is all the SSA construction the IR needs.
-            Stmt::Assign { name, value, .. } => {
-                let reg = lowering.bind(name, value);
-                lowering.vars.insert(name.clone(), reg);
-            }
-            Stmt::Print { value, .. } => {
-                let ty = types.of(value.id);
-                let val = lowering.expr(value);
-                lowering.program.instrs.push(Instr::Print { ty, val });
-            }
-        }
+        lowering.stmt(stmt);
+    }
+    lowering.terminate(Terminator::Return);
+
+    Program {
+        blocks: lowering.blocks,
+        strings: lowering.strings,
+        vreg_names: lowering.vreg_names,
+    }
+}
+
+struct Lowering<'a> {
+    blocks: Vec<Block>,
+    strings: Vec<Vec<u8>>,
+    vreg_names: Vec<String>,
+    /// The block instructions are currently appended to.
+    current: BlockId,
+    /// Variable name -> virtual register, one map per open scope.
+    scopes: Vec<HashMap<String, VReg>>,
+    /// How many registers have borne each name, so a shadowing declaration in
+    /// another scope gets a distinct dump name (`i`, then `i.1`).
+    name_counts: HashMap<String, u32>,
+    types: &'a Types,
+}
+
+impl<'a> Lowering<'a> {
+    // -- blocks ------------------------------------------------------------
+
+    /// Append a new block and return its id. It starts with a placeholder
+    /// terminator that [`Self::terminate`] replaces.
+    fn new_block(&mut self, label: &str) -> BlockId {
+        let id = BlockId(self.blocks.len() as u32);
+        let label = format!("{label}{}", id.0);
+        self.blocks.push(Block { label, instrs: Vec::new(), term: Terminator::Return });
+        self.current = id;
+        id
     }
 
-    lowering.program
-}
+    fn emit(&mut self, instr: Instr) {
+        self.blocks[self.current.0 as usize].instrs.push(instr);
+    }
 
-struct Lowering {
-    program: Program,
-    /// Variable name -> the virtual register currently holding its value.
-    vars: HashMap<String, VReg>,
-    /// How many times each variable has been written, so successive values can
-    /// be told apart in dumps: `%s`, then `%s.1`, then `%s.2`.
-    versions: HashMap<String, u32>,
-}
+    /// Finish the current block.
+    fn terminate(&mut self, term: Terminator) {
+        self.blocks[self.current.0 as usize].term = term;
+    }
 
-impl Lowering {
+    fn switch_to(&mut self, block: BlockId) {
+        self.current = block;
+    }
+
+    // -- names -------------------------------------------------------------
+
     fn fresh(&mut self, name: &str) -> VReg {
-        let reg = VReg(self.program.vreg_names.len() as u32);
-        self.program.vreg_names.push(name.to_string());
+        let reg = VReg(self.vreg_names.len() as u32);
+        let count = self.name_counts.entry(name.to_string()).or_insert(0);
+        let label = if *count == 0 { name.to_string() } else { format!("{name}.{count}") };
+        *count += 1;
+        self.vreg_names.push(label);
         reg
     }
 
-    /// Lower `value` and return the virtual register that becomes `name`'s new
-    /// home.
-    fn bind(&mut self, name: &str, value: &Expr) -> VReg {
-        let version = self.versions.entry(name.to_string()).or_insert(0);
-        let label = if *version == 0 { name.to_string() } else { format!("{name}.{version}") };
-        *version += 1;
+    /// Temporaries are named after their own index, so `%t7` is always virtual
+    /// register 7.
+    fn fresh_temp(&mut self) -> VReg {
+        let reg = VReg(self.vreg_names.len() as u32);
+        self.vreg_names.push(format!("t{}", reg.0));
+        reg
+    }
 
-        match self.expr(value) {
-            // The expression already produced a register: adopt it as the
-            // variable's home and relabel it, so dumps read `%s` rather than
-            // `%t2`. A register that is some *other* variable's home is left
-            // alone — `int b = a;` simply shares `a`'s value.
-            Value::Reg(reg) => {
-                if !self.vars.values().any(|&v| v == reg) {
-                    self.program.vreg_names[reg.0 as usize] = label;
-                }
-                reg
+    fn declare(&mut self, name: &str) -> VReg {
+        let reg = self.fresh(name);
+        self.scopes.last_mut().expect("a scope is always open").insert(name.to_string(), reg);
+        reg
+    }
+
+    fn lookup(&self, name: &str) -> VReg {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+            .expect("sema rejects undeclared variables")
+    }
+
+    // -- statements --------------------------------------------------------
+
+    fn block_stmts(&mut self, block: &AstBlock) {
+        self.scopes.push(HashMap::new());
+        for stmt in &block.stmts {
+            self.stmt(stmt);
+        }
+        self.scopes.pop();
+    }
+
+    fn stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Decl { name, init, .. } => {
+                let dst = self.declare(name);
+                self.expr_into(dst, init);
             }
-            Value::Const(val) => {
-                let dst = self.fresh(&label);
-                self.program.instrs.push(Instr::Const { dst, val });
-                dst
+            // The variable keeps its register; the assignment overwrites it.
+            Stmt::Assign { name, value, .. } => {
+                let dst = self.lookup(name);
+                self.expr_into(dst, value);
+            }
+            Stmt::Print { value, .. } => {
+                let ty = self.types.of(value.id);
+                let val = self.expr(value);
+                self.emit(Instr::Print { ty, val });
+            }
+            Stmt::If { cond, then_block, else_block } => self.if_stmt(cond, then_block, else_block),
+            Stmt::While { cond, body } => self.while_stmt(cond, body),
+            // `for (init; cond; step) body` is exactly `init; while (cond) { body; step; }`
+            // with the initialiser's variable scoped to the loop.
+            Stmt::For { init, cond, step, body } => {
+                self.scopes.push(HashMap::new());
+                self.stmt(init);
+                self.loop_with_step(cond, body, Some(step));
+                self.scopes.pop();
             }
         }
     }
 
-    /// Temporaries are named after their own index, so `%t3` is always virtual
-    /// register 3 no matter how many names variables have taken.
-    fn fresh_temp(&mut self) -> VReg {
-        let name = format!("t{}", self.program.vreg_names.len());
-        self.fresh(&name)
+    fn if_stmt(&mut self, cond: &Expr, then_block: &AstBlock, else_block: &Option<AstBlock>) {
+        let cond = self.expr(cond);
+
+        let then_id = self.new_block("then");
+        self.block_stmts(then_block);
+        let then_exit = self.current;
+
+        let (else_id, else_exit) = match else_block {
+            Some(block) => {
+                let id = self.new_block("else");
+                self.block_stmts(block);
+                (id, Some(self.current))
+            }
+            None => (BlockId(0), None), // patched below
+        };
+
+        let join = self.new_block("join");
+
+        // The branch belongs to the block that computed the condition, which is
+        // whatever block preceded `then`.
+        let entry = BlockId(then_id.0 - 1);
+        self.blocks[entry.0 as usize].term = Terminator::Branch {
+            cond,
+            then_blk: then_id,
+            else_blk: if else_block.is_some() { else_id } else { join },
+        };
+
+        self.blocks[then_exit.0 as usize].term = Terminator::Jump(join);
+        if let Some(exit) = else_exit {
+            self.blocks[exit.0 as usize].term = Terminator::Jump(join);
+        }
+
+        self.switch_to(join);
     }
 
+    fn while_stmt(&mut self, cond: &Expr, body: &AstBlock) {
+        self.loop_with_step(cond, body, None);
+    }
+
+    /// The shape shared by `while` and `for`: a header that re-tests the
+    /// condition on every iteration, a body, and an optional step run at the
+    /// end of the body.
+    fn loop_with_step(&mut self, cond: &Expr, body: &AstBlock, step: Option<&Stmt>) {
+        let before = self.current;
+
+        // The condition must be re-evaluated each time round, so it gets a
+        // block of its own that the body jumps back to.
+        let header = self.new_block("loop");
+        let cond = self.expr(cond);
+        let header_exit = self.current;
+
+        let body_id = self.new_block("body");
+        self.block_stmts(body);
+        if let Some(step) = step {
+            self.stmt(step);
+        }
+        let body_exit = self.current;
+
+        let after = self.new_block("done");
+
+        self.blocks[before.0 as usize].term = Terminator::Jump(header);
+        self.blocks[header_exit.0 as usize].term =
+            Terminator::Branch { cond, then_blk: body_id, else_blk: after };
+        // The back edge: this is what makes liveness need a fixpoint.
+        self.blocks[body_exit.0 as usize].term = Terminator::Jump(header);
+
+        self.switch_to(after);
+    }
+
+    // -- expressions -------------------------------------------------------
+
+    /// Lower an expression whose result must land in `dst`.
+    fn expr_into(&mut self, dst: VReg, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Int(v) => self.emit(Instr::Const { dst, val: *v }),
+            ExprKind::Bool(v) => self.emit(Instr::Const { dst, val: i64::from(*v) }),
+            ExprKind::Str(bytes) => {
+                let id = self.intern(bytes);
+                self.emit(Instr::StrAddr { dst, id });
+            }
+            ExprKind::Bin { op, lhs, rhs } => {
+                let lhs = self.expr(lhs);
+                let rhs = self.expr(rhs);
+                self.emit(Instr::Bin { op: *op, dst, lhs, rhs });
+            }
+            ExprKind::Cmp { op, lhs, rhs } => {
+                let lhs = self.expr(lhs);
+                let rhs = self.expr(rhs);
+                self.emit(Instr::Cmp { op: *op, dst, lhs, rhs });
+            }
+            ExprKind::Neg(operand) => {
+                let val = self.expr(operand);
+                self.emit(Instr::Bin { op: BinOp::Sub, dst, lhs: Value::Const(0), rhs: val });
+            }
+            ExprKind::Var(_) => {
+                let src = self.expr(expr);
+                self.emit(Instr::Copy { dst, src });
+            }
+        }
+    }
+
+    /// Lower an expression used as an operand, producing a value to read.
     fn expr(&mut self, expr: &Expr) -> Value {
         match &expr.kind {
             // Literals stay immediates so the backend can fold them into the
             // instruction that consumes them.
             ExprKind::Int(v) => Value::Const(*v),
-            ExprKind::Str(bytes) => {
-                let id = self.intern(bytes);
-                let dst = self.fresh_temp();
-                self.program.instrs.push(Instr::StrAddr { dst, id });
-                Value::Reg(dst)
-            }
             ExprKind::Bool(v) => Value::Const(i64::from(*v)),
-            ExprKind::Var(name) => Value::Reg(self.vars[name]),
-            // `-x` lowers to `0 - x`, which needs no separate instruction kind.
+            ExprKind::Var(name) => Value::Reg(self.lookup(name)),
             ExprKind::Neg(operand) => {
-                let val = self.expr(operand);
-                if let Value::Const(c) = val {
-                    return Value::Const(c.wrapping_neg());
+                if let ExprKind::Int(v) = operand.kind {
+                    return Value::Const(v.wrapping_neg());
                 }
                 let dst = self.fresh_temp();
-                self.program.instrs.push(Instr::Bin {
-                    op: BinOp::Sub,
-                    dst,
-                    lhs: Value::Const(0),
-                    rhs: val,
-                });
+                self.expr_into(dst, expr);
                 Value::Reg(dst)
             }
-            ExprKind::Bin { op, lhs, rhs } => {
-                let lhs = self.expr(lhs);
-                let rhs = self.expr(rhs);
+            _ => {
                 let dst = self.fresh_temp();
-                self.program.instrs.push(Instr::Bin { op: *op, dst, lhs, rhs });
+                self.expr_into(dst, expr);
                 Value::Reg(dst)
             }
         }
     }
 
     fn intern(&mut self, bytes: &[u8]) -> StrId {
-        if let Some(i) = self.program.strings.iter().position(|s| s == bytes) {
+        if let Some(i) = self.strings.iter().position(|s| s == bytes) {
             return StrId(i as u32);
         }
-        self.program.strings.push(bytes.to_vec());
-        StrId(self.program.strings.len() as u32 - 1)
+        self.strings.push(bytes.to_vec());
+        StrId(self.strings.len() as u32 - 1)
     }
 }
 
@@ -286,76 +529,98 @@ mod tests {
             concat!(
                 "str0 = \"hi\"\n",
                 "\n",
+                "entry0:\n",
                 "  0  %x = const 10\n",
                 "  1  %y = const 20\n",
                 "  2  %s = straddr str0\n",
                 "  3  %t3 = add %x, %y\n",
                 "  4  print int %t3\n",
                 "  5  print string %s\n",
+                "  6  return\n",
             )
         );
+    }
+
+    #[test]
+    fn an_assignment_writes_the_variables_own_register() {
+        // No `%n.1`: with control flow a variable must have one home, so the
+        // second write targets the same register.
+        let ir = lower_src("int n = 1;\nn = n + 41;\nprint(n);");
+        assert_eq!(
+            ir.dump(),
+            concat!(
+                "entry0:\n",
+                "  0  %n = const 1\n",
+                "  1  %n = add %n, 41\n",
+                "  2  print int %n\n",
+                "  3  return\n",
+            )
+        );
+    }
+
+    #[test]
+    fn an_if_produces_a_diamond() {
+        let ir = lower_src("int n = 0;\nif (n < 1) {\n  n = 2;\n} else {\n  n = 3;\n}\nprint(n);");
+        let labels: Vec<&str> = ir.blocks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, vec!["entry0", "then1", "else2", "join3"]);
+        assert!(matches!(ir.blocks[0].term, Terminator::Branch { .. }));
+        assert!(matches!(ir.blocks[1].term, Terminator::Jump(BlockId(3))));
+        assert!(matches!(ir.blocks[2].term, Terminator::Jump(BlockId(3))));
+    }
+
+    #[test]
+    fn an_if_without_else_branches_straight_to_the_join() {
+        let ir = lower_src("int n = 0;\nif (n < 1) {\n  n = 2;\n}\nprint(n);");
+        let labels: Vec<&str> = ir.blocks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, vec!["entry0", "then1", "join2"]);
+        match ir.blocks[0].term {
+            Terminator::Branch { then_blk, else_blk, .. } => {
+                assert_eq!((then_blk, else_blk), (BlockId(1), BlockId(2)));
+            }
+            ref other => panic!("expected a branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_while_loop_closes_a_back_edge() {
+        let ir = lower_src("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
+        let labels: Vec<&str> = ir.blocks.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, vec!["entry0", "loop1", "body2", "done3"]);
+        // The body jumps back to the header, which re-tests the condition.
+        assert!(matches!(ir.blocks[2].term, Terminator::Jump(BlockId(1))));
+        assert!(matches!(ir.blocks[0].term, Terminator::Jump(BlockId(1))));
+    }
+
+    #[test]
+    fn a_for_loop_desugars_into_the_same_shape() {
+        let with_for = lower_src("for (int i = 0; i < 3; i = i + 1) {\n  print(i);\n}");
+        let with_while =
+            lower_src("int i = 0;\nwhile (i < 3) {\n  print(i);\n  i = i + 1;\n}");
+        assert_eq!(with_for.dump(), with_while.dump());
     }
 
     #[test]
     fn literal_operands_stay_immediates() {
         let ir = lower_src("print(1 + 2);");
-        assert_eq!(ir.instrs.len(), 2);
+        assert_eq!(ir.blocks[0].instrs.len(), 2);
         assert!(matches!(
-            ir.instrs[0],
+            ir.blocks[0].instrs[0],
             Instr::Bin { lhs: Value::Const(1), rhs: Value::Const(2), .. }
         ));
     }
 
     #[test]
-    fn assignment_gives_the_variable_a_new_register() {
-        let ir = lower_src("int n = 1;\nprint(n);\nn = n + 10;\nprint(n);");
-        assert_eq!(
-            ir.dump(),
-            concat!(
-                "  0  %n = const 1\n",
-                "  1  print int %n\n",
-                "  2  %n.1 = add %n, 10\n",
-                "  3  print int %n.1\n",
-            )
-        );
-
-        // Every virtual register still has exactly one definition, which is what
-        // keeps the live intervals exact.
-        let mut defined = std::collections::HashSet::new();
-        for instr in &ir.instrs {
-            if let Some(dst) = instr.def() {
-                assert!(defined.insert(dst), "{dst:?} is defined twice");
-            }
-        }
-    }
-
-    #[test]
-    fn assignment_does_not_disturb_a_variable_copied_from_it() {
-        // `b` took `a`'s value, so reassigning `a` must leave `b` alone.
-        let ir = lower_src("int a = 1;\nint b = a;\na = 2;\nprint(a);\nprint(b);");
-        assert_eq!(
-            ir.dump(),
-            concat!(
-                "  0  %a = const 1\n",
-                "  1  %a.1 = const 2\n",
-                "  2  print int %a.1\n",
-                "  3  print int %a\n",
-            )
-        );
-    }
-
-    #[test]
     fn bools_lower_to_integer_constants() {
-        // A bool is just a 0 or a 1, so it needs no instruction of its own and
-        // the register allocator never has to know the type exists.
         let ir = lower_src("bool ready = true;\nbool done = false;\nprint(ready);\nprint(done);");
         assert_eq!(
             ir.dump(),
             concat!(
+                "entry0:\n",
                 "  0  %ready = const 1\n",
                 "  1  %done = const 0\n",
                 "  2  print bool %ready\n",
                 "  3  print bool %done\n",
+                "  4  return\n",
             )
         );
     }
@@ -363,8 +628,18 @@ mod tests {
     #[test]
     fn a_printed_bool_literal_stays_an_immediate() {
         let ir = lower_src("print(false);");
-        assert_eq!(ir.instrs.len(), 1);
-        assert!(matches!(ir.instrs[0], Instr::Print { ty: Ty::Bool, val: Value::Const(0) }));
+        assert_eq!(ir.blocks[0].instrs.len(), 1);
+        assert!(matches!(
+            ir.blocks[0].instrs[0],
+            Instr::Print { ty: Ty::Bool, val: Value::Const(0) }
+        ));
+    }
+
+    #[test]
+    fn shadowed_variables_get_distinct_registers() {
+        let ir = lower_src("int i = 1;\nif (true) {\n  int i = 2;\n  print(i);\n}\nprint(i);");
+        assert!(ir.vreg_names.contains(&"i".to_string()));
+        assert!(ir.vreg_names.contains(&"i.1".to_string()));
     }
 
     #[test]

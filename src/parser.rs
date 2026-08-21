@@ -4,17 +4,22 @@
 //!
 //! ```text
 //! program := stmt*
-//! stmt    := decl | assign | print
-//! decl    := ("int" | "string") IDENT "=" expr ";"
+//! stmt    := decl | assign | print | if | while | for
+//! decl    := ("int" | "string" | "bool") IDENT "=" expr ";"
 //! assign  := IDENT "=" expr ";"
 //! print   := "print" "(" expr ")" ";"
-//! expr    := term (("+" | "-") term)*
+//! if      := "if" "(" expr ")" block ("else" (block | if))?
+//! while   := "while" "(" expr ")" block
+//! for     := "for" "(" (decl | assign) expr ";" assign-no-semi ")" block
+//! block   := "{" stmt* "}"
+//! expr    := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
+//! sum     := term (("+" | "-") term)*
 //! term    := unary (("*" | "/") unary)*
 //! unary   := "-" unary | primary
-//! primary := INT | STRING | IDENT | "(" expr ")"
+//! primary := INT | STRING | BOOL | IDENT | "(" expr ")"
 //! ```
 
-use crate::ast::{BinOp, Expr, ExprKind, NodeId, Program, Stmt, Ty};
+use crate::ast::{Block, BinOp, CmpOp, Expr, ExprKind, NodeId, Program, Stmt, Ty};
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
 
@@ -86,6 +91,9 @@ impl<'a> Parser<'a> {
             TokenKind::KwString => self.decl(Ty::Str),
             TokenKind::KwBool => self.decl(Ty::Bool),
             TokenKind::KwPrint => self.print_stmt(),
+            TokenKind::KwIf => self.if_stmt(),
+            TokenKind::KwWhile => self.while_stmt(),
+            TokenKind::KwFor => self.for_stmt(),
             TokenKind::Ident(_) => self.assign(),
             _ => {
                 let found = self.peek();
@@ -93,9 +101,99 @@ impl<'a> Parser<'a> {
                     format!("expected a statement, found {}", found.kind.describe()),
                     found.span,
                 )
-                .with_label("statements start with `int`, `string`, `print` or a variable name"))
+                .with_label(
+                    "statements start with a type, `print`, `if`, `while`, `for` or a variable name",
+                ))
             }
         }
+    }
+
+    /// `{ stmt* }`
+    fn block(&mut self) -> PResult<Block> {
+        let open = self.expect(TokenKind::LBrace)?.span;
+        let mut stmts = Vec::new();
+        loop {
+            match self.peek().kind {
+                TokenKind::RBrace => {
+                    let close = self.bump().span;
+                    return Ok(Block { stmts, span: open.to(close) });
+                }
+                TokenKind::Eof => {
+                    let found = self.peek();
+                    return Err(Diagnostic::new("unclosed block", found.span)
+                        .with_label("expected `}` before the end of the file")
+                        .with_note("to close this `{`", Some(open)));
+                }
+                _ => stmts.push(self.stmt()?),
+            }
+        }
+    }
+
+    /// The condition of `if` and `while`, including its parentheses.
+    fn condition(&mut self) -> PResult<Expr> {
+        let open = self.expect(TokenKind::LParen)?.span;
+        let cond = self.expr()?;
+        self.expect_closing_paren(open)?;
+        Ok(cond)
+    }
+
+    fn if_stmt(&mut self) -> PResult<Stmt> {
+        self.bump(); // `if`
+        let cond = self.condition()?;
+        let then_block = self.block()?;
+
+        let else_block = if self.eat(&TokenKind::KwElse) {
+            // `else if` chains by nesting the next `if` in a synthetic block,
+            // so the AST needs no separate "else if" shape.
+            if matches!(self.peek().kind, TokenKind::KwIf) {
+                let nested = self.if_stmt()?;
+                Some(Block { stmts: vec![nested], span: self.tokens[self.pos - 1].span })
+            } else {
+                Some(self.block()?)
+            }
+        } else {
+            None
+        };
+
+        Ok(Stmt::If { cond, then_block, else_block })
+    }
+
+    fn while_stmt(&mut self) -> PResult<Stmt> {
+        self.bump(); // `while`
+        let cond = self.condition()?;
+        let body = self.block()?;
+        Ok(Stmt::While { cond, body })
+    }
+
+    fn for_stmt(&mut self) -> PResult<Stmt> {
+        self.bump(); // `for`
+        let open = self.expect(TokenKind::LParen)?.span;
+
+        // The initialiser is a full statement, so it consumes its own `;`.
+        let init = match self.peek().kind {
+            TokenKind::KwInt => self.decl(Ty::Int)?,
+            TokenKind::KwString => self.decl(Ty::Str)?,
+            TokenKind::KwBool => self.decl(Ty::Bool)?,
+            TokenKind::Ident(_) => self.assign()?,
+            _ => {
+                let found = self.peek();
+                return Err(Diagnostic::new(
+                    format!("expected a declaration or assignment, found {}", found.kind.describe()),
+                    found.span,
+                )
+                .with_label("the first part of a `for` initialises a variable"));
+            }
+        };
+
+        let cond = self.expr()?;
+        self.expect(TokenKind::Semi)?;
+
+        // The step has no trailing `;` — the closing paren ends it.
+        let step = self.assign_without_semi()?;
+        self.expect_closing_paren(open)?;
+
+        let body = self.block()?;
+        Ok(Stmt::For { init: Box::new(init), cond, step: Box::new(step), body })
     }
 
     fn decl(&mut self, ty: Ty) -> PResult<Stmt> {
@@ -119,15 +217,26 @@ impl<'a> Parser<'a> {
     }
 
     fn assign(&mut self) -> PResult<Stmt> {
-        let token = self.bump();
+        let stmt = self.assign_without_semi()?;
+        self.expect(TokenKind::Semi)?;
+        Ok(stmt)
+    }
+
+    /// The assignment itself, without its terminator: a `for` step ends at `)`.
+    fn assign_without_semi(&mut self) -> PResult<Stmt> {
+        let token = self.peek();
         let TokenKind::Ident(name) = &token.kind else {
-            unreachable!("only called when the next token is an identifier")
+            return Err(Diagnostic::new(
+                format!("expected a variable name, found {}", token.kind.describe()),
+                token.span,
+            )
+            .with_label("an assignment starts with a variable name"));
         };
         let (name, name_span) = (name.clone(), token.span);
+        self.bump();
 
         self.expect(TokenKind::Eq)?;
         let value = self.expr()?;
-        self.expect(TokenKind::Semi)?;
         Ok(Stmt::Assign { name, name_span, value })
     }
 
@@ -140,7 +249,30 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Print { span, value })
     }
 
+    /// Comparisons bind loosest, so `a + 1 < b * 2` compares the two sums.
     fn expr(&mut self) -> PResult<Expr> {
+        let mut lhs = self.sum()?;
+        loop {
+            let op = match self.peek().kind {
+                TokenKind::EqEq => CmpOp::Eq,
+                TokenKind::BangEq => CmpOp::Ne,
+                TokenKind::Lt => CmpOp::Lt,
+                TokenKind::Le => CmpOp::Le,
+                TokenKind::Gt => CmpOp::Gt,
+                TokenKind::Ge => CmpOp::Ge,
+                _ => return Ok(lhs),
+            };
+            self.bump();
+            let rhs = self.sum()?;
+            lhs = Expr {
+                id: self.node_id(),
+                span: lhs.span.to(rhs.span),
+                kind: ExprKind::Cmp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
+            };
+        }
+    }
+
+    fn sum(&mut self) -> PResult<Expr> {
         let mut lhs = self.term()?;
         loop {
             let op = match self.peek().kind {
@@ -286,6 +418,68 @@ mod tests {
             ast::dump(&program),
             "decl bool ready\n  bool true\nassign ready\n  bool false\n"
         );
+    }
+
+    #[test]
+    fn comparisons_bind_looser_than_arithmetic() {
+        let program = parse_src("print(1 + 2 < 4);").unwrap();
+        assert_eq!(
+            ast::dump(&program),
+            "print\n  <\n    +\n      int 1\n      int 2\n    int 4\n"
+        );
+    }
+
+    #[test]
+    fn parses_if_else() {
+        let program = parse_src("if (true) {\n  print(1);\n} else {\n  print(2);\n}").unwrap();
+        assert_eq!(
+            ast::dump(&program),
+            "if\n  bool true\nthen\n  print\n    int 1\nelse\n  print\n    int 2\n"
+        );
+    }
+
+    #[test]
+    fn else_if_nests_inside_the_else_block() {
+        let program =
+            parse_src("if (true) {\n} else if (false) {\n}").unwrap();
+        let dumped = ast::dump(&program);
+        // The second `if` appears one level deeper, inside the `else`.
+        assert!(dumped.contains("else\n  if\n"), "{dumped}");
+    }
+
+    #[test]
+    fn parses_a_while_loop() {
+        let program = parse_src("while (1 < 2) {\n  print(1);\n}").unwrap();
+        assert_eq!(ast::dump(&program), "while\n  <\n    int 1\n    int 2\n  print\n    int 1\n");
+    }
+
+    #[test]
+    fn parses_a_for_loop() {
+        let program = parse_src("for (int i = 0; i < 3; i = i + 1) {\n  print(i);\n}").unwrap();
+        assert_eq!(
+            ast::dump(&program),
+            concat!(
+                "for\n",
+                "  decl int i\n",
+                "    int 0\n",
+                "  <\n",
+                "    var i\n",
+                "    int 3\n",
+                "  assign i\n",
+                "    +\n",
+                "      var i\n",
+                "      int 1\n",
+                "  print\n",
+                "    var i\n",
+            )
+        );
+    }
+
+    #[test]
+    fn reports_an_unclosed_block() {
+        let errors = parse_src("if (true) {\n  print(1);\n").unwrap_err();
+        assert!(errors[0].message.contains("unclosed block"), "{}", errors[0].message);
+        assert!(errors[0].note.is_some());
     }
 
     #[test]
