@@ -96,6 +96,39 @@ impl CmpOp {
     }
 }
 
+/// The short-circuiting operators.
+///
+/// Deliberately not a [`BinOp`]: `&&` and `||` do not evaluate both operands,
+/// so they are not operations on two values at all. [`crate::ir`] lowers them
+/// to a branch rather than to an instruction, which is why no `Instr` matches
+/// them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogicOp {
+    And,
+    Or,
+}
+
+impl LogicOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            LogicOp::And => "&&",
+            LogicOp::Or => "||",
+        }
+    }
+
+    /// The answer the left operand gives when it settles the whole expression
+    /// on its own, as the 0 or 1 a `bool` is.
+    ///
+    /// It doubles as the *condition* for stopping there, because the two happen
+    /// to coincide: `false && x` is false, and `true || x` is true.
+    pub fn short_circuit(self) -> i64 {
+        match self {
+            LogicOp::And => 0,
+            LogicOp::Or => 1,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Expr {
     pub id: NodeId,
@@ -114,6 +147,9 @@ pub enum ExprKind {
     Neg(Box<Expr>),
     Bin { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Cmp { op: CmpOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `lhs && rhs` or `lhs || rhs`. `rhs` is evaluated only when `lhs` did not
+    /// already decide the answer, which is why this is not a [`Self::Bin`].
+    Logic { op: LogicOp, lhs: Box<Expr>, rhs: Box<Expr> },
     /// A call, `add(1, 2)`. The enclosing [`Expr::span`] covers the whole call;
     /// `name_span` covers just the callee, which is what "unknown function"
     /// underlines. Each argument keeps its own span, so an argument of the
@@ -177,6 +213,14 @@ pub enum Stmt {
         span: Span,
         value: Option<Expr>,
     },
+    /// `break;` — leave the innermost enclosing loop.
+    ///
+    /// The parser accepts it anywhere, exactly as it does `return`; whether
+    /// there *is* a loop to leave is a question for [`crate::sema`], which is
+    /// the first stage that tracks how deeply the statement is nested.
+    Break { span: Span },
+    /// `continue;` — start the innermost enclosing loop's next iteration.
+    Continue { span: Span },
     /// A call evaluated for its effect, `greet("hi");`.
     ///
     /// TinyC has no general expression statements — this is the only one,
@@ -292,6 +336,8 @@ fn dump_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
                 dump_expr(out, expr, depth + 1);
             }
         }
+        Stmt::Break { .. } => out.push_str(&format!("{pad}break\n")),
+        Stmt::Continue { .. } => out.push_str(&format!("{pad}continue\n")),
         Stmt::Call(call) => dump_expr(out, call, depth),
     }
 }
@@ -321,6 +367,11 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
             dump_expr(out, rhs, depth + 1);
         }
         ExprKind::Bin { op, lhs, rhs } => {
+            out.push_str(&format!("{pad}{}\n", op.symbol()));
+            dump_expr(out, lhs, depth + 1);
+            dump_expr(out, rhs, depth + 1);
+        }
+        ExprKind::Logic { op, lhs, rhs } => {
             out.push_str(&format!("{pad}{}\n", op.symbol()));
             dump_expr(out, lhs, depth + 1);
             dump_expr(out, rhs, depth + 1);

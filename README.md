@@ -112,7 +112,7 @@ fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 params  := param ("," param)*
 param   := type IDENT
 type    := "int" | "string" | "bool"
-stmt    := decl | assign | print | if | while | for | return | call ";"
+stmt    := decl | assign | print | if | while | for | return | break | continue | call ";"
 decl    := type IDENT "=" expr ";"
 assign  := IDENT "=" expr ";"
 print   := "print" "(" expr ")" ";"
@@ -120,8 +120,12 @@ if      := "if" "(" expr ")" block ("else" (block | if))?
 while   := "while" "(" expr ")" block
 for     := "for" "(" (decl | assign) expr ";" assign ")" block
 return  := "return" expr? ";"
+break   := "break" ";"
+cont    := "continue" ";"
 block   := "{" stmt* "}"
-expr    := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
+expr    := and ("||" and)*
+and     := cmp ("&&" cmp)*
+cmp     := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 sum     := term (("+" | "-") term)*
 term    := unary (("*" | "/") unary)*
 unary   := "-" unary | primary
@@ -130,9 +134,10 @@ call    := IDENT "(" (expr ("," expr)*)? ")"
 ```
 
 `int` is a 64-bit signed integer, `string` is a pointer to static bytes, `bool`
-is `true` or `false`. Arithmetic is `int`-only, `//` starts a comment, and a
-variable keeps the type it was declared with — assigning a `string` to an `int`
-is an error. There are deliberately no arrays yet.
+is `true` or `false`. Arithmetic is `int`-only, `&&` and `||` are `bool`-only,
+`//` starts a comment, and a variable keeps the type it was declared with —
+assigning a `string` to an `int` is an error. There are deliberately no arrays
+yet, and no `!`: the only way that character can appear is in `!=`.
 
 ### Functions
 
@@ -219,6 +224,69 @@ A block is a scope: declarations inside one disappear at its closing brace, an
 inner block may shadow an outer name, and a `for` variable does not outlive its
 loop. `for` is desugared during lowering — `for (init; cond; step) body`
 produces exactly the same IR as `init; while (cond) { body; step; }`.
+
+`break` leaves the innermost enclosing loop and `continue` starts its next
+iteration; outside a loop, both are errors. Neither is a syntactic question, so
+the parser accepts them anywhere and `sema` — the first stage that counts how
+deeply a statement is nested — is what rejects them.
+
+```c
+for (int c = 1; c <= 10; c = c + 1) {
+  if (c == 2) { continue; }   // the step still runs on the way past
+  if (c == 4) { break; }
+  print(c);                   // 1, 3
+}
+```
+
+That parenthesis about the step is the whole difficulty. Lowering a `continue`
+in a `for` cannot simply jump back to the header, because the step lives at the
+end of the body and skipping it would leave the counter alone forever. So the
+step gets a block of its own — a *latch* — that both the body and every
+`continue` jump to. It is created only when a `continue` needs it, which is what
+keeps a plain `for` lowering to exactly the `while` it desugars into.
+
+### Short-circuiting `&&` and `||`
+
+`&&` and `||` evaluate their right operand only when the left one has not
+already settled the answer, which is what makes a guard like this work:
+
+```c
+int zero = 0;
+print(zero == 0 || total / zero > 1);   // true, without ever dividing
+```
+
+They are **not** `BinOp`s in the AST, and there is no `and` or `or` instruction
+in the IR. There could not usefully be one: an instruction reads both its
+operands, and not reading one is the entire point. Short circuiting *is* control
+flow, so `a && b` lowers to the same diamond an `if` produces, with both arms
+writing the destination the join then reads:
+
+```
+  0  %t2 = cmp > %x, 1
+  1  branch %t2 ? rhs1 : short2
+rhs1:
+  2  %ok = call f(%x)
+  3  jump join3
+short2:
+  4  %ok = const 0
+  5  jump join3
+join3:
+  6  print bool %ok
+```
+
+Writing one register from two blocks is only expressible because the IR is not
+in SSA form — the same property that let `if (c) { n = 1; } else { n = 2; }`
+work without phi nodes.
+
+Two details earn their keep:
+
+* **A known left operand drops the right one outright.** `false && f()` folds to
+  `false` and never emits the call, which is not an optimisation but the
+  semantics. `true && e` folds the other way, to just `e`.
+* **The arm the branch continues into is laid out first**, so the backend
+  reaches it by falling through: the right operand for `&&`, the short circuit
+  for `||`. Both spellings then cost one conditional jump and one unconditional
+  one, instead of `||` paying for a jump to the block that was already next.
 
 ### What control flow changed underneath
 

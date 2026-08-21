@@ -8,7 +8,7 @@
 //! params  := param ("," param)*
 //! param   := type IDENT
 //! type    := "int" | "string" | "bool"
-//! stmt    := decl | assign | print | if | while | for | return
+//! stmt    := decl | assign | print | if | while | for | return | break | continue
 //! decl    := type IDENT "=" expr ";"
 //! assign  := IDENT "=" expr ";"
 //! print   := "print" "(" expr ")" ";"
@@ -16,8 +16,12 @@
 //! while   := "while" "(" expr ")" block
 //! for     := "for" "(" (decl | assign) expr ";" assign-no-semi ")" block
 //! return  := "return" expr? ";"
+//! break   := "break" ";"
+//! cont    := "continue" ";"
 //! block   := "{" stmt* "}"
-//! expr    := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
+//! expr    := and ("||" and)*
+//! and     := cmp ("&&" cmp)*
+//! cmp     := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 //! sum     := term (("+" | "-") term)*
 //! term    := unary (("*" | "/") unary)*
 //! unary   := "-" unary | primary
@@ -26,7 +30,7 @@
 //! ```
 
 use crate::ast::{
-    BinOp, Block, CmpOp, Expr, ExprKind, FnDecl, NodeId, Param, Program, Stmt, Ty,
+    BinOp, Block, CmpOp, Expr, ExprKind, FnDecl, LogicOp, NodeId, Param, Program, Stmt, Ty,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
@@ -269,6 +273,16 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Return { span, value: Some(value) })
     }
 
+    /// `break;` or `continue;` — a keyword and a semicolon, nothing else.
+    ///
+    /// Which loop they belong to is not a syntactic question: the parser has no
+    /// idea whether there is one, and says so by accepting them anywhere.
+    fn loop_jump(&mut self, build: impl FnOnce(Span) -> Stmt) -> PResult<Stmt> {
+        let span = self.bump().span;
+        self.expect(TokenKind::Semi)?;
+        Ok(build(span))
+    }
+
     /// A call used as a statement, `greet("hi");` — the only expression
     /// statement in the language, and the only way to call a `void` function.
     fn call_stmt(&mut self) -> PResult<Stmt> {
@@ -287,6 +301,8 @@ impl<'a> Parser<'a> {
             TokenKind::KwWhile => self.while_stmt(),
             TokenKind::KwFor => self.for_stmt(),
             TokenKind::KwReturn => self.return_stmt(),
+            TokenKind::KwBreak => self.loop_jump(|span| Stmt::Break { span }),
+            TokenKind::KwContinue => self.loop_jump(|span| Stmt::Continue { span }),
             // `f(...)` and `x = ...` both start with a name, so this is the one
             // place the parser needs to look one token further ahead.
             TokenKind::Ident(_) if matches!(self.peek_at(1).kind, TokenKind::LParen) => {
@@ -449,8 +465,30 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Print { span, value })
     }
 
-    /// Comparisons bind loosest, so `a + 1 < b * 2` compares the two sums.
+    /// `||` binds loosest of all, so `a < 1 || b < 2` is one disjunction of two
+    /// comparisons rather than a comparison against a disjunction.
     fn expr(&mut self) -> PResult<Expr> {
+        let mut lhs = self.and()?;
+        while self.eat(&TokenKind::PipePipe) {
+            let rhs = self.and()?;
+            lhs = self.logic(LogicOp::Or, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    /// `&&` binds tighter than `||`, so `a || b && c` is `a || (b && c)`.
+    fn and(&mut self) -> PResult<Expr> {
+        let mut lhs = self.comparison()?;
+        while self.eat(&TokenKind::AmpAmp) {
+            let rhs = self.comparison()?;
+            lhs = self.logic(LogicOp::And, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    /// Comparisons bind looser than arithmetic, so `a + 1 < b * 2` compares the
+    /// two sums.
+    fn comparison(&mut self) -> PResult<Expr> {
         let mut lhs = self.sum()?;
         loop {
             let op = match self.peek().kind {
@@ -469,6 +507,14 @@ impl<'a> Parser<'a> {
                 span: lhs.span.to(rhs.span),
                 kind: ExprKind::Cmp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
             };
+        }
+    }
+
+    fn logic(&mut self, op: LogicOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr {
+            id: self.node_id(),
+            span: lhs.span.to(rhs.span),
+            kind: ExprKind::Logic { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
         }
     }
 
@@ -755,6 +801,76 @@ mod tests {
                 "    var i\n",
             )
         );
+    }
+
+    // -- logical operators -------------------------------------------------
+
+    #[test]
+    fn and_binds_tighter_than_or() {
+        // The `&&` must appear below the `||` in the tree.
+        assert_eq!(
+            dump_main("print(true || false && true);"),
+            "print\n  ||\n    bool true\n    &&\n      bool false\n      bool true\n"
+        );
+    }
+
+    #[test]
+    fn logic_binds_looser_than_comparison() {
+        // Without this, `1 < 2 && 3 < 4` would compare `2 && 3`.
+        assert_eq!(
+            dump_main("print(1 < 2 && 3 < 4);"),
+            concat!(
+                "print\n",
+                "  &&\n",
+                "    <\n",
+                "      int 1\n",
+                "      int 2\n",
+                "    <\n",
+                "      int 3\n",
+                "      int 4\n",
+            )
+        );
+    }
+
+    #[test]
+    fn logical_operators_are_left_associative() {
+        assert_eq!(
+            dump_main("print(true && false && true);"),
+            "print\n  &&\n    &&\n      bool true\n      bool false\n    bool true\n"
+        );
+    }
+
+    #[test]
+    fn parentheses_override_logical_precedence() {
+        assert_eq!(
+            dump_main("print((true || false) && true);"),
+            "print\n  &&\n    ||\n      bool true\n      bool false\n    bool true\n"
+        );
+    }
+
+    // -- break and continue ------------------------------------------------
+
+    #[test]
+    fn parses_break_and_continue() {
+        assert_eq!(
+            dump_main("while (true) {\n  break;\n  continue;\n}"),
+            "while\n  bool true\n  break\n  continue\n"
+        );
+    }
+
+    #[test]
+    fn break_and_continue_need_a_semicolon() {
+        for body in ["while (true) {\n  break\n}", "while (true) {\n  continue\n}"] {
+            let errors = errors_in_main(body);
+            assert!(errors[0].message.contains("expected `;`"), "{body}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn the_parser_accepts_a_loop_jump_outside_a_loop() {
+        // Nothing syntactic is wrong with it; `sema` is the stage that knows
+        // there is no loop to leave.
+        assert_eq!(dump_main("break;"), "break\n");
     }
 
     #[test]

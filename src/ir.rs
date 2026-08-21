@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    BinOp, Block as AstBlock, CmpOp, Expr, ExprKind, FnDecl, Program as Ast, Stmt, Ty,
+    BinOp, Block as AstBlock, CmpOp, Expr, ExprKind, FnDecl, LogicOp, Program as Ast, Stmt, Ty,
 };
 use crate::sema::Types;
 
@@ -141,9 +141,19 @@ pub enum BlockKind {
     /// A loop header: it re-tests the condition on every iteration.
     Loop,
     Body,
+    /// A `for`'s step, on the occasions it needs a block of its own: a
+    /// `continue` has to jump somewhere that still runs it.
+    Step,
     /// Where a loop leaves.
     Done,
-    /// Opened after a `return` for whatever follows it, and reached by nothing.
+    /// The right operand of `&&` or `||`, reached only when the left one did
+    /// not already settle the answer.
+    Rhs,
+    /// Where a short-circuited `&&` or `||` lands, carrying the answer its left
+    /// operand gave on its own.
+    Short,
+    /// Opened after a `return`, `break` or `continue` for whatever follows it,
+    /// and reached by nothing.
     Unreachable,
 }
 
@@ -156,7 +166,10 @@ impl BlockKind {
             BlockKind::Join => "join",
             BlockKind::Loop => "loop",
             BlockKind::Body => "body",
+            BlockKind::Step => "step",
             BlockKind::Done => "done",
+            BlockKind::Rhs => "rhs",
+            BlockKind::Short => "short",
             BlockKind::Unreachable => "unreachable",
         }
     }
@@ -400,6 +413,7 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
             vreg_names: Vec::new(),
             current: BlockId(0),
             scopes: vec![HashMap::new()],
+            loops: Vec::new(),
             name_counts: HashMap::new(),
             types,
             strings: &mut strings,
@@ -542,6 +556,22 @@ struct PendingBlock {
     term: Option<Terminator>,
 }
 
+/// One open loop, and the blocks whose exit it still owes an answer.
+///
+/// A `break` knows where it is going only once the loop's `done` block exists,
+/// and a `continue` only once it is settled whether the loop needs a step block
+/// — both of which happen *after* the body has been lowered. So each jump
+/// finishes its own block later: it records which block it left and the loop
+/// patches the terminator in on the way out, the same way [`Lowering::if_stmt`]
+/// patches the arms of a diamond.
+#[derive(Default)]
+struct LoopFrame {
+    /// Blocks ending in a `break`, waiting for the loop's exit.
+    breaks: Vec<BlockId>,
+    /// Blocks ending in a `continue`, waiting for the loop's back edge.
+    continues: Vec<BlockId>,
+}
+
 struct Lowering<'a> {
     blocks: Vec<PendingBlock>,
     vreg_names: Vec<String>,
@@ -549,6 +579,8 @@ struct Lowering<'a> {
     current: BlockId,
     /// Variable name -> virtual register, one map per open scope.
     scopes: Vec<HashMap<String, VReg>>,
+    /// The loops enclosing the statement being lowered, innermost last.
+    loops: Vec<LoopFrame>,
     /// How many registers have borne each name, so a shadowing declaration in
     /// another scope gets a distinct dump name (`i`, then `i.1`).
     name_counts: HashMap<String, u32>,
@@ -709,11 +741,27 @@ impl Lowering<'_> {
                 // backend simply never reaches.
                 self.new_block(BlockKind::Unreachable);
             }
+            Stmt::Break { .. } => self.loop_jump(|frame| &mut frame.breaks),
+            Stmt::Continue { .. } => self.loop_jump(|frame| &mut frame.continues),
             Stmt::Call(call) => {
                 let (callee, args) = self.call_parts(call);
                 self.emit(Instr::Call { dst: None, callee, args });
             }
         }
+    }
+
+    /// Lower a `break` or a `continue`: hand the block it ends to the innermost
+    /// loop, which will terminate it once it knows where the jump goes.
+    ///
+    /// `which` picks the list to join, and is the only difference between the
+    /// two statements at this stage.
+    fn loop_jump(&mut self, which: impl FnOnce(&mut LoopFrame) -> &mut Vec<BlockId>) {
+        let leaving = self.current;
+        let frame = self.loops.last_mut().expect("sema rejects a loop jump outside a loop");
+        which(frame).push(leaving);
+        // As after a `return`: whatever was written next still has to be
+        // lowered somewhere, and nothing reaches it.
+        self.new_block(BlockKind::Unreachable);
     }
 
     fn if_stmt(&mut self, cond: &Expr, then_block: &AstBlock, else_block: &Option<AstBlock>) {
@@ -769,18 +817,47 @@ impl Lowering<'_> {
         let header_exit = self.current;
 
         let body_id = self.new_block(BlockKind::Body);
+        self.loops.push(LoopFrame::default());
         self.block_stmts(body);
-        if let Some(step) = step {
-            self.stmt(step);
-        }
-        let body_exit = self.current;
+        let frame = self.loops.pop().expect("the frame pushed just above");
+
+        // Where the back edge starts, and where a `continue` goes.
+        //
+        // A `for` has to run its step at the end of *every* iteration, the ones
+        // a `continue` cuts short included — so when one exists the step needs a
+        // block of its own to jump to. When none does the step simply ends the
+        // body, and the `for` lowers to exactly the `while` it desugars into.
+        let latch = match step {
+            Some(step) if !frame.continues.is_empty() => {
+                let body_exit = self.current;
+                let latch = self.new_block(BlockKind::Step);
+                self.stmt(step);
+                self.finish(body_exit, Terminator::Jump(latch));
+                latch
+            }
+            Some(step) => {
+                self.stmt(step);
+                header
+            }
+            None => header,
+        };
+        // The step may itself open blocks — `i = i + 1` does not, but
+        // `ok = ok && f()` would — so where it ended is not where it began.
+        let latch_exit = self.current;
 
         let after = self.new_block(BlockKind::Done);
 
         self.finish(before, Terminator::Jump(header));
         self.finish(header_exit, Terminator::Branch { cond, then_blk: body_id, else_blk: after });
         // The back edge: this is what makes liveness need a fixpoint.
-        self.finish(body_exit, Terminator::Jump(header));
+        self.finish(latch_exit, Terminator::Jump(header));
+
+        for block in frame.continues {
+            self.finish(block, Terminator::Jump(latch));
+        }
+        for block in frame.breaks {
+            self.finish(block, Terminator::Jump(after));
+        }
 
         self.switch_to(after);
     }
@@ -837,6 +914,7 @@ impl Lowering<'_> {
                     }),
                 }
             }
+            ExprKind::Logic { op, lhs, rhs } => self.logic_into(dst, *op, lhs, rhs),
             ExprKind::Call { .. } => {
                 let (callee, args) = self.call_parts(expr);
                 self.emit(Instr::Call { dst: Some(dst), callee, args });
@@ -846,6 +924,74 @@ impl Lowering<'_> {
                 self.emit(Instr::Copy { dst, src });
             }
         }
+    }
+
+    /// Lower `lhs && rhs` or `lhs || rhs` into `dst`.
+    fn logic_into(&mut self, dst: VReg, op: LogicOp, lhs: &Expr, rhs: &Expr) {
+        let cond = self.expr(lhs);
+        if matches!(cond, Value::Const(_)) {
+            // A known left operand settles the expression at compile time.
+            // Dropping the right one is not just an optimisation here: with
+            // `false && f()`, *not* calling `f` is the semantics.
+            match fold_logic(op, cond) {
+                Some(val) => self.emit(Instr::Const { dst, val }),
+                // It decided nothing: `true && e` is simply `e`.
+                None => self.expr_into(dst, rhs),
+            }
+            return;
+        }
+        self.logic_branch(dst, op, cond, rhs);
+    }
+
+    /// The half of `&&` and `||` that really branches, given a left operand
+    /// whose value is not known.
+    ///
+    /// There is no `and` or `or` instruction, and there could not usefully be
+    /// one: short circuiting *is* control flow, so this produces the same
+    /// diamond an `if` does. Both arms write `dst`, which is only expressible
+    /// because the IR is not in SSA form — see the module comment.
+    fn logic_branch(&mut self, dst: VReg, op: LogicOp, cond: Value, rhs: &Expr) {
+        // The value the left operand hands back when it decides on its own.
+        let settled = op.short_circuit();
+        // The branch belongs to whichever block the left operand ended in.
+        let entry = self.current;
+
+        // The arm the branch continues into is laid out first, so the backend
+        // reaches it by falling through instead of by jumping.
+        let (then_blk, else_blk, rhs_exit, short) = match op {
+            LogicOp::And => {
+                let (rhs_blk, rhs_exit) = self.logic_rhs(dst, rhs);
+                let short = self.logic_short(dst, settled);
+                (rhs_blk, short, rhs_exit, short)
+            }
+            LogicOp::Or => {
+                let short = self.logic_short(dst, settled);
+                let (rhs_blk, rhs_exit) = self.logic_rhs(dst, rhs);
+                (short, rhs_blk, rhs_exit, short)
+            }
+        };
+
+        let join = self.new_block(BlockKind::Join);
+        self.finish(entry, Terminator::Branch { cond, then_blk, else_blk });
+        self.finish(rhs_exit, Terminator::Jump(join));
+        self.finish(short, Terminator::Jump(join));
+        self.switch_to(join);
+    }
+
+    /// The arm that evaluates the right operand, as `(entry, exit)`: lowering it
+    /// can open blocks of its own, so where it ends is not where it began.
+    fn logic_rhs(&mut self, dst: VReg, rhs: &Expr) -> (BlockId, BlockId) {
+        let id = self.new_block(BlockKind::Rhs);
+        self.expr_into(dst, rhs);
+        (id, self.current)
+    }
+
+    /// The arm the short circuit takes, holding nothing but the answer the left
+    /// operand already gave.
+    fn logic_short(&mut self, dst: VReg, val: i64) -> BlockId {
+        let id = self.new_block(BlockKind::Short);
+        self.emit(Instr::Const { dst, val });
+        id
     }
 
     /// Lower an expression used as an operand, producing a value to read.
@@ -891,6 +1037,20 @@ impl Lowering<'_> {
                 self.emit(Instr::Cmp { op: *op, dst, lhs, rhs });
                 Value::Reg(dst)
             }
+            // A left operand that settles the answer leaves nothing to branch
+            // on, and so nothing to hold in a register either.
+            ExprKind::Logic { op, lhs, rhs } => {
+                let cond = self.expr(lhs);
+                if matches!(cond, Value::Const(_)) {
+                    return match fold_logic(*op, cond) {
+                        Some(val) => Value::Const(val),
+                        None => self.expr(rhs),
+                    };
+                }
+                let dst = self.fresh_temp();
+                self.logic_branch(dst, *op, cond, rhs);
+                Value::Reg(dst)
+            }
             ExprKind::Str(_) | ExprKind::Call { .. } => {
                 let dst = self.fresh_temp();
                 self.expr_into(dst, expr);
@@ -926,6 +1086,20 @@ fn fold_bin(op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
         // are exactly the two divisions `idiv` refuses.
         BinOp::Div => a.checked_div(b),
     }
+}
+
+/// What a short-circuiting operator answers when its left operand alone decides.
+///
+/// Unlike [`fold_bin`] and [`fold_cmp`] this looks at one operand, because that
+/// is the whole point: `false && x` is false and `true || x` is true whatever
+/// `x` would have been — the same value in both cases, which is what
+/// [`LogicOp::short_circuit`] reports. `None` means the right operand still has
+/// to run, and covers both "the left one is unknown" and "the left one is known
+/// but decided nothing".
+fn fold_logic(op: LogicOp, lhs: Value) -> Option<i64> {
+    let Value::Const(c) = lhs else { return None };
+    let settled = op.short_circuit();
+    ((c != 0) == (settled != 0)).then_some(settled)
 }
 
 /// The same for a comparison, whose result is the 0 or 1 a `bool` is.
@@ -1043,6 +1217,172 @@ mod tests {
         let with_for = lower_main("for (int i = 0; i < 3; i = i + 1) {\n  print(i);\n}");
         let with_while = lower_main("int i = 0;\nwhile (i < 3) {\n  print(i);\n  i = i + 1;\n}");
         assert_eq!(with_for.dump(), with_while.dump());
+    }
+
+    // -- short-circuiting operators ----------------------------------------
+
+    #[test]
+    fn a_logical_operator_lowers_to_a_diamond() {
+        let ir = lower_main("int x = 5;\nbool ok = x > 1 && x < 9;\nprint(ok);");
+        let main = &ir.functions[0];
+        assert_eq!(labels(main), vec!["entry0", "rhs1", "short2", "join3"]);
+        // Both arms write the same register, which is what makes this an
+        // expression: the join needs no phi.
+        assert!(matches!(main.blocks[1].instrs.last(), Some(Instr::Cmp { dst, .. }) if *dst == main.blocks[2].instrs[0].def().unwrap()));
+        assert!(matches!(main.blocks[2].instrs[0], Instr::Const { val: 0, .. }));
+    }
+
+    #[test]
+    fn or_lays_its_short_circuit_out_first() {
+        // The arm the branch continues into comes first, so the backend reaches
+        // it by falling through: for `&&` that is the right operand, for `||`
+        // the short circuit.
+        let ir = lower_main("int x = 5;\nbool ok = x > 1 || x < 9;\nprint(ok);");
+        let main = &ir.functions[0];
+        assert_eq!(labels(main), vec!["entry0", "short1", "rhs2", "join3"]);
+        assert!(matches!(main.blocks[1].instrs[0], Instr::Const { val: 1, .. }));
+        match main.blocks[0].term {
+            Terminator::Branch { then_blk, else_blk, .. } => {
+                assert_eq!((then_blk, else_blk), (BlockId(1), BlockId(2)));
+            }
+            ref other => panic!("expected a branch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_left_operand_that_settles_the_answer_drops_the_right_one() {
+        // Not an optimisation but the semantics: `f` must not be called.
+        let ir = lower_src(
+            "fn f() -> bool {\n  return true;\n}\nfn main() {\n  print(false && f());\n}",
+        );
+        let main = ir.functions.iter().find(|f| f.name == "main").expect("main survives");
+        assert_eq!(labels(main), vec!["entry0"]);
+        assert!(
+            matches!(main.blocks[0].instrs[0], Instr::Print { val: Value::Const(0), .. }),
+            "{}",
+            ir.dump()
+        );
+        // Nothing calls `f` any more, so it is pruned along with unused ones.
+        assert!(!ir.functions.iter().any(|f| f.name == "f"), "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_left_operand_that_settles_nothing_leaves_only_the_right_one() {
+        // `true && e` is `e`: no branch, no temporary, no constant.
+        let ir = lower_main("int x = 5;\nprint(true && x > 1);");
+        let main = &ir.functions[0];
+        assert_eq!(labels(main), vec!["entry0"]);
+        assert!(matches!(main.blocks[0].instrs[1], Instr::Cmp { .. }), "{}", ir.dump());
+    }
+
+    #[test]
+    fn logic_between_literals_is_folded_all_the_way() {
+        for (source, expected) in
+            [("print(true || false);", 1), ("print(true && false);", 0), ("print(1 < 2 && 3 < 4);", 1)]
+        {
+            let ir = lower_main(source);
+            let main = &ir.functions[0];
+            assert_eq!(main.blocks[0].instrs.len(), 1, "{source}: {}", ir.dump());
+            assert!(
+                matches!(main.blocks[0].instrs[0], Instr::Print { val: Value::Const(v), .. } if v == expected),
+                "{source}: {}",
+                ir.dump()
+            );
+        }
+    }
+
+    #[test]
+    fn a_logical_operator_may_be_a_condition_of_its_own() {
+        // The branch belongs to the block the condition *ended* in, which for a
+        // short-circuiting operator is its join rather than the loop header.
+        let ir = lower_main("int i = 0;\nwhile (i < 3 && i != 2) {\n  i = i + 1;\n}\nprint(i);");
+        let main = &ir.functions[0];
+        assert_eq!(labels(main), vec!["entry0", "loop1", "rhs2", "short3", "join4", "body5", "done6"]);
+        // The loop is still a loop: the body jumps back to the header, not to
+        // the join the condition finished in.
+        assert!(matches!(main.blocks[5].term, Terminator::Jump(BlockId(1))));
+    }
+
+    // -- break and continue ------------------------------------------------
+
+    #[test]
+    fn break_jumps_to_the_block_after_the_loop() {
+        let ir = lower_main("while (true) {\n  break;\n}\nprint(1);");
+        let main = &ir.functions[0];
+        // The block the `break` left was terminated by the loop on its way out,
+        // and the unreachable block opened after it is gone.
+        assert_eq!(labels(main), vec!["entry0", "loop1", "body2", "done3"]);
+        assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(3))));
+    }
+
+    #[test]
+    fn continue_in_a_while_jumps_back_to_the_header() {
+        let ir = lower_main("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n  continue;\n}\nprint(i);");
+        let main = &ir.functions[0];
+        // A `while` has no step, so its header *is* its latch and no extra
+        // block appears.
+        assert_eq!(labels(main), vec!["entry0", "loop1", "body2", "done3"]);
+        assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(1))));
+    }
+
+    #[test]
+    fn continue_in_a_for_runs_the_step_on_its_way_past() {
+        // The whole reason the step needs a block: skipping it would leave the
+        // counter alone and the loop would never end.
+        let ir = lower_main("for (int i = 0; i < 3; i = i + 1) {\n  continue;\n}");
+        let main = &ir.functions[0];
+        assert_eq!(labels(main), vec!["entry0", "loop1", "body2", "step3", "done4"]);
+        assert!(matches!(main.blocks[3].instrs[0], Instr::Bin { op: BinOp::Add, .. }));
+        assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(3))));
+        assert!(matches!(main.blocks[3].term, Terminator::Jump(BlockId(1))));
+    }
+
+    #[test]
+    fn a_for_without_a_continue_needs_no_step_block() {
+        // Which is what keeps a plain `for` lowering to exactly the `while` it
+        // desugars into.
+        let ir = lower_main("for (int i = 0; i < 3; i = i + 1) {\n  print(i);\n}");
+        assert_eq!(labels(&ir.functions[0]), vec!["entry0", "loop1", "body2", "done3"]);
+    }
+
+    #[test]
+    fn a_continue_in_a_nested_loop_belongs_to_that_loop() {
+        // The inner `while` takes the `continue`, so the outer `for` still has
+        // none of its own and stays step-block free.
+        let ir = lower_main(
+            "for (int i = 0; i < 3; i = i + 1) {\n  while (i < 2) {\n    i = i + 1;\n    continue;\n  }\n}",
+        );
+        let labels = labels(&ir.functions[0]);
+        assert!(!labels.iter().any(|l| l.starts_with("step")), "{labels:?}");
+    }
+
+    #[test]
+    fn break_leaves_only_the_innermost_loop() {
+        let ir = lower_main(
+            "while (true) {\n  while (true) {\n    break;\n  }\n  print(1);\n  break;\n}",
+        );
+        let main = &ir.functions[0];
+        // The inner `break` lands where the inner loop leaves, which is where
+        // the `print` still runs — not at the outer loop's exit.
+        let done: Vec<usize> =
+            main.blocks.iter().enumerate().filter(|(_, b)| b.kind == BlockKind::Done).map(|(i, _)| i).collect();
+        assert_eq!(done.len(), 2, "{}", ir.dump());
+        let inner_exit = done[0];
+        assert!(
+            main.blocks[inner_exit].instrs.iter().any(|i| matches!(i, Instr::Print { .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn code_after_a_loop_jump_is_pruned() {
+        let ir = lower_main("while (true) {\n  break;\n  print(1);\n}");
+        assert!(
+            !ir.functions[0].blocks.iter().flat_map(|b| &b.instrs).any(|i| matches!(i, Instr::Print { .. })),
+            "{}",
+            ir.dump()
+        );
     }
 
     #[test]

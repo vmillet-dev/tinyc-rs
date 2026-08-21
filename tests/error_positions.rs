@@ -111,6 +111,17 @@ fn assigning_to_an_undeclared_variable_points_at_the_name() {
 }
 
 #[test]
+fn a_logical_operator_on_the_wrong_type_points_at_the_offending_operand() {
+    assert_error_at("logic_on_ints.tc", "3:9");
+}
+
+#[test]
+fn a_break_with_no_loop_to_leave_points_at_the_keyword() {
+    // An `if` is not a loop, which is exactly the mistake worth catching.
+    assert_error_at("break_outside_loop.tc", "3:5");
+}
+
+#[test]
 fn redeclaration_points_at_both_declarations() {
     assert_error_at("redeclaration.tc", "3:7");
 

@@ -31,10 +31,15 @@
 //! only sound because two operands of the same instruction can never be a
 //! touching pair, and they cannot because **[`crate::ir`] always emits a
 //! register's definition before any of its uses in the flat layout**. A lowering
-//! that broke that — one that could reach a use before its definition, the way
-//! short-circuit `&&` or a `continue` might — would need this rule revisited,
-//! not just the backend's aliasing guards. [`verify`] checks the consequence;
-//! `definitions_precede_uses` in the tests checks the cause.
+//! that broke that — one that could reach a use before its definition — would
+//! need this rule revisited, not just the backend's aliasing guards. [`verify`]
+//! checks the consequence; `definitions_precede_uses` in the tests checks the
+//! cause, and holds the constructs most likely to break it.
+//!
+//! Short-circuit `&&` and `continue` were the two candidates. Neither does:
+//! `&&` writes its destination in both arms of a diamond laid out *before* the
+//! join that reads it, and a loop jump only redirects control, adding no
+//! definition and no use at all.
 
 use std::collections::HashMap;
 
@@ -589,6 +594,15 @@ mod tests {
              return fib(n - 1) + fib(n - 2);\n}\nfn main() {\n  print(fib(10));\n}",
             "fn main() {\n  int a = 1;\n  int b = 2;\n  int c = 3;\n  \
              while (a < 100) {\n    a = a + b * c;\n    b = a - b;\n  }\n  print(b);\n}",
+            // Both arms of a short circuit write the destination the join reads.
+            "fn main() {\n  int x = 5;\n  bool ok = x > 1 && x < 9;\n  print(ok);\n}",
+            "fn main() {\n  int x = 5;\n  bool ok = x < 1 || x > 9 || x == 5;\n  print(ok);\n}",
+            // A short circuit as a loop condition, so its join is the block the
+            // back edge returns to.
+            "fn main() {\n  int i = 0;\n  while (i < 9 && i != 4) {\n    i = i + 1;\n  }\n  print(i);\n}",
+            // Loop jumps, including the step block a `continue` in a `for` needs.
+            "fn main() {\n  for (int i = 0; i < 9; i = i + 1) {\n    if (i == 2) {\n      \
+             continue;\n    }\n    if (i == 5) {\n      break;\n    }\n    print(i);\n  }\n}",
         ];
 
         for source in programs {

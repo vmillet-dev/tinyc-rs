@@ -230,6 +230,10 @@ struct FnChecker<'a, 'c> {
     /// Names already reported as undeclared. One missing declaration is one
     /// mistake, however many times the name is mentioned afterwards.
     undeclared: HashSet<String>,
+    /// How many loops enclose the statement being checked. `break` and
+    /// `continue` need one; the count rather than a flag is what makes them
+    /// legal in a loop nested inside an `if` inside a loop.
+    loop_depth: u32,
 }
 
 impl<'a, 'c> FnChecker<'a, 'c> {
@@ -240,6 +244,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             ret_span: function.ret_span,
             scopes: Vec::new(),
             undeclared: HashSet::new(),
+            loop_depth: 0,
         }
     }
 
@@ -417,7 +422,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             }
             Stmt::While { cond, body } => {
                 self.condition(cond, "while");
-                self.block(body);
+                self.loop_body(body);
             }
             Stmt::For { init, cond, step, body } => {
                 // The initialiser's variable is visible to the condition, the
@@ -427,10 +432,12 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 self.stmt(init);
                 self.condition(cond, "for");
                 self.stmt(step);
-                self.block(body);
+                self.loop_body(body);
                 self.scopes.pop();
             }
             Stmt::Return { span, value } => self.return_stmt(*span, value.as_ref()),
+            Stmt::Break { span } => self.loop_jump(*span, "break", "leaves"),
+            Stmt::Continue { span } => self.loop_jump(*span, "continue", "restarts"),
             // The result of a call statement is discarded, so a function that
             // returns nothing is exactly as welcome as one that returns a value.
             // The type still goes in the table: every expression node has an
@@ -439,6 +446,28 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 let ty = self.call(call, true).unwrap_or(Ty::Int);
                 self.record(call.id, ty);
             }
+        }
+    }
+
+    /// A loop's body, checked with one more loop open around it.
+    fn loop_body(&mut self, body: &Block) {
+        self.loop_depth += 1;
+        self.block(body);
+        self.loop_depth -= 1;
+    }
+
+    /// `break` and `continue` need a loop to talk about. `verb` completes
+    /// "there is no loop this ... " for the one being checked.
+    fn loop_jump(&mut self, span: Span, keyword: &str, verb: &str) {
+        if self.loop_depth == 0 {
+            self.error(
+                Diagnostic::new(format!("`{keyword}` outside of a loop"), span)
+                    .with_label(format!("there is no loop this {verb}"))
+                    .with_note(
+                        format!("`{keyword}` only means something inside `while` or `for`"),
+                        None,
+                    ),
+            );
         }
     }
 
@@ -642,6 +671,39 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                             "bools only support `==` and `!=`".to_string()
                         }),
                     );
+                }
+                Ty::Bool
+            }
+            ExprKind::Logic { op, lhs, rhs } => {
+                // Both operands are checked even though only one may be
+                // *evaluated*: short circuiting is a runtime matter, and a type
+                // error in the right operand is a mistake either way.
+                let lhs_ty = self.expr(lhs);
+                let rhs_ty = self.expr(rhs);
+
+                for (ty, operand) in [(lhs_ty, lhs), (rhs_ty, rhs)] {
+                    if ty != Ty::Bool {
+                        self.error(
+                            Diagnostic::new(
+                                format!(
+                                    "cannot apply `{}` to `{}` and `{}`",
+                                    op.symbol(),
+                                    lhs_ty.name(),
+                                    rhs_ty.name()
+                                ),
+                                operand.span,
+                            )
+                            .with_label(format!("expected bool, found {}", ty.name()))
+                            .with_note(
+                                format!(
+                                    "`{}` combines two bools, as in `i < 10 {} ok`",
+                                    op.symbol(),
+                                    op.symbol()
+                                ),
+                                None,
+                            ),
+                        );
+                    }
                 }
                 Ty::Bool
             }
@@ -870,6 +932,81 @@ mod tests {
         );
         let errors = errors_in_main("for (int i = 0; i < 1; i = i + 1) {\n}\nprint(i);");
         assert!(errors[0].message.contains("undeclared variable `i`"));
+    }
+
+    // -- logical operators -------------------------------------------------
+
+    #[test]
+    fn logical_operators_take_bools_and_produce_one() {
+        assert!(check_main("bool ok = true && false;\nprint(ok);").is_ok());
+        assert!(check_main("int n = 5;\nif (n > 1 && n < 10) {\n  print(n);\n}").is_ok());
+        assert!(check_main("bool a = true;\nwhile (a || 1 < 2) {\n  a = false;\n}").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_non_bool_operand_of_a_logical_operator() {
+        for body in ["print(1 && true);", "print(true || 1);", "print(\"a\" && \"b\");"] {
+            let errors = errors_in_main(body);
+            assert!(errors[0].message.contains("cannot apply"), "{body}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn a_mistake_in_the_right_operand_is_reported_even_though_it_may_not_run() {
+        // Short circuiting decides what is *evaluated*, not what is checked.
+        let errors = errors_in_main("print(false && nope);");
+        assert!(errors[0].message.contains("undeclared variable `nope`"), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_logical_operator_is_a_bool_wherever_one_is_wanted() {
+        assert!(check_main("bool b = 1 < 2 || 3 < 4;\nif (b && true) {\n}").is_ok());
+        assert!(errors_in_main("int n = true && false;")[0].message.contains("cannot initialize"));
+    }
+
+    // -- break and continue ------------------------------------------------
+
+    #[test]
+    fn accepts_break_and_continue_inside_a_loop() {
+        assert!(check_main("while (true) {\n  break;\n}").is_ok());
+        assert!(check_main("for (int i = 0; i < 3; i = i + 1) {\n  continue;\n}").is_ok());
+        // Nested inside an `if`, which is the usual way they are written.
+        assert!(
+            check_main("for (int i = 0; i < 3; i = i + 1) {\n  if (i == 1) {\n    continue;\n  }\n}")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_break_and_continue_outside_a_loop() {
+        for (body, keyword) in [("break;", "break"), ("continue;", "continue")] {
+            let errors = errors_in_main(body);
+            assert!(
+                errors[0].message.contains(&format!("`{keyword}` outside of a loop")),
+                "{body}: {}",
+                errors[0].message
+            );
+        }
+        // An `if` is not a loop, and neither is a function body.
+        assert!(errors_in_main("if (true) {\n  break;\n}")[0].message.contains("outside of a loop"));
+    }
+
+    #[test]
+    fn a_loop_that_has_closed_no_longer_counts() {
+        // The depth is decremented on the way out, so a `break` after the loop
+        // is as wrong as one that was never inside it.
+        let errors = errors_in_main("while (true) {\n  break;\n}\nbreak;");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+    }
+
+    #[test]
+    fn an_inner_loop_satisfies_break_for_a_body_nested_in_an_outer_one() {
+        assert!(
+            check_main(
+                "while (true) {\n  if (false) {\n    while (true) {\n      break;\n    }\n  }\n  break;\n}"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

@@ -1131,6 +1131,43 @@ mod tests {
     }
 
     #[test]
+    fn a_short_circuit_costs_one_conditional_jump_either_way() {
+        // The arm the branch continues into is laid out first, so it is reached
+        // by falling through — for `&&` the right operand, for `||` the short
+        // circuit. Getting the layout backwards would show up as a `jz` to the
+        // very next block followed by a `jmp`.
+        for (source, skipped) in [("x > 1 && x < 9", ".short2"), ("x > 1 || x < 9", ".rhs2")] {
+            let asm = compile(&format!("int x = 5;\nbool ok = {source};\nprint(ok);"));
+            // One `jcc` out of the entry block, and one `jmp` from the arm that
+            // is not next to the join.
+            assert_eq!(asm.matches("jmp  .join3").count(), 1, "{source}: {asm}");
+            assert!(asm.contains(skipped), "{source}: {asm}");
+        }
+    }
+
+    #[test]
+    fn a_short_circuits_condition_is_folded_into_its_branch() {
+        // The comparison feeding a short circuit is the same fusable shape as
+        // an `if`'s: it never becomes a 0 or a 1 in a register.
+        let asm = compile("int x = 5;\nbool ok = x > 1 && x < 9;\nprint(ok);");
+        assert!(asm.contains("cmp  rbx, 1"), "{asm}");
+        assert!(!asm.contains("setg"), "{asm}");
+    }
+
+    #[test]
+    fn a_break_jumps_to_the_loops_exit_and_a_continue_to_its_step() {
+        let asm = compile(
+            "for (int i = 0; i < 9; i = i + 1) {\n  if (i == 2) {\n    continue;\n  }\n  \
+             if (i == 5) {\n    break;\n  }\n  print(i);\n}",
+        );
+        // The step block exists because a `continue` needs one, and the back
+        // edge leaves from it rather than from the body.
+        assert!(asm.contains(".step"), "{asm}");
+        assert!(asm.contains(".done"), "{asm}");
+        assert!(asm.contains("jmp  .loop1"), "{asm}");
+    }
+
+    #[test]
     fn strings_are_emitted_as_bytes() {
         let asm = compile("string s = \"hi\";\nprint(s);");
         assert!(asm.contains("str0: db 104, 105, 0"), "{asm}");

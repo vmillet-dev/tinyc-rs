@@ -23,6 +23,8 @@ pub enum TokenKind {
     KwFor,
     KwFn,
     KwReturn,
+    KwBreak,
+    KwContinue,
 
     // Punctuation.
     LParen,
@@ -45,6 +47,10 @@ pub enum TokenKind {
     Le,
     Gt,
     Ge,
+
+    // Logic
+    AmpAmp,
+    PipePipe,
 
     /// Synthetic token at the end of the file; simplifies the parser.
     Eof,
@@ -82,6 +88,8 @@ impl TokenKind {
             TokenKind::KwFor => "for",
             TokenKind::KwFn => "fn",
             TokenKind::KwReturn => "return",
+            TokenKind::KwBreak => "break",
+            TokenKind::KwContinue => "continue",
 
             // Punctuation.
             TokenKind::LParen => "(",
@@ -104,6 +112,10 @@ impl TokenKind {
             TokenKind::Le => "<=",
             TokenKind::Gt => ">",
             TokenKind::Ge => ">=",
+
+            // Logic.
+            TokenKind::AmpAmp => "&&",
+            TokenKind::PipePipe => "||",
 
             // No fixed spelling: a generic noun, not a value.
             TokenKind::Int(_) => "integer literal",

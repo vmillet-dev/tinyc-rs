@@ -132,6 +132,75 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
     }
 }
 
+/// Short circuiting and loop jumps are the two features whose whole point is
+/// what a program *does not* do, which no amount of reading assembly proves.
+///
+/// Each case is written so that getting it wrong is loud: an operand that
+/// should never have been evaluated divides by zero and aborts, a `continue`
+/// that skips a `for`'s step loops forever, and a `break` that leaves the wrong
+/// loop prints the wrong number.
+#[test]
+fn short_circuits_and_loop_jumps_do_what_they_promise() {
+    let Some(tools) = Tools::find() else { return };
+
+    let cases: [(&str, &str); 11] = [
+        // The right operand must not run: `10 / z` would abort the process.
+        ("int z = 0;\nprint(z != 0 && 10 / z > 1);", "false"),
+        ("int z = 0;\nprint(z == 0 || 10 / z > 1);", "true"),
+        // ... but it must run when the left one settles nothing.
+        ("int z = 2;\nprint(z != 0 && 10 / z > 1);", "true"),
+        ("int z = 2;\nprint(z == 0 || 10 / z > 4);", "true"),
+        // `&&` binds tighter than `||`, so this is `true || (false && false)`.
+        ("print(true || false && false);", "true"),
+        // A chain, evaluated left to right and stopping at the first `false`.
+        ("int z = 0;\nprint(1 < 2 && z == 0 && 2 < 1 && 10 / z > 0);", "false"),
+        // A `continue` in a `for` still runs the step, or this never ends.
+        (
+            "int total = 0;\nfor (int i = 1; i <= 10; i = i + 1) {\n  if (i == 5) {\n    \
+             continue;\n  }\n  total = total + i;\n}\nprint(total);",
+            "50",
+        ),
+        // The same in a `while`, where the increment is inside the body and a
+        // `continue` therefore has to come *after* it.
+        (
+            "int i = 0;\nint total = 0;\nwhile (i < 10) {\n  i = i + 1;\n  if (i == 5) {\n    \
+             continue;\n  }\n  total = total + i;\n}\nprint(total);",
+            "50",
+        ),
+        // `break` leaves the innermost loop only: the outer one runs to the end.
+        (
+            "int hits = 0;\nfor (int a = 1; a <= 3; a = a + 1) {\n  \
+             for (int b = 1; b <= 3; b = b + 1) {\n    if (b == 2) {\n      break;\n    }\n    \
+             hits = hits + 1;\n  }\n}\nprint(hits);",
+            "3",
+        ),
+        // A short circuit *as* a loop condition, so its join is what the back
+        // edge returns through.
+        (
+            "int i = 0;\nwhile (i < 100 && i * i < 30) {\n  i = i + 1;\n}\nprint(i);",
+            "6",
+        ),
+        // The two new shapes stacked: a `for` whose step is itself a short
+        // circuit, reached through the step block a `continue` asked for. The
+        // back edge has to leave the block the step *ended* in, which is the
+        // join of the short circuit rather than the step block itself.
+        (
+            "bool ok = true;\nint i = 0;\nfor (i = 0; i < 4; ok = ok && i < 2) {\n  \
+             if (i == 1) {\n    i = i + 1;\n    continue;\n  }\n  i = i + 1;\n}\nprint(ok);",
+            "false",
+        ),
+    ];
+
+    for (index, (body, expected)) in cases.iter().enumerate() {
+        let source = tools.scratch.join(format!("logic{index}.tc"));
+        std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
+
+        let run = tools.build_and_run(&source, &format!("logic{index}"));
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
+}
+
 /// A TinyC function may be called anything, including the name of the runtime
 /// routine `print` itself compiles into.
 #[test]

@@ -60,19 +60,11 @@ impl<'a> Lexer<'a> {
                 '=' => self.one_or_two('=', TokenKind::EqEq, TokenKind::Eq),
                 '<' => self.one_or_two('=', TokenKind::Le, TokenKind::Lt),
                 '>' => self.one_or_two('=', TokenKind::Ge, TokenKind::Gt),
-                '!' => {
-                    self.bump();
-                    if self.peek() == Some('=') {
-                        self.bump();
-                        TokenKind::BangEq
-                    } else {
-                        return Err(Diagnostic::new(
-                            "unexpected character `!`",
-                            Span::new(start, self.offset() - start),
-                        )
-                        .with_label("did you mean `!=`?"));
-                    }
-                }
+                // These three exist only doubled: TinyC has no `!`, `&` or `|`
+                // operator for the lone character to mean instead.
+                '!' => self.only_doubled('=', TokenKind::BangEq, start)?,
+                '&' => self.only_doubled('&', TokenKind::AmpAmp, start)?,
+                '|' => self.only_doubled('|', TokenKind::PipePipe, start)?,
                 '+' => self.single(TokenKind::Plus),
                 '-' => self.one_or_two('>', TokenKind::Arrow, TokenKind::Minus),
                 '*' => self.single(TokenKind::Star),
@@ -113,6 +105,29 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Consume a token that has no one-character form: `!=`, `&&`, `||`.
+    ///
+    /// Unlike [`Self::one_or_two`] there is nothing to fall back to, so the
+    /// character on its own is an error — and the only thing it can plausibly
+    /// have meant is the doubled spelling, which the message says.
+    fn only_doubled(
+        &mut self,
+        second: char,
+        both: TokenKind,
+        start: usize,
+    ) -> std::result::Result<TokenKind, Diagnostic> {
+        let first = self.bump().expect("the caller peeked this character");
+        if self.peek() == Some(second) {
+            self.bump();
+            return Ok(both);
+        }
+        Err(Diagnostic::new(
+            format!("unexpected character `{first}`"),
+            Span::new(start, self.offset() - start),
+        )
+        .with_label(format!("did you mean `{}`?", both.text())))
+    }
+
     fn skip_trivia(&mut self) {
         loop {
             match self.peek() {
@@ -151,6 +166,8 @@ impl<'a> Lexer<'a> {
             "false" => TokenKind::Bool(false),
             "fn" => TokenKind::KwFn,
             "return" => TokenKind::KwReturn,
+            "break" => TokenKind::KwBreak,
+            "continue" => TokenKind::KwContinue,
             name => TokenKind::Ident(name.to_string()),
         }
     }
@@ -334,6 +351,44 @@ mod tests {
     }
 
     #[test]
+    fn lexes_the_logical_operators() {
+        assert_eq!(
+            kinds("a && b || c"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::AmpAmp,
+                TokenKind::Ident("b".into()),
+                TokenKind::PipePipe,
+                TokenKind::Ident("c".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_ampersand_or_pipe_is_an_error() {
+        // Neither is an operator on its own, so the doubled spelling is the only
+        // thing they can have been meant as.
+        for (src, doubled) in [("a & b", "&&"), ("a | b", "||")] {
+            let error = error(src);
+            assert!(error.message.contains("unexpected character"), "{src}: {}", error.message);
+            assert!(
+                error.label.as_deref().unwrap().contains(doubled),
+                "{src}: {:?}",
+                error.label
+            );
+            assert_eq!(error.span, Span::new(2, 1), "{src}");
+        }
+    }
+
+    #[test]
+    fn a_doubled_operator_is_one_token_not_two() {
+        // `&&&` is `&&` followed by a lone `&`, which stops the lexer.
+        assert_eq!(kinds("&&"), vec![TokenKind::AmpAmp, TokenKind::Eof]);
+        assert!(error("&&&").message.contains("unexpected character `&`"));
+    }
+
+    #[test]
     fn lexes_control_flow_keywords_and_braces() {
         assert_eq!(
             kinds("if else while for { }"),
@@ -422,7 +477,7 @@ mod tests {
     #[test]
     fn lexes_every_keyword() {
         assert_eq!(
-            kinds("int string bool print if else while for fn return"),
+            kinds("int string bool print if else while for fn return break continue"),
             vec![
                 TokenKind::KwInt,
                 TokenKind::KwString,
@@ -434,6 +489,8 @@ mod tests {
                 TokenKind::KwFor,
                 TokenKind::KwFn,
                 TokenKind::KwReturn,
+                TokenKind::KwBreak,
+                TokenKind::KwContinue,
                 TokenKind::Eof,
             ]
         );
@@ -461,7 +518,9 @@ mod tests {
     fn a_keyword_is_never_recognised_as_a_prefix() {
         // Each of these starts with a keyword's spelling but is longer, so the
         // match on the whole identifier has to fall through to `Ident`.
-        for name in ["fnx", "returns", "printer", "intx", "forth", "elsewhere", "boolean"] {
+        for name in
+            ["fnx", "returns", "printer", "intx", "forth", "elsewhere", "boolean", "breaks", "continued"]
+        {
             assert_eq!(
                 kinds(name),
                 vec![TokenKind::Ident(name.into()), TokenKind::Eof],
