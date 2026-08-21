@@ -46,6 +46,9 @@ pub enum BinOp {
     Sub,
     Mul,
     Div,
+    /// Remainder. Paired with [`BinOp::Div`] everywhere, because on x86 they are
+    /// the same instruction read from two different registers.
+    Rem,
 }
 
 impl BinOp {
@@ -55,7 +58,13 @@ impl BinOp {
             BinOp::Sub => "-",
             BinOp::Mul => "*",
             BinOp::Div => "/",
+            BinOp::Rem => "%",
         }
+    }
+
+    /// Whether this operator divides, and so has a zero divisor to worry about.
+    pub fn divides(self) -> bool {
+        matches!(self, BinOp::Div | BinOp::Rem)
     }
 
     /// Whether the operands may be exchanged, which lets a backend pick
@@ -93,6 +102,21 @@ impl CmpOp {
     /// only need equality.
     pub fn is_ordering(self) -> bool {
         !matches!(self, CmpOp::Eq | CmpOp::Ne)
+    }
+
+    /// The comparison that is true exactly when this one is false.
+    ///
+    /// Every comparison has one, which is what lets `!(a < b)` be lowered as
+    /// `a >= b` — one instruction where negating the *result* would be two.
+    pub fn negate(self) -> CmpOp {
+        match self {
+            CmpOp::Eq => CmpOp::Ne,
+            CmpOp::Ne => CmpOp::Eq,
+            CmpOp::Lt => CmpOp::Ge,
+            CmpOp::Le => CmpOp::Gt,
+            CmpOp::Gt => CmpOp::Le,
+            CmpOp::Ge => CmpOp::Lt,
+        }
     }
 }
 
@@ -143,8 +167,10 @@ pub enum ExprKind {
     Str(Vec<u8>),
     Bool(bool),
     Var(String),
-    /// Unary minus; the only unary operator in v0.
+    /// Unary minus, on an `int`.
     Neg(Box<Expr>),
+    /// Logical negation, on a `bool`.
+    Not(Box<Expr>),
     Bin { op: BinOp, lhs: Box<Expr>, rhs: Box<Expr> },
     Cmp { op: CmpOp, lhs: Box<Expr>, rhs: Box<Expr> },
     /// `lhs && rhs` or `lhs || rhs`. `rhs` is evaluated only when `lhs` did not
@@ -359,6 +385,10 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
         ExprKind::Var(name) => out.push_str(&format!("{pad}var {name}\n")),
         ExprKind::Neg(operand) => {
             out.push_str(&format!("{pad}neg\n"));
+            dump_expr(out, operand, depth + 1);
+        }
+        ExprKind::Not(operand) => {
+            out.push_str(&format!("{pad}not\n"));
             dump_expr(out, operand, depth + 1);
         }
         ExprKind::Cmp { op, lhs, rhs } => {

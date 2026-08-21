@@ -60,15 +60,16 @@ impl<'a> Lexer<'a> {
                 '=' => self.one_or_two('=', TokenKind::EqEq, TokenKind::Eq),
                 '<' => self.one_or_two('=', TokenKind::Le, TokenKind::Lt),
                 '>' => self.one_or_two('=', TokenKind::Ge, TokenKind::Gt),
-                // These three exist only doubled: TinyC has no `!`, `&` or `|`
-                // operator for the lone character to mean instead.
-                '!' => self.only_doubled('=', TokenKind::BangEq, start)?,
+                '!' => self.one_or_two('=', TokenKind::BangEq, TokenKind::Bang),
+                // These two exist only doubled: TinyC has no bitwise `&` or `|`
+                // for the lone character to mean instead.
                 '&' => self.only_doubled('&', TokenKind::AmpAmp, start)?,
                 '|' => self.only_doubled('|', TokenKind::PipePipe, start)?,
                 '+' => self.single(TokenKind::Plus),
                 '-' => self.one_or_two('>', TokenKind::Arrow, TokenKind::Minus),
                 '*' => self.single(TokenKind::Star),
                 '/' => self.single(TokenKind::Slash),
+                '%' => self.single(TokenKind::Percent),
                 ',' => self.single(TokenKind::Comma),
                 '"' => self.string()?,
                 c if c.is_ascii_digit() => self.number()?,
@@ -105,7 +106,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Consume a token that has no one-character form: `!=`, `&&`, `||`.
+    /// Consume a token that has no one-character form: `&&` and `||`.
     ///
     /// Unlike [`Self::one_or_two`] there is nothing to fall back to, so the
     /// character on its own is an error — and the only thing it can plausibly
@@ -326,7 +327,7 @@ mod tests {
     #[test]
     fn two_character_operators_win_over_their_prefixes() {
         assert_eq!(
-            kinds("<= < == = >= > != -> -"),
+            kinds("<= < == = >= > != ! -> -"),
             vec![
                 TokenKind::Le,
                 TokenKind::Lt,
@@ -335,6 +336,7 @@ mod tests {
                 TokenKind::Ge,
                 TokenKind::Gt,
                 TokenKind::BangEq,
+                TokenKind::Bang,
                 TokenKind::Arrow,
                 TokenKind::Minus,
                 TokenKind::Eof,
@@ -343,11 +345,20 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_bang_is_an_error() {
-        // There is no `!` operator, so the only way `!` can appear is in `!=`.
-        let errors = lex("if (!x) { }").unwrap_err();
-        assert!(errors[0].message.contains("unexpected character `!`"));
-        assert_eq!(errors[0].span, Span::new(4, 1));
+    fn a_lone_bang_is_the_negation_operator() {
+        // `!` and `!=` share a first character, so the two-character form has to
+        // win when it is really there and lose when it is not.
+        assert_eq!(
+            kinds("!x != !y"),
+            vec![
+                TokenKind::Bang,
+                TokenKind::Ident("x".into()),
+                TokenKind::BangEq,
+                TokenKind::Bang,
+                TokenKind::Ident("y".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]
@@ -456,7 +467,7 @@ mod tests {
     #[test]
     fn lexes_every_punctuation_token() {
         assert_eq!(
-            kinds("( ) { } ; = + - * / ,"),
+            kinds("( ) { } ; = + - * / % , !"),
             vec![
                 TokenKind::LParen,
                 TokenKind::RParen,
@@ -468,7 +479,9 @@ mod tests {
                 TokenKind::Minus,
                 TokenKind::Star,
                 TokenKind::Slash,
+                TokenKind::Percent,
                 TokenKind::Comma,
+                TokenKind::Bang,
                 TokenKind::Eof,
             ]
         );
@@ -638,6 +651,15 @@ mod tests {
         assert_eq!(
             kinds("1 / 2"),
             vec![TokenKind::Int(1), TokenKind::Slash, TokenKind::Int(2), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_percent_is_the_remainder_operator() {
+        // Nothing else starts with `%`, so it needs no lookahead at all.
+        assert_eq!(
+            kinds("7 % 2"),
+            vec![TokenKind::Int(7), TokenKind::Percent, TokenKind::Int(2), TokenKind::Eof]
         );
     }
 

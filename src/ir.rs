@@ -388,6 +388,7 @@ fn op_name(op: BinOp) -> &'static str {
         BinOp::Sub => "sub",
         BinOp::Mul => "mul",
         BinOp::Div => "div",
+        BinOp::Rem => "rem",
     }
 }
 
@@ -914,6 +915,13 @@ impl Lowering<'_> {
                     }),
                 }
             }
+            ExprKind::Not(operand) => {
+                let (op, lhs, rhs) = self.negated(operand);
+                match fold_cmp(op, lhs, rhs) {
+                    Some(val) => self.emit(Instr::Const { dst, val }),
+                    None => self.emit(Instr::Cmp { op, dst, lhs, rhs }),
+                }
+            }
             ExprKind::Logic { op, lhs, rhs } => self.logic_into(dst, *op, lhs, rhs),
             ExprKind::Call { .. } => {
                 let (callee, args) = self.call_parts(expr);
@@ -994,6 +1002,22 @@ impl Lowering<'_> {
         id
     }
 
+    /// The comparison that computes `!operand`, as `(op, lhs, rhs)`.
+    ///
+    /// There is no `not` instruction, and none is wanted: `!x` *is* `x == 0`,
+    /// which folds and fuses into a branch like any other comparison. When the
+    /// operand is itself a comparison the negation goes one better and inverts
+    /// it in place, so `!(a < b)` costs the single `cmp` that `a >= b` does
+    /// instead of a comparison followed by a comparison against its result.
+    fn negated(&mut self, operand: &Expr) -> (CmpOp, Value, Value) {
+        if let ExprKind::Cmp { op, lhs, rhs } = &operand.kind {
+            let lhs = self.expr(lhs);
+            let rhs = self.expr(rhs);
+            return (op.negate(), lhs, rhs);
+        }
+        (CmpOp::Eq, self.expr(operand), Value::Const(0))
+    }
+
     /// Lower an expression used as an operand, producing a value to read.
     fn expr(&mut self, expr: &Expr) -> Value {
         match &expr.kind {
@@ -1035,6 +1059,16 @@ impl Lowering<'_> {
                 }
                 let dst = self.fresh_temp();
                 self.emit(Instr::Cmp { op: *op, dst, lhs, rhs });
+                Value::Reg(dst)
+            }
+            // `!` is a comparison, so it takes the same path as one.
+            ExprKind::Not(operand) => {
+                let (op, lhs, rhs) = self.negated(operand);
+                if let Some(val) = fold_cmp(op, lhs, rhs) {
+                    return Value::Const(val);
+                }
+                let dst = self.fresh_temp();
+                self.emit(Instr::Cmp { op, dst, lhs, rhs });
                 Value::Reg(dst)
             }
             // A left operand that settles the answer leaves nothing to branch
@@ -1083,8 +1117,11 @@ fn fold_bin(op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
         BinOp::Sub => Some(a.wrapping_sub(b)),
         BinOp::Mul => Some(a.wrapping_mul(b)),
         // `checked_div` answers `None` for both `x / 0` and `MIN / -1`, which
-        // are exactly the two divisions `idiv` refuses.
+        // are exactly the two divisions `idiv` refuses. `checked_rem` refuses
+        // the same pair, and has to: `MIN % -1` is 0 mathematically, but the
+        // machine still computes it with the `idiv` whose *quotient* overflows.
         BinOp::Div => a.checked_div(b),
+        BinOp::Rem => a.checked_rem(b),
     }
 }
 
@@ -1217,6 +1254,74 @@ mod tests {
         let with_for = lower_main("for (int i = 0; i < 3; i = i + 1) {\n  print(i);\n}");
         let with_while = lower_main("int i = 0;\nwhile (i < 3) {\n  print(i);\n  i = i + 1;\n}");
         assert_eq!(with_for.dump(), with_while.dump());
+    }
+
+    // -- negation and remainder --------------------------------------------
+
+    #[test]
+    fn negating_a_comparison_inverts_it_in_place() {
+        // `!(a < b)` is `a >= b`: one comparison, not a comparison plus a
+        // comparison against its result.
+        let ir = lower_main("int a = 1;\nint b = 2;\nprint(!(a < b));");
+        let comparisons: Vec<&Instr> = ir.functions[0].blocks[0]
+            .instrs
+            .iter()
+            .filter(|i| matches!(i, Instr::Cmp { .. }))
+            .collect();
+        assert_eq!(comparisons.len(), 1, "{}", ir.dump());
+        assert!(matches!(comparisons[0], Instr::Cmp { op: CmpOp::Ge, .. }), "{comparisons:?}");
+    }
+
+    #[test]
+    fn negating_anything_else_compares_it_against_zero() {
+        // There is no `not` instruction, and none is needed: `!ok` *is*
+        // `ok == 0`, which folds and fuses like any other comparison.
+        let ir = lower_main("bool ok = true;\nint n = 1;\nok = n > 0;\nprint(!ok);");
+        assert!(
+            ir.functions[0].blocks[0]
+                .instrs
+                .iter()
+                .any(|i| matches!(i, Instr::Cmp { op: CmpOp::Eq, rhs: Value::Const(0), .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn negating_a_literal_is_folded() {
+        let ir = lower_main("print(!true);");
+        let main = &ir.functions[0];
+        assert_eq!(main.blocks[0].instrs.len(), 1, "{}", ir.dump());
+        assert!(matches!(main.blocks[0].instrs[0], Instr::Print { val: Value::Const(0), .. }));
+    }
+
+    #[test]
+    fn a_remainder_between_literals_is_computed_at_compile_time() {
+        let ir = lower_main("print(17 % 5);");
+        let main = &ir.functions[0];
+        assert!(
+            matches!(main.blocks[0].instrs[0], Instr::Print { val: Value::Const(2), .. }),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_remainder_the_machine_would_refuse_is_never_folded() {
+        // `checked_rem` refuses the same pair `checked_div` does, and has to:
+        // `MIN % -1` is 0 mathematically, but the machine reaches it through an
+        // `idiv` whose quotient does not fit.
+        for source in ["print(1 % (3 - 3));", "print((0 - 9223372036854775807 - 1) % (0 - 1));"] {
+            let ir = lower_main(source);
+            assert!(
+                ir.functions[0].blocks[0]
+                    .instrs
+                    .iter()
+                    .any(|i| matches!(i, Instr::Bin { op: BinOp::Rem, .. })),
+                "{source}: {}",
+                ir.dump()
+            );
+        }
     }
 
     // -- short-circuiting operators ----------------------------------------

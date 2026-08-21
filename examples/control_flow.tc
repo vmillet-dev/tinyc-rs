@@ -62,4 +62,17 @@ fn main() {
   // && binds tighter than ||, and both bind looser than a comparison.
   print(1 < 2 && 2 < 3);   // true
   print(false || 5 > 9);   // false
+
+  // `!` binds tighter than any binary operator, so `!ok && big` negates `ok`
+  // alone. Negating a comparison inverts it rather than its result: `!(a < b)`
+  // is compiled as `a >= b`, at no cost at all.
+  bool ok = false;
+  print(!ok);              // true
+  print(!(total < 10));    // true
+  for (int n = 1; n <= 6; n = n + 1) {
+    if (!(n % 2 == 0)) {
+      continue;            // odd numbers are skipped
+    }
+    print(n);              // 2, 4, 6
+  }
 }

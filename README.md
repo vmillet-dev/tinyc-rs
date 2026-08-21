@@ -127,17 +127,21 @@ expr    := and ("||" and)*
 and     := cmp ("&&" cmp)*
 cmp     := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 sum     := term (("+" | "-") term)*
-term    := unary (("*" | "/") unary)*
-unary   := "-" unary | primary
+term    := unary (("*" | "/" | "%") unary)*
+unary   := ("-" | "!") unary | primary
 primary := INT | STRING | BOOL | IDENT | call | "(" expr ")"
 call    := IDENT "(" (expr ("," expr)*)? ")"
 ```
 
 `int` is a 64-bit signed integer, `string` is a pointer to static bytes, `bool`
-is `true` or `false`. Arithmetic is `int`-only, `&&` and `||` are `bool`-only,
-`//` starts a comment, and a variable keeps the type it was declared with —
-assigning a `string` to an `int` is an error. There are deliberately no arrays
-yet, and no `!`: the only way that character can appear is in `!=`.
+is `true` or `false`. Arithmetic is `int`-only, `&&`, `||` and `!` are
+`bool`-only, `//` starts a comment, and a variable keeps the type it was
+declared with — assigning a `string` to an `int` is an error. There are
+deliberately no arrays yet.
+
+There is no implicit truth test either, so `!n` on an `int` is a type error
+rather than a comparison against zero. `%` takes its sign from the dividend, as
+in C: `-7 % 2` is `-1`.
 
 ### Functions
 
@@ -287,6 +291,21 @@ Two details earn their keep:
   reaches it by falling through: the right operand for `&&`, the short circuit
   for `||`. Both spellings then cost one conditional jump and one unconditional
   one, instead of `||` paying for a jump to the block that was already next.
+
+`!` takes the opposite route. There is no `not` instruction in the IR and none
+is wanted, because `!x` **is** `x == 0` — a comparison, which already folds and
+already fuses into the branch that reads it. When the operand is itself a
+comparison the lowering goes one better and inverts it in place, so `!(a < b)`
+becomes `a >= b`:
+
+```
+if (a < b)  { ... }      cmp  rbx, rsi      if (!(a < b)) { ... }      cmp  rbx, rsi
+                         jge  .join2                                   jl   .join2
+```
+
+Negation costs nothing at all there — the same single `cmp`, with the jump the
+other way round. The general case, `!ok` on a value that is not a comparison,
+costs one `cmp reg, 0` that the branch absorbs.
 
 ### What control flow changed underneath
 
@@ -462,6 +481,11 @@ leaves spill nothing and get no frame at all.
 `idiv` does not answer `x / 0`, and it does not answer `i64::MIN / -1` either:
 the quotient does not fit, so the CPU faults exactly as it does on a zero
 divisor. Left alone that is a silent `0xC0000094` with nothing printed.
+
+`%` is the same instruction read from a different register — `idiv` produces the
+quotient in `rax` and the remainder in `rdx` at once — so it carries the same two
+guards. It needs them both: `i64::MIN % -1` is 0 on paper, but the machine still
+reaches that 0 through the `idiv` whose *quotient* does not fit.
 
 Each division is guarded, and each guard a literal operand already answers is
 left out — `n / 7` carries no check at all, `n / (0 - 1)` checks only for

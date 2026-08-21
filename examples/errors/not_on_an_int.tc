@@ -1,0 +1,6 @@
+fn main() {
+  int n = 0;
+  if (!n) {
+    print("zero");
+  }
+}

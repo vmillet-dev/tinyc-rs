@@ -37,8 +37,10 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    Percent,
     Comma,
     Arrow,
+    Bang,
 
     // Comparison.
     EqEq,
@@ -102,8 +104,10 @@ impl TokenKind {
             TokenKind::Minus => "-",
             TokenKind::Star => "*",
             TokenKind::Slash => "/",
+            TokenKind::Percent => "%",
             TokenKind::Comma => ",",
             TokenKind::Arrow => "->",
+            TokenKind::Bang => "!",
 
             // Comparison.
             TokenKind::EqEq => "==",

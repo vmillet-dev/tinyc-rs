@@ -195,7 +195,7 @@ impl DivGuards {
 /// Whether an instruction may jump to a runtime abort, and so needs a frame it
 /// can make a call from.
 fn may_abort(instr: &Instr) -> bool {
-    matches!(instr, Instr::Bin { op: BinOp::Div, lhs, rhs, .. } if DivGuards::of(lhs, rhs).any())
+    matches!(instr, Instr::Bin { op, lhs, rhs, .. } if op.divides() && DivGuards::of(lhs, rhs).any())
 }
 
 pub struct X64Windows {
@@ -672,7 +672,10 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 self.asm.asm(&format!("movzx {work}, {SCRATCH1_8}"));
                 self.store_back(*dst, &work);
             }
-            Instr::Bin { op: BinOp::Div, dst, lhs, rhs } => self.division(*dst, lhs, rhs),
+            // One `idiv`, read from `rax` for the quotient or `rdx` for the
+            // remainder.
+            Instr::Bin { op: BinOp::Div, dst, lhs, rhs } => self.division(*dst, RAX, lhs, rhs),
+            Instr::Bin { op: BinOp::Rem, dst, lhs, rhs } => self.division(*dst, RDX, lhs, rhs),
             Instr::Bin { op, dst, lhs, rhs } => {
                 // The result usually lands in a register that just held one of
                 // the operands — that is register reuse working as intended.
@@ -701,7 +704,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                         self.asm.asm(&format!("imul {work}, {work}, {rhs}"))
                     }
                     BinOp::Mul => self.asm.asm(&format!("imul {work}, {rhs}")),
-                    BinOp::Div => unreachable!("handled above"),
+                    BinOp::Div | BinOp::Rem => unreachable!("handled above"),
                 }
                 self.store_back(*dst, &work);
             }
@@ -760,12 +763,15 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
     }
 
     /// `idiv` is fixed to `rdx:rax`, so the dividend is moved into `rax`, sign
-    /// extended with `cqo`, and the quotient moved back out.
+    /// extended with `cqo`, and the answer moved back out.
     ///
-    /// It also faults rather than producing a wrong answer, on a zero divisor
-    /// and on `i64::MIN / -1`. Both are ruled out first, unless a literal
-    /// operand already rules them out for free.
-    fn division(&mut self, dst: VReg, lhs: &Value, rhs: &Value) {
+    /// One instruction produces both answers: the quotient in `rax` and the
+    /// remainder in `rdx`. `/` and `%` therefore differ by nothing but which
+    /// register `result` names, which is why they share this routine — and why
+    /// `%` inherits the guards below unchanged. It needs them: `i64::MIN % -1`
+    /// is 0 mathematically, but the machine still reaches it through the `idiv`
+    /// whose *quotient* does not fit.
+    fn division(&mut self, dst: VReg, result: &str, lhs: &Value, rhs: &Value) {
         let guards = DivGuards::of(lhs, rhs);
 
         // A literal zero divisor can do nothing but fault.
@@ -801,10 +807,10 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         self.asm.asm("cqo");
         self.asm.asm(&format!("idiv {SCRATCH1}"));
 
-        // The divisor has already been read, so the quotient can go straight
-        // into the destination even if the two share a register.
+        // The divisor has already been read, so the answer can go straight into
+        // the destination even if the two share a register.
         let work = self.work_reg(dst, false);
-        self.asm.mov(&work, RAX);
+        self.asm.mov(&work, result);
         self.store_back(dst, &work);
     }
 
@@ -1128,6 +1134,49 @@ mod tests {
         // between them is a fallthrough and must not be emitted.
         let asm = compile("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
         assert_eq!(asm.matches("jmp  .loop1").count(), 1, "{asm}");
+    }
+
+    #[test]
+    fn a_remainder_reads_rdx_where_a_division_reads_rax() {
+        // One `idiv` produces both, so the two differ by a single `mov`.
+        let quotient = compile("int a = 17;\nint b = 5;\nprint(a / b);");
+        let remainder = compile("int a = 17;\nint b = 5;\nprint(a % b);");
+        assert_eq!(quotient.matches("idiv").count(), 1, "{quotient}");
+        assert_eq!(remainder.matches("idiv").count(), 1, "{remainder}");
+        assert!(remainder.contains(", rdx"), "{remainder}");
+        assert!(!remainder.contains(", rax"), "{remainder}");
+    }
+
+    #[test]
+    fn a_remainder_carries_the_same_guards_a_division_does() {
+        // Including the overflow one: `MIN % -1` is 0 on paper, but the `idiv`
+        // that computes it still faults.
+        let asm = compile("int a = 17;\nint b = 5;\nprint(a % b);");
+        assert!(asm.contains(ABORT_DIV_ZERO), "{asm}");
+        assert!(asm.contains(ABORT_DIV_OVERFLOW), "{asm}");
+    }
+
+    #[test]
+    fn a_negated_condition_costs_nothing_at_all() {
+        // `!(a < b)` is emitted as `a >= b`, so the only difference from the
+        // un-negated form is which way the conditional jump goes.
+        let plain = compile("int a = 1;\nint b = 2;\nif (a < b) {\n  print(1);\n}");
+        let negated = compile("int a = 1;\nint b = 2;\nif (!(a < b)) {\n  print(1);\n}");
+        assert_eq!(plain.matches("cmp  ").count(), negated.matches("cmp  ").count(), "{negated}");
+        assert!(plain.contains("jge  ."), "{plain}");
+        assert!(negated.contains("jl   ."), "{negated}");
+        // Neither ever materialises the comparison as a 0 or a 1.
+        assert!(!negated.contains("setl"), "{negated}");
+    }
+
+    #[test]
+    fn negating_a_value_fuses_into_the_branch_that_reads_it() {
+        // `!ok` lowers to `ok == 0`, which is the same fusable shape an `if`
+        // already had: one `cmp`, one `jcc`, and no `setcc`.
+        let asm = compile("int n = 1;\nbool ok = n > 0;\nif (!ok) {\n  print(1);\n}");
+        assert!(asm.contains(", 0"), "{asm}");
+        assert!(asm.contains("jne  ."), "{asm}");
+        assert_eq!(asm.matches("sete").count(), 0, "{asm}");
     }
 
     #[test]

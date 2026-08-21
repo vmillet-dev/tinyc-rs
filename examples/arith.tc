@@ -1,4 +1,4 @@
-// Exercises precedence, parentheses, unary minus and division.
+// Exercises precedence, parentheses, unary minus, division and remainder.
 // Each nested product becomes a temporary that dies as soon as it is consumed,
 // so the register allocator reuses the same machine registers over and over.
 fn main() {
@@ -13,4 +13,10 @@ fn main() {
   print(a * b / c);        // 42 / 2        = 21
   print(100 / c / c);      // 50 / 2        = 25
   print(a * a + b * b + c * c);  // 36 + 49 + 4 = 89
+
+  // `%` binds as tightly as `*` and `/`, and is the same `idiv` underneath —
+  // read from rdx instead of rax.
+  print(b % c);            // 7 % 2         = 1
+  print(a + b % c);        // 6 + 1         = 7
+  print(-b % c);           // -7 % 2        = -1, the sign follows the dividend
 }

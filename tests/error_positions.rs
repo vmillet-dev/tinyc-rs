@@ -116,6 +116,13 @@ fn a_logical_operator_on_the_wrong_type_points_at_the_offending_operand() {
 }
 
 #[test]
+fn negating_an_int_points_at_the_operand_not_the_bang() {
+    // `if (!n)` is the habit from a language with truthiness, so this is the
+    // one worth pointing at precisely.
+    assert_error_at("not_on_an_int.tc", "3:8");
+}
+
+#[test]
 fn a_break_with_no_loop_to_leave_points_at_the_keyword() {
     // An `if` is not a loop, which is exactly the mistake worth catching.
     assert_error_at("break_outside_loop.tc", "3:5");

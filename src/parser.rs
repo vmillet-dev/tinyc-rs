@@ -23,8 +23,8 @@
 //! and     := cmp ("&&" cmp)*
 //! cmp     := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 //! sum     := term (("+" | "-") term)*
-//! term    := unary (("*" | "/") unary)*
-//! unary   := "-" unary | primary
+//! term    := unary (("*" | "/" | "%") unary)*
+//! unary   := ("-" | "!") unary | primary
 //! primary := INT | STRING | BOOL | IDENT | call | "(" expr ")"
 //! call    := IDENT "(" (expr ("," expr)*)? ")"
 //! ```
@@ -538,6 +538,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek().kind {
                 TokenKind::Star => BinOp::Mul,
                 TokenKind::Slash => BinOp::Div,
+                TokenKind::Percent => BinOp::Rem,
                 _ => return Ok(lhs),
             };
             self.bump();
@@ -556,18 +557,23 @@ impl<'a> Parser<'a> {
 
     /// Every recursive path through the expression grammar comes through here,
     /// which is why this is where the nesting limit is counted.
+    ///
+    /// Both prefix operators bind tighter than any binary one, so `!a == b`
+    /// compares `!a` with `b` — the same way `-a * b` multiplies `-a`.
     fn unary(&mut self) -> PResult<Expr> {
         self.nested(|p| {
-            if let TokenKind::Minus = p.peek().kind {
-                let minus = p.bump().span;
-                let operand = p.unary()?;
-                return Ok(Expr {
-                    id: p.node_id(),
-                    span: minus.to(operand.span),
-                    kind: ExprKind::Neg(Box::new(operand)),
-                });
-            }
-            p.primary()
+            let build: fn(Box<Expr>) -> ExprKind = match p.peek().kind {
+                TokenKind::Minus => ExprKind::Neg,
+                TokenKind::Bang => ExprKind::Not,
+                _ => return p.primary(),
+            };
+            let operator = p.bump().span;
+            let operand = p.unary()?;
+            Ok(Expr {
+                id: p.node_id(),
+                span: operator.to(operand.span),
+                kind: build(Box::new(operand)),
+            })
         })
     }
 
@@ -803,7 +809,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remainder_binds_as_tightly_as_multiplication() {
+        assert_eq!(
+            dump_main("print(1 + 2 % 3);"),
+            "print\n  +\n    int 1\n    %\n      int 2\n      int 3\n"
+        );
+        // And is left-associative alongside it: `(4 % 3) * 2`.
+        assert_eq!(
+            dump_main("print(4 % 3 * 2);"),
+            "print\n  *\n    %\n      int 4\n      int 3\n    int 2\n"
+        );
+    }
+
     // -- logical operators -------------------------------------------------
+
+    #[test]
+    fn negation_binds_tighter_than_any_binary_operator() {
+        // `!a && b` is `(!a) && b`, and `!a == b` compares `!a` with `b`.
+        assert_eq!(
+            dump_main("print(!a && b);"),
+            "print\n  &&\n    not\n      var a\n    var b\n"
+        );
+        assert_eq!(
+            dump_main("print(!a == b);"),
+            "print\n  ==\n    not\n      var a\n    var b\n"
+        );
+    }
+
+    #[test]
+    fn negation_nests() {
+        assert_eq!(dump_main("print(!!a);"), "print\n  not\n    not\n      var a\n");
+    }
+
+    #[test]
+    fn a_bang_is_not_equal_only_when_an_equals_follows_it() {
+        // The two spellings are distinguished in the lexer, but this is where
+        // getting it wrong would show: `a != b` must not parse as `a ! (= b)`.
+        assert_eq!(
+            dump_main("print(a != b);"),
+            "print\n  !=\n    var a\n    var b\n"
+        );
+    }
+
 
     #[test]
     fn and_binds_tighter_than_or() {

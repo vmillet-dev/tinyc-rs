@@ -59,7 +59,7 @@ fn every_example_prints_what_it_promises() {
 fn the_awkward_corners_of_code_generation_still_compute() {
     let Some(tools) = Tools::find() else { return };
 
-    let cases: [(&str, &str); 10] = [
+    let cases: [(&str, &str); 15] = [
         // The destination shares a register with the right operand of an
         // operator that does not commute, so the operand has to be read before
         // the destination is written.
@@ -91,6 +91,16 @@ fn the_awkward_corners_of_code_generation_still_compute() {
              print(total);",
             "55",
         ),
+        // `%` reads `rdx` where `/` reads `rax`; swapping them silently would
+        // still produce a plausible-looking number.
+        ("int a = 17;\nint b = 5;\nprint(a % b);", "2"),
+        ("int a = 17;\nint b = 5;\nprint(a / b);", "3"),
+        // The remainder takes its sign from the dividend, which is what `cqo`
+        // sign-extending into `rdx:rax` is for.
+        ("int a = 0 - 17;\nint b = 5;\nprint(a % b);", "-2"),
+        ("int a = 17;\nint b = 0 - 5;\nprint(a % b);", "2"),
+        // The destination shares a register with an operand, as for division.
+        ("int a = 17;\nint b = 5;\na = a % b;\nprint(a);", "2"),
     ];
 
     for (index, (body, expected)) in cases.iter().enumerate() {
@@ -114,6 +124,14 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
         (
             "fn neg() -> int {\n  return 0 - 1;\n}\n\
              fn main() {\n  int m = 0 - 9223372036854775807 - 1;\n  print(m / neg());\n}",
+            "overflows",
+        ),
+        // `%` is the same `idiv`, so it faults in both the same ways — the
+        // second one even though `MIN % -1` is 0 on paper.
+        ("fn zero() -> int {\n  return 0;\n}\nfn main() {\n  print(1 % zero());\n}", "by zero"),
+        (
+            "fn neg() -> int {\n  return 0 - 1;\n}\n\
+             fn main() {\n  int m = 0 - 9223372036854775807 - 1;\n  print(m % neg());\n}",
             "overflows",
         ),
     ];
@@ -143,7 +161,7 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
 fn short_circuits_and_loop_jumps_do_what_they_promise() {
     let Some(tools) = Tools::find() else { return };
 
-    let cases: [(&str, &str); 11] = [
+    let cases: [(&str, &str); 15] = [
         // The right operand must not run: `10 / z` would abort the process.
         ("int z = 0;\nprint(z != 0 && 10 / z > 1);", "false"),
         ("int z = 0;\nprint(z == 0 || 10 / z > 1);", "true"),
@@ -189,6 +207,13 @@ fn short_circuits_and_loop_jumps_do_what_they_promise() {
              if (i == 1) {\n    i = i + 1;\n    continue;\n  }\n  i = i + 1;\n}\nprint(ok);",
             "false",
         ),
+        // `!(a < b)` is compiled as `a >= b`, so an off-by-one in the inversion
+        // table would show up right at the boundary where the two differ.
+        ("int a = 5;\nint b = 5;\nprint(!(a < b));", "true"),
+        ("int a = 5;\nint b = 5;\nprint(!(a <= b));", "false"),
+        // Negating something that is not a comparison goes through `== 0`.
+        ("bool ok = 1 > 0;\nprint(!ok);", "false"),
+        ("bool ok = 1 > 0;\nprint(!!ok);", "true"),
     ];
 
     for (index, (body, expected)) in cases.iter().enumerate() {

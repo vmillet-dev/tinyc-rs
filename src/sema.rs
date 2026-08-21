@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, NodeId, Program, Stmt, Ty};
+use crate::ast::{Block, Expr, ExprKind, FnDecl, NodeId, Program, Stmt, Ty};
 use crate::diag::{Diagnostic, Result, Span};
 
 /// The name of the entry point.
@@ -611,6 +611,22 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 }
                 Ty::Int
             }
+            ExprKind::Not(operand) => {
+                let inner = self.expr(operand);
+                if inner != Ty::Bool {
+                    self.error(
+                        Diagnostic::new(
+                            format!("cannot apply `!` to {} value", inner.with_article()),
+                            operand.span,
+                        )
+                        .with_label(format!("expected bool, found {}", inner.name()))
+                        // `!n` on an int is the mistake this catches, and it is
+                        // almost always a habit from a language with truthiness.
+                        .with_note("`!` negates a bool; there is no implicit truth test", None),
+                    );
+                }
+                Ty::Bool
+            }
             ExprKind::Bin { op, lhs, rhs } => {
                 let lhs_ty = self.expr(lhs);
                 let rhs_ty = self.expr(rhs);
@@ -633,7 +649,9 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     }
                 }
 
-                if *op == BinOp::Div && matches!(rhs.kind, ExprKind::Int(0)) {
+                // `%` divides too, and traps on a zero divisor exactly as `/`
+                // does — it is the same instruction underneath.
+                if op.divides() && matches!(rhs.kind, ExprKind::Int(0)) {
                     self.error(
                         Diagnostic::new("division by zero", rhs.span)
                             .with_label("this divisor is always zero"),
@@ -934,7 +952,44 @@ mod tests {
         assert!(errors[0].message.contains("undeclared variable `i`"));
     }
 
+    #[test]
+    fn the_remainder_operator_is_int_only_like_the_rest_of_arithmetic() {
+        assert!(check_main("print(17 % 5);").is_ok());
+        assert!(check_main("bool even = 4 % 2 == 0;\nprint(even);").is_ok());
+        assert!(errors_in_main("print(true % 2);")[0].message.contains("cannot apply `%`"));
+    }
+
+    #[test]
+    fn a_remainder_by_a_literal_zero_is_rejected_like_a_division() {
+        // It is the same instruction underneath, and traps the same way.
+        assert!(errors_in_main("print(1 % 0);")[0].message.contains("division by zero"));
+    }
+
     // -- logical operators -------------------------------------------------
+
+    #[test]
+    fn negation_takes_a_bool_and_produces_one() {
+        assert!(check_main("bool ok = true;\nprint(!ok);").is_ok());
+        assert!(check_main("if (!(1 < 2)) {\n}").is_ok());
+        assert!(check_main("bool a = !!false;\nprint(a);").is_ok());
+    }
+
+    #[test]
+    fn rejects_negating_anything_that_is_not_a_bool() {
+        // `!n` on an int is the habit from languages with truthiness, so the
+        // diagnostic says there is no implicit truth test.
+        let errors = errors_in_main("int n = 1;\nprint(!n);");
+        assert!(errors[0].message.contains("cannot apply `!`"), "{}", errors[0].message);
+        assert!(errors[0].note.is_some(), "{errors:#?}");
+        assert!(errors_in_main("print(!\"a\");")[0].message.contains("cannot apply `!`"));
+    }
+
+    #[test]
+    fn a_negation_is_a_bool_wherever_one_is_wanted() {
+        assert!(check_main("bool ok = true;\nwhile (!ok) {\n  ok = true;\n}").is_ok());
+        assert!(errors_in_main("bool ok = true;\nint n = !ok;")[0].message.contains("cannot initialize"));
+    }
+
 
     #[test]
     fn logical_operators_take_bools_and_produce_one() {
