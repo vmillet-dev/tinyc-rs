@@ -10,6 +10,13 @@ use std::path::{Path, PathBuf};
 /// How many columns a tab character occupies when a source line is echoed.
 const TAB_WIDTH: usize = 4;
 
+/// Most characters of a source line a diagnostic will echo. A longer line is
+/// shown as a window around the caret, with `...` for what was cut.
+const MAX_ECHOED_LINE: usize = 100;
+
+/// The marker standing in for the part of a line that was cut.
+const ELLIPSIS: &str = "...";
+
 /// A half-open byte range `[offset, offset + len)` into a [`SourceFile`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Span {
@@ -155,7 +162,7 @@ impl SourceFile {
             }
             chars_seen += 1;
         }
-        if chars_seen <= col - 1 {
+        if chars_seen < col {
             // Span points at (or past) the end of the line, e.g. a missing `;`.
             caret_col = shown.chars().count();
         }
@@ -164,10 +171,14 @@ impl SourceFile {
         let span_end = (span.offset + span.len) as usize;
         let line_end = self.line_starts[line - 1] + text.len();
         let end = span_end.min(line_end);
-        let width = self.text[span.offset as usize..end.max(span.offset as usize)]
+        let mut width = self.text[span.offset as usize..end.max(span.offset as usize)]
             .chars()
             .count()
             .max(1);
+
+        // A machine-generated line can be arbitrarily long, and echoing all of
+        // it buries the message. Keep a window around the caret instead.
+        let (shown, caret_col) = window(&shown, caret_col, &mut width);
 
         let path = self.path.display();
         out.push_str(&format!("{:w$}--> {path}:{line}:{col}\n", " ", w = gutter));
@@ -183,6 +194,34 @@ impl SourceFile {
             c = caret_col,
         ));
     }
+}
+
+/// Cut `line` down to [`MAX_ECHOED_LINE`] characters around `caret`, answering
+/// the text to print and the column the caret lands on inside it. `width`, the
+/// length of the underline, is clipped to what is still visible.
+fn window(line: &str, caret: usize, width: &mut usize) -> (String, usize) {
+    let length = line.chars().count();
+    if length <= MAX_ECHOED_LINE {
+        return (line.to_string(), caret);
+    }
+
+    // Centre the window on the caret, then slide it back inside the line so the
+    // last characters are still reachable.
+    let half = MAX_ECHOED_LINE / 2;
+    let start = caret.saturating_sub(half).min(length - MAX_ECHOED_LINE);
+    let end = start + MAX_ECHOED_LINE;
+
+    let mut shown = String::new();
+    if start > 0 {
+        shown.push_str(ELLIPSIS);
+    }
+    shown.extend(line.chars().skip(start).take(MAX_ECHOED_LINE));
+    if end < length {
+        shown.push_str(ELLIPSIS);
+    }
+
+    *width = (*width).min(end - caret.min(end)).max(1);
+    (shown, caret - start + if start > 0 { ELLIPSIS.len() } else { 0 })
 }
 
 #[cfg(test)]
@@ -204,6 +243,30 @@ mod tests {
         let sf = SourceFile::new("t.tc", "string s = \"é\"; x".to_string());
         let offset = sf.text().find('x').unwrap() as u32;
         assert_eq!(sf.line_col(offset), (1, 17));
+    }
+
+    #[test]
+    fn a_very_long_line_is_shown_as_a_window_around_the_caret() {
+        // A generated file can hold a line of any length; echoing all of it
+        // would bury the message it is supposed to illustrate.
+        let padding = "x".repeat(500);
+        let text = format!("int a = 1; // {padding} here");
+        let offset = text.find("here").unwrap() as u32;
+        let sf = SourceFile::new("t.tc", text);
+
+        let rendered = sf.render(&Diagnostic::new("something", Span::new(offset as usize, 4)));
+        let echoed = rendered.lines().nth(3).expect("the source line");
+        assert!(echoed.len() < MAX_ECHOED_LINE + 20, "line was not trimmed: {echoed}");
+        assert!(echoed.contains(ELLIPSIS), "the cut should be marked: {echoed}");
+        assert!(echoed.contains("here"), "the caret's own text must survive: {echoed}");
+    }
+
+    #[test]
+    fn a_short_line_is_echoed_whole() {
+        let sf = SourceFile::new("t.tc", "int x = 1;\n".to_string());
+        let rendered = sf.render(&Diagnostic::new("something", Span::new(4, 1)));
+        assert!(rendered.contains("int x = 1;"), "{rendered}");
+        assert!(!rendered.contains(ELLIPSIS), "{rendered}");
     }
 
     #[test]

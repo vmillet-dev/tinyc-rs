@@ -5,9 +5,10 @@ use std::process::ExitCode;
 
 use clap::{Parser, ValueEnum};
 
-use tinyc::codegen::{self, Target};
+use tinyc::Stage;
+use tinyc::codegen::Target;
 use tinyc::diag::SourceFile;
-use tinyc::{ast, ir, lexer, parser, sema};
+use tinyc::ast;
 
 #[derive(Parser)]
 #[command(
@@ -47,7 +48,9 @@ enum Emit {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
+    // The pipeline recurses with the nesting of the source, which needs more
+    // stack than a thread gets by default.
+    match tinyc::with_compiler_stack(|| run(&cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             eprint!("{message}");
@@ -69,39 +72,38 @@ fn run(cli: &Cli) -> Result<(), String> {
         .map_err(|e| format!("error: cannot read {}: {e}\n", cli.input.display()))?;
     let source = SourceFile::new(&cli.input, text);
 
-    // Each stage is run explicitly here so that `--emit` can stop between any
-    // two of them; `tinyc::compile` chains the same calls in one go.
     let render = |errors: Vec<tinyc::diag::Diagnostic>| -> String {
         errors.iter().map(|d| source.render(d)).collect::<Vec<_>>().join("\n")
     };
 
-    let tokens = lexer::lex(source.text()).map_err(render)?;
-    if cli.emit == Emit::Tokens {
-        for token in &tokens {
-            let (line, col) = source.line_col(token.span.offset);
-            println!("{line:>3}:{col:<3} {:?}", token.kind);
+    // `--emit` stops the pipeline after a stage by answering `false`; the order
+    // of the stages themselves lives in `tinyc::compile_with`, not here.
+    let compiled = tinyc::compile_with(source.text(), target, |stage| match (stage, cli.emit) {
+        (Stage::Tokens(tokens), Emit::Tokens) => {
+            for token in tokens {
+                let (line, col) = source.line_col(token.span.offset);
+                println!("{line:>3}:{col:<3} {:?}", token.kind);
+            }
+            false
         }
-        return Ok(());
-    }
+        (Stage::Ast(ast), Emit::Ast) => {
+            print!("{}", ast::dump(ast));
+            false
+        }
+        (Stage::Ir(ir), Emit::Ir) => {
+            print!("{}", ir.dump());
+            false
+        }
+        _ => true,
+    })
+    .map_err(render)?;
 
-    let ast = parser::parse(&tokens).map_err(render)?;
-    if cli.emit == Emit::Ast {
-        print!("{}", ast::dump(&ast));
-        return Ok(());
-    }
+    let Some(compiled) = compiled else { return Ok(()) };
 
-    let types = sema::check(&ast).map_err(render)?;
-    let ir = ir::lower(&ast, &types);
-    if cli.emit == Emit::Ir {
-        print!("{}", ir.dump());
-        return Ok(());
-    }
-
-    let (backend, allocations, asm) = codegen::compile(&ir, target);
     if cli.dump_regalloc {
-        for (function, allocation) in ir.functions.iter().zip(&allocations) {
+        for (function, allocation) in compiled.ir.functions.iter().zip(&compiled.allocations) {
             println!("{}:", function.signature());
-            print!("{}", allocation.dump(function, backend.register_file()));
+            print!("{}", allocation.dump(function, &compiled.registers));
         }
     }
 
@@ -112,9 +114,9 @@ fn run(cli: &Cli) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("error: cannot create {}: {e}\n", parent.display()))?;
     }
-    std::fs::write(&output, asm)
+    std::fs::write(&output, &compiled.asm)
         .map_err(|e| format!("error: cannot write {}: {e}\n", output.display()))?;
 
-    println!("wrote {} ({})", output.display(), backend.name());
+    println!("wrote {} ({})", output.display(), compiled.backend);
     Ok(())
 }

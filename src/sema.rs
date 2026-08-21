@@ -13,14 +13,10 @@
 //! function call *itself* — by the time `fib`'s body is checked, `fib` is
 //! already in the table. A single pass could only ever see backwards.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, NodeId, Program, Stmt, Ty};
 use crate::diag::{Diagnostic, Result, Span};
-
-/// The most parameters a function may take: the four the Microsoft x64 ABI
-/// passes in registers. A fifth would have to travel on the stack.
-pub const MAX_PARAMS: usize = 4;
 
 /// The name of the entry point.
 pub const ENTRY_POINT: &str = "main";
@@ -47,11 +43,16 @@ struct Signature {
     name_span: Span,
 }
 
-pub fn check(program: &Program) -> Result<Types> {
+/// Type check a program.
+///
+/// `max_params` is how many arguments the target can pass in registers; the
+/// front end has no opinion of its own about that, it just enforces what
+/// [`crate::codegen::RegisterFile::max_args`] reports.
+pub fn check(program: &Program, max_params: usize) -> Result<Types> {
     let mut errors = Vec::new();
 
     // Pass 1: every signature, before any body.
-    let signatures = collect_signatures(program, &mut errors);
+    let signatures = collect_signatures(program, max_params, &mut errors);
     check_entry_point(program, &signatures, &mut errors);
 
     // Pass 2: the bodies, each with the whole table visible.
@@ -60,46 +61,52 @@ pub fn check(program: &Program) -> Result<Types> {
         // treated as an int so a single mistake does not cascade.
         types: Types { expr_ty: vec![Ty::Int; program.node_count] },
         signatures: &signatures,
-        scopes: Vec::new(),
-        ret: None,
-        ret_span: Span::new(0, 0),
         errors,
     };
     for function in &program.functions {
-        checker.function(function);
+        FnChecker::new(&mut checker, function).run(function);
     }
 
     if checker.errors.is_empty() {
-        Ok(checker.types)
-    } else {
-        Err(checker.errors)
+        return Ok(checker.types);
     }
+
+    // Errors are produced in traversal order, which is not source order: a
+    // statement's value is checked before its name, so `y = y + 1` would report
+    // column 7 before column 3. Sorting is what makes a list of diagnostics read
+    // down the file.
+    let mut errors = checker.errors;
+    errors.sort_by_key(|d| d.span.offset);
+    Err(errors)
 }
 
 /// Pass 1: one entry per function name, with the first declaration winning.
 fn collect_signatures(
     program: &Program,
+    max_params: usize,
     errors: &mut Vec<Diagnostic>,
 ) -> HashMap<String, Signature> {
     let mut signatures: HashMap<String, Signature> = HashMap::new();
 
     for function in &program.functions {
-        if function.params.len() > MAX_PARAMS {
+        if function.params.len() > max_params {
             // Point at the first parameter that does not fit.
-            let offending = &function.params[MAX_PARAMS];
+            let offending = &function.params[max_params];
             errors.push(
                 Diagnostic::new(
                     format!(
-                        "`{}` takes {} parameters, but at most {MAX_PARAMS} are supported",
+                        "`{}` takes {} parameters, but at most {max_params} are supported",
                         function.name,
                         function.params.len()
                     ),
                     offending.ty_span.to(offending.name_span),
                 )
-                .with_label(format!("parameter {} is one too many", MAX_PARAMS + 1))
+                .with_label(format!("parameter {} is one too many", max_params + 1))
                 .with_note(
-                    "the first four arguments travel in registers; passing more \
-                     would need stack arguments",
+                    format!(
+                        "the first {max_params} arguments travel in registers; passing more \
+                         would need stack arguments"
+                    ),
                     None,
                 ),
             );
@@ -196,20 +203,58 @@ fn always_returns(block: &Block) -> bool {
     })
 }
 
+/// What the whole program shares: one type table, one signature table, one list
+/// of diagnostics.
 struct Checker<'a> {
     types: Types,
     /// Every signature in the program, immutable once pass 1 is done.
     signatures: &'a HashMap<String, Signature>,
-    /// One map per open block, innermost last. A name is looked up from the
-    /// inside out, and a block's declarations disappear when it closes.
-    scopes: Vec<HashMap<String, (Ty, Span)>>,
-    /// Return type of the function being checked, and where it was written.
-    ret: Option<Ty>,
-    ret_span: Span,
     errors: Vec<Diagnostic>,
 }
 
-impl Checker<'_> {
+/// One function's body, and the state that means nothing outside it.
+///
+/// Scopes, the return type and the names already complained about are all
+/// per-function. Kept as fields of the program-wide [`Checker`] they would have
+/// to be reset at the top of every body, and forgetting one would leak a
+/// previous function's answer into the next — so they live here instead, and are
+/// created and dropped with the body they describe.
+struct FnChecker<'a, 'c> {
+    shared: &'c mut Checker<'a>,
+    /// Return type of this function, and where it was written.
+    ret: Option<Ty>,
+    ret_span: Span,
+    /// One map per open block, innermost last. A name is looked up from the
+    /// inside out, and a block's declarations disappear when it closes.
+    scopes: Vec<HashMap<String, (Ty, Span)>>,
+    /// Names already reported as undeclared. One missing declaration is one
+    /// mistake, however many times the name is mentioned afterwards.
+    undeclared: HashSet<String>,
+}
+
+impl<'a, 'c> FnChecker<'a, 'c> {
+    fn new(shared: &'c mut Checker<'a>, function: &FnDecl) -> FnChecker<'a, 'c> {
+        FnChecker {
+            shared,
+            ret: function.ret,
+            ret_span: function.ret_span,
+            scopes: Vec::new(),
+            undeclared: HashSet::new(),
+        }
+    }
+
+    fn error(&mut self, diagnostic: Diagnostic) {
+        self.shared.errors.push(diagnostic);
+    }
+
+    /// The signature of a function anywhere in the program.
+    ///
+    /// The table outlives the checker, so what comes back does not borrow
+    /// `self` and the caller may keep reporting errors while holding it.
+    fn signature(&self, name: &str) -> Option<&'a Signature> {
+        self.shared.signatures.get(name)
+    }
+
     /// The type and declaration span of a visible variable.
     fn lookup(&self, name: &str) -> Option<(Ty, Span)> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name).copied())
@@ -222,7 +267,7 @@ impl Checker<'_> {
         let innermost = self.scopes.last_mut().expect("a scope is always open");
         if let Some((_, previous)) = innermost.get(name) {
             let previous = *previous;
-            self.errors.push(
+            self.error(
                 Diagnostic::new(format!("`{name}` is already declared"), name_span)
                     .with_label(format!("declared a second time here, as {what}"))
                     .with_note("previous declaration", Some(previous)),
@@ -232,10 +277,24 @@ impl Checker<'_> {
         }
     }
 
-    fn function(&mut self, function: &FnDecl) {
-        self.ret = function.ret;
-        self.ret_span = function.ret_span;
+    /// Report `name` as undeclared, unless this function has already been told.
+    ///
+    /// The diagnostic is built lazily, because on every mention after the first
+    /// it would only be thrown away.
+    fn report_undeclared(&mut self, name: &str, diagnostic: impl FnOnce() -> Diagnostic) {
+        if self.undeclared.insert(name.to_string()) {
+            self.error(diagnostic());
+        }
+    }
 
+    /// Record an expression's type in the side table, and hand it back so
+    /// callers can keep using it.
+    fn record(&mut self, id: NodeId, ty: Ty) -> Ty {
+        self.shared.types.expr_ty[id.0 as usize] = ty;
+        ty
+    }
+
+    fn run(&mut self, function: &FnDecl) {
         // Parameters live in the body's outermost scope, so a local of the same
         // name at the top level of the body is a redeclaration, not a shadow.
         self.scopes.push(HashMap::new());
@@ -252,7 +311,7 @@ impl Checker<'_> {
             // message talks about, and it is where a `return` would have to go.
             let body = function.body.span;
             let closing_brace = Span::new((body.offset + body.len - 1) as usize, 1);
-            self.errors.push(
+            self.error(
                 Diagnostic::new(
                     format!("`{}` may finish without returning a value", function.name),
                     closing_brace,
@@ -275,7 +334,7 @@ impl Checker<'_> {
     fn condition(&mut self, cond: &Expr, keyword: &str) {
         let ty = self.expr(cond);
         if ty != Ty::Bool {
-            self.errors.push(
+            self.error(
                 Diagnostic::new(
                     format!("the condition of `{keyword}` must be a `bool`"),
                     cond.span,
@@ -291,7 +350,7 @@ impl Checker<'_> {
             Stmt::Decl { ty, name, name_span, init, .. } => {
                 let actual = self.expr(init);
                 if actual != *ty {
-                    self.errors.push(
+                    self.error(
                         Diagnostic::new(
                             format!(
                                 "cannot initialize {} variable with {} value",
@@ -306,40 +365,44 @@ impl Checker<'_> {
                 self.declare(name, *ty, *name_span, "a variable");
             }
             Stmt::Assign { name, name_span, value } => {
-                let actual = self.expr(value);
-                match self.lookup(name) {
-                    // A variable keeps the type it was declared with.
-                    Some((declared, declared_span)) => {
-                        if actual != declared {
-                            self.errors.push(
-                                Diagnostic::new(
-                                    format!(
-                                        "cannot assign {} value to {} variable",
-                                        actual.with_article(),
-                                        declared.with_article()
-                                    ),
-                                    value.span,
-                                )
-                                .with_label(format!(
-                                    "expected {}, found {}",
-                                    declared.name(),
-                                    actual.name()
-                                ))
-                                .with_note(
-                                    format!("`{name}` was declared here"),
-                                    Some(declared_span),
-                                ),
-                            );
-                        }
-                    }
-                    None => self.errors.push(
-                        Diagnostic::new(format!("undeclared variable `{name}`"), *name_span)
+                // The target is looked up *before* the value is checked, so
+                // that `y = y + 1` reports the assignment rather than the use
+                // inside it — the assignment is the better place to point.
+                let target = self.lookup(name);
+                if target.is_none() {
+                    let (name, span) = (name.clone(), *name_span);
+                    self.report_undeclared(&name, || {
+                        Diagnostic::new(format!("undeclared variable `{name}`"), span)
                             .with_label("assign to it after declaring it")
                             .with_note(
                                 format!("a declaration gives it a type, as in `int {name} = 0;`"),
                                 None,
+                            )
+                    });
+                }
+
+                let actual = self.expr(value);
+                // A variable keeps the type it was declared with. An undeclared
+                // one has no type to disagree with, and was reported above.
+                if let Some((declared, declared_span)) = target
+                    && actual != declared
+                {
+                    self.error(
+                        Diagnostic::new(
+                            format!(
+                                "cannot assign {} value to {} variable",
+                                actual.with_article(),
+                                declared.with_article()
                             ),
-                    ),
+                            value.span,
+                        )
+                        .with_label(format!(
+                            "expected {}, found {}",
+                            declared.name(),
+                            actual.name()
+                        ))
+                        .with_note(format!("`{name}` was declared here"), Some(declared_span)),
+                    );
                 }
             }
             Stmt::Print { value, .. } => {
@@ -370,8 +433,11 @@ impl Checker<'_> {
             Stmt::Return { span, value } => self.return_stmt(*span, value.as_ref()),
             // The result of a call statement is discarded, so a function that
             // returns nothing is exactly as welcome as one that returns a value.
+            // The type still goes in the table: every expression node has an
+            // entry, and a hole here would be a trap for whoever reads one next.
             Stmt::Call(call) => {
-                self.call(call, true);
+                let ty = self.call(call, true).unwrap_or(Ty::Int);
+                self.record(call.id, ty);
             }
         }
     }
@@ -381,7 +447,7 @@ impl Checker<'_> {
             (Some(expected), Some(expr)) => {
                 let actual = self.expr(expr);
                 if actual != expected {
-                    self.errors.push(
+                    self.error(
                         Diagnostic::new(
                             format!(
                                 "cannot return {} value from a function returning {}",
@@ -399,14 +465,14 @@ impl Checker<'_> {
                     );
                 }
             }
-            (Some(expected), None) => self.errors.push(
+            (Some(expected), None) => self.error(
                 Diagnostic::new("this `return` needs a value", span)
                     .with_label(format!("expected {}", expected.with_article()))
                     .with_note("this return type was declared here", Some(self.ret_span)),
             ),
             (None, Some(expr)) => {
                 self.expr(expr);
-                self.errors.push(
+                self.error(
                     Diagnostic::new("this function returns nothing", expr.span)
                         .with_label("so this value has nowhere to go")
                         .with_note(
@@ -433,10 +499,10 @@ impl Checker<'_> {
         // when the callee turns out not to exist.
         let actual: Vec<Ty> = args.iter().map(|arg| self.expr(arg)).collect();
 
-        // `self.signatures` is a shared reference with a lifetime of its own,
-        // so reading from it does not borrow `self` for the rest of the call.
-        let Some(signature) = self.signatures.get(name) else {
-            self.errors.push(
+        // The signature table outlives this checker, so holding a signature does
+        // not borrow `self` for the rest of the call.
+        let Some(signature) = self.signature(name) else {
+            self.error(
                 Diagnostic::new(format!("unknown function `{name}`"), *name_span)
                     .with_label("not defined anywhere in this file"),
             );
@@ -446,7 +512,7 @@ impl Checker<'_> {
             (signature.params.clone(), signature.ret, signature.name_span);
 
         if params.len() != args.len() {
-            self.errors.push(
+            self.error(
                 Diagnostic::new(
                     format!(
                         "`{name}` takes {}, but {} supplied",
@@ -461,7 +527,7 @@ impl Checker<'_> {
         } else {
             for ((expected, found), arg) in params.iter().zip(&actual).zip(args) {
                 if expected != found {
-                    self.errors.push(
+                    self.error(
                         Diagnostic::new(
                             format!(
                                 "cannot pass {} value where {} is expected",
@@ -478,7 +544,7 @@ impl Checker<'_> {
         }
 
         if ret.is_none() && !as_statement {
-            self.errors.push(
+            self.error(
                 Diagnostic::new(format!("`{name}` returns nothing"), expr.span)
                     .with_label("so this call produces no value to use")
                     .with_note(format!("`{name}` is defined here"), Some(declared_at)),
@@ -495,17 +561,18 @@ impl Checker<'_> {
             ExprKind::Var(name) => match self.lookup(name) {
                 Some((ty, _)) => ty,
                 None => {
-                    self.errors.push(
-                        Diagnostic::new(format!("undeclared variable `{name}`"), expr.span)
-                            .with_label("not declared anywhere above this point"),
-                    );
+                    let span = expr.span;
+                    self.report_undeclared(name, || {
+                        Diagnostic::new(format!("undeclared variable `{name}`"), span)
+                            .with_label("not declared anywhere above this point")
+                    });
                     Ty::Int
                 }
             },
             ExprKind::Neg(operand) => {
                 let inner = self.expr(operand);
                 if inner != Ty::Int {
-                    self.errors.push(
+                    self.error(
                         Diagnostic::new(
                             format!("cannot apply `-` to {} value", inner.with_article()),
                             operand.span,
@@ -522,7 +589,7 @@ impl Checker<'_> {
                 // Arithmetic is int-only in v0; report the offending operand.
                 for (ty, operand) in [(lhs_ty, lhs), (rhs_ty, rhs)] {
                     if ty != Ty::Int {
-                        self.errors.push(
+                        self.error(
                             Diagnostic::new(
                                 format!(
                                     "cannot apply `{}` to `{}` and `{}`",
@@ -538,7 +605,7 @@ impl Checker<'_> {
                 }
 
                 if *op == BinOp::Div && matches!(rhs.kind, ExprKind::Int(0)) {
-                    self.errors.push(
+                    self.error(
                         Diagnostic::new("division by zero", rhs.span)
                             .with_label("this divisor is always zero"),
                     );
@@ -550,7 +617,7 @@ impl Checker<'_> {
                 let rhs_ty = self.expr(rhs);
 
                 if lhs_ty != rhs_ty {
-                    self.errors.push(
+                    self.error(
                         Diagnostic::new(
                             format!(
                                 "cannot compare `{}` with `{}`",
@@ -564,7 +631,7 @@ impl Checker<'_> {
                 } else if lhs_ty == Ty::Str || (lhs_ty == Ty::Bool && op.is_ordering()) {
                     // `==` works on bools; ordering does not, and strings have
                     // no comparison at all without a runtime routine.
-                    self.errors.push(
+                    self.error(
                         Diagnostic::new(
                             format!("`{}` values cannot be compared with `{}`", lhs_ty.name(), op.symbol()),
                             expr.span,
@@ -583,8 +650,7 @@ impl Checker<'_> {
             ExprKind::Call { .. } => self.call(expr, false).unwrap_or(Ty::Int),
         };
 
-        self.types.expr_ty[expr.id.0 as usize] = ty;
-        ty
+        self.record(expr.id, ty)
     }
 }
 
@@ -605,7 +671,8 @@ mod tests {
     use crate::parser::parse;
 
     fn check_src(src: &str) -> Result<Types> {
-        check(&parse(&lex(src)?)?)
+        // Four is what every backend in the tree reports today.
+        check(&parse(&lex(src)?)?, 4)
     }
 
     /// Wrap statements in a `main`, so the tests about statements stay about
@@ -616,6 +683,60 @@ mod tests {
 
     fn errors_in_main(body: &str) -> Vec<Diagnostic> {
         check_main(body).unwrap_err()
+    }
+
+    // -- how many diagnostics, and in what order ---------------------------
+
+    #[test]
+    fn one_missing_declaration_is_one_diagnostic() {
+        // The name is undeclared on both sides of the `=`, but the mistake is
+        // the same one: a reader should be told once.
+        let errors = errors_in_main("y = y + 1;");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].label.as_deref().unwrap().contains("assign to it"), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_name_mentioned_many_times_is_still_reported_once() {
+        let errors = errors_in_main("print(nope);\nprint(nope);\nprint(nope);");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+    }
+
+    #[test]
+    fn each_function_gets_its_own_say_about_the_same_name() {
+        // Two functions, two independent mistakes.
+        let errors = check_src(
+            "fn a() {\n  print(nope);\n}\nfn b() {\n  print(nope);\n}\nfn main() {\n  a();\n}",
+        )
+        .unwrap_err();
+        assert_eq!(errors.len(), 2, "{errors:#?}");
+    }
+
+    #[test]
+    fn diagnostics_are_reported_in_source_order() {
+        // A statement's value is checked before its name, so without sorting
+        // these would come out back to front.
+        let errors = errors_in_main("int x = 1;\nx = \"a\";\nstring s = 1;\nprint(s + 1);");
+        assert!(errors.len() > 1, "this program should produce several: {errors:#?}");
+        let offsets: Vec<u32> = errors.iter().map(|d| d.span.offset).collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted, "{errors:#?}");
+    }
+
+    #[test]
+    fn a_call_statement_records_the_type_it_produced() {
+        // Nothing reads it today, but every expression node has an entry and a
+        // hole here would be a trap for whoever reads one next.
+        let types = check_src(
+            "fn label() -> string {\n  return \"hi\";\n}\nfn main() {\n  label();\n}",
+        )
+        .unwrap();
+        let ast = parse(&lex("fn label() -> string {\n  return \"hi\";\n}\nfn main() {\n  label();\n}")
+            .unwrap())
+        .unwrap();
+        let Stmt::Call(call) = &ast.functions[1].body.stmts[0] else { panic!("a call statement") };
+        assert_eq!(types.of(call.id), Ty::Str);
     }
 
     #[test]

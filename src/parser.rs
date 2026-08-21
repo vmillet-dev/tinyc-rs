@@ -32,15 +32,30 @@ use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
 
 pub fn parse(tokens: &[Token]) -> Result<Program> {
-    Parser { tokens, pos: 0, next_id: 0 }.run().map_err(|d| vec![d])
+    Parser { tokens, pos: 0, next_id: 0, depth: 0 }.run().map_err(|d| vec![d])
 }
 
 type PResult<T> = std::result::Result<T, Diagnostic>;
+
+/// How deeply constructs may nest before the parser gives up.
+///
+/// Recursive descent turns nesting in the source into nesting on the *call
+/// stack*, and so do [`crate::sema`] and [`crate::ir`] afterwards — dropping the
+/// tree does too. Without a limit, `((((...))))` is not a parse error but a
+/// stack overflow, which is a crash rather than a diagnostic.
+///
+/// The limit alone is not enough: a debug build spends several kilobytes of
+/// stack per level, far more than the megabyte Windows gives a thread by
+/// default. [`crate::STACK_SIZE`] is the other half of the bargain, and the two
+/// constants must be read together.
+pub const MAX_NESTING: u32 = 256;
 
 struct Parser<'a> {
     tokens: &'a [Token],
     pos: usize,
     next_id: u32,
+    /// How many nested expressions and blocks are currently open.
+    depth: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -81,7 +96,7 @@ impl<'a> Parser<'a> {
 
     /// Consume `kind` or produce "expected X, found Y" at the offending token.
     fn expect(&mut self, kind: TokenKind) -> PResult<&'a Token> {
-        if &self.peek().kind == &kind {
+        if self.peek().kind == kind {
             Ok(self.bump())
         } else {
             let found = self.peek();
@@ -97,6 +112,28 @@ impl<'a> Parser<'a> {
         let id = NodeId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Run `parse` one level deeper, refusing to go past [`MAX_NESTING`].
+    ///
+    /// Every recursive path through the grammar passes through [`Self::unary`]
+    /// or [`Self::block`], so counting those two is enough to bound the depth of
+    /// the whole tree — and therefore the stack every later pass will use.
+    fn nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING {
+            self.depth -= 1;
+            let found = self.peek();
+            return Err(Diagnostic::new("this program nests too deeply", found.span)
+                .with_label("giving up here")
+                .with_note(
+                    format!("at most {MAX_NESTING} levels of nested expressions and blocks"),
+                    None,
+                ));
+        }
+        let parsed = parse(self);
+        self.depth -= 1;
+        parsed
     }
 
     /// The type a type keyword names, without consuming it. Answering `None`
@@ -272,22 +309,24 @@ impl<'a> Parser<'a> {
     /// `{ stmt* }`
     fn block(&mut self) -> PResult<Block> {
         let open = self.expect(TokenKind::LBrace)?.span;
-        let mut stmts = Vec::new();
-        loop {
-            match self.peek().kind {
-                TokenKind::RBrace => {
-                    let close = self.bump().span;
-                    return Ok(Block { stmts, span: open.to(close) });
+        self.nested(|p| {
+            let mut stmts = Vec::new();
+            loop {
+                match p.peek().kind {
+                    TokenKind::RBrace => {
+                        let close = p.bump().span;
+                        return Ok(Block { stmts, span: open.to(close) });
+                    }
+                    TokenKind::Eof => {
+                        let found = p.peek();
+                        return Err(Diagnostic::new("unclosed block", found.span)
+                            .with_label("expected `}` before the end of the file")
+                            .with_note("to close this `{`", Some(open)));
+                    }
+                    _ => stmts.push(p.stmt()?),
                 }
-                TokenKind::Eof => {
-                    let found = self.peek();
-                    return Err(Diagnostic::new("unclosed block", found.span)
-                        .with_label("expected `}` before the end of the file")
-                        .with_note("to close this `{`", Some(open)));
-                }
-                _ => stmts.push(self.stmt()?),
             }
-        }
+        })
     }
 
     /// The condition of `if` and `while`, including its parentheses.
@@ -469,17 +508,21 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Every recursive path through the expression grammar comes through here,
+    /// which is why this is where the nesting limit is counted.
     fn unary(&mut self) -> PResult<Expr> {
-        if let TokenKind::Minus = self.peek().kind {
-            let minus = self.bump().span;
-            let operand = self.unary()?;
-            return Ok(Expr {
-                id: self.node_id(),
-                span: minus.to(operand.span),
-                kind: ExprKind::Neg(Box::new(operand)),
-            });
-        }
-        self.primary()
+        self.nested(|p| {
+            if let TokenKind::Minus = p.peek().kind {
+                let minus = p.bump().span;
+                let operand = p.unary()?;
+                return Ok(Expr {
+                    id: p.node_id(),
+                    span: minus.to(operand.span),
+                    kind: ExprKind::Neg(Box::new(operand)),
+                });
+            }
+            p.primary()
+        })
     }
 
     fn primary(&mut self) -> PResult<Expr> {
@@ -508,15 +551,16 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Call { name: name.clone(), name_span: span, args },
                 });
             }
+            // Parentheses only group: the expression between them keeps its own
+            // node id, so [`crate::sema`]'s table gains no unused entry, and
+            // only its span widens to cover the brackets a diagnostic should
+            // underline.
             TokenKind::LParen => {
                 let open = self.bump().span;
-                let inner = self.expr()?;
+                let mut inner = self.expr()?;
                 let close = self.expect_closing_paren(open)?;
-                return Ok(Expr {
-                    id: self.node_id(),
-                    span: open.to(close),
-                    kind: inner.kind,
-                });
+                inner.span = open.to(close);
+                return Ok(inner);
             }
             other => {
                 return Err(Diagnostic::new(
@@ -572,6 +616,51 @@ mod tests {
 
     fn errors_in_main(body: &str) -> Vec<Diagnostic> {
         parse_src(&format!("fn main() {{\n{body}\n}}\n")).unwrap_err()
+    }
+
+    // -- the nesting limit -------------------------------------------------
+
+    /// Parse on a stack big enough for [`MAX_NESTING`] levels — the same one
+    /// the CLI runs the compiler on.
+    fn parse_deep(src: &str) -> Result<Program> {
+        crate::with_compiler_stack(|| parse_src(src))
+    }
+
+    fn nested_parens(levels: usize) -> String {
+        format!("fn main() {{ print({}1{}); }}", "(".repeat(levels), ")".repeat(levels))
+    }
+
+    #[test]
+    fn nesting_just_under_the_limit_is_accepted() {
+        assert!(parse_deep(&nested_parens(MAX_NESTING as usize - 8)).is_ok());
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_a_diagnostic_rather_than_a_crash() {
+        // Recursive descent turns nesting into stack frames, so without a limit
+        // this is not a parse error but a stack overflow.
+        let errors = parse_deep(&nested_parens(MAX_NESTING as usize + 8)).unwrap_err();
+        assert!(errors[0].message.contains("nests too deeply"), "{:?}", errors[0]);
+    }
+
+    #[test]
+    fn the_limit_counts_unary_operators_too() {
+        // `-----1` recurses through `unary` without ever passing a `(`.
+        let source = format!("fn main() {{ print({}1); }}", "-".repeat(MAX_NESTING as usize + 8));
+        let errors = parse_deep(&source).unwrap_err();
+        assert!(errors[0].message.contains("nests too deeply"), "{:?}", errors[0]);
+    }
+
+    #[test]
+    fn the_limit_counts_nested_blocks_too() {
+        let levels = MAX_NESTING as usize + 8;
+        let source = format!(
+            "fn main() {{ {}{} }}",
+            "if (true) { ".repeat(levels),
+            "}".repeat(levels)
+        );
+        let errors = parse_deep(&source).unwrap_err();
+        assert!(errors[0].message.contains("nests too deeply"), "{:?}", errors[0]);
     }
 
     #[test]

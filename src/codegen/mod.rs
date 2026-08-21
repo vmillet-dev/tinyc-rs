@@ -55,13 +55,12 @@ pub fn backend_for(target: Target) -> Box<dyn Backend> {
 ///
 /// Allocation is per function — each one gets its own registers, spill slots
 /// and stack frame, and nothing about one function's pressure affects another.
-pub fn compile(program: &Program, target: Target) -> (Box<dyn Backend>, Vec<Allocation>, String) {
-    let backend = backend_for(target);
+pub fn compile(program: &Program, backend: &dyn Backend) -> (Vec<Allocation>, String) {
     let allocations: Vec<Allocation> = program
         .functions
         .iter()
         .map(|function| regalloc::allocate(function, backend.register_file()))
         .collect();
     let asm = backend.emit(program, &allocations);
-    (backend, allocations, asm)
+    (allocations, asm)
 }

@@ -1,0 +1,23 @@
+--------
+arithmetic
+42
+10
+6
+--------
+recursion
+55
+3628800
+--------
+booleans
+true
+false
+--------
+the first fibonacci numbers
+0
+1
+1
+2
+3
+5
+8
+13

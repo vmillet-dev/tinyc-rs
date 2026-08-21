@@ -30,7 +30,7 @@ impl Ty {
         match self {
             Ty::Int => "an `int`",
             Ty::Str => "a `string`",
-            Ty::Bool => "a `boolean`",
+            Ty::Bool => "a `bool`",
         }
     }
 }

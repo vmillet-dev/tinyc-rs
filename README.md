@@ -100,7 +100,9 @@ NASM and the Microsoft linker work together without anything in between.
 
 `print` is compiled into a call to the C runtime's `printf`, which is why the
 CRT is linked in. `legacy_stdio_definitions.lib` provides `printf` as a real
-symbol, since the UCRT headers normally supply it as an inline function.
+symbol, since the UCRT headers normally supply it as an inline function. A
+program containing a division that has to be guarded also reaches for `_write`
+and `exit`, both from the same library — see [Runtime failures](#runtime-failures).
 
 ## The language
 
@@ -166,7 +168,10 @@ fn fib(int n) -> int {
   the only expression statement in the language, and it exists precisely so that
   a `void` function is callable at all.
 * **At most four parameters**, because that is how many the Microsoft x64 ABI
-  passes in registers. A fifth would need stack arguments.
+  passes in registers. A fifth would need stack arguments. The number is the
+  target's to state, not the language's: it comes from
+  `RegisterFile::max_args`, and `sema::check` enforces whatever the backend
+  reports rather than a constant of its own.
 
 ### What functions changed underneath
 
@@ -267,6 +272,34 @@ Columns are counted in characters rather than bytes, so non-ASCII text earlier
 on a line does not shift them. `examples/errors/` holds one program per kind of
 error.
 
+Three rules keep a list of them readable:
+
+* **Source order.** The type checker walks a statement's value before its name,
+  so it finds mistakes out of order; the diagnostics are sorted before they are
+  printed.
+* **One mistake, one message.** `y = y + 1` mentions an undeclared `y` twice and
+  is reported once — the first time a name is missed in a function is the only
+  time it is worth saying so.
+* **A window, not the whole line.** A generated file can hold a line of any
+  length; only the hundred characters around the caret are echoed, with `...`
+  for what was cut.
+
+### The nesting limit
+
+Recursive descent turns nesting in the source into frames on the call stack, and
+so do the type checker, the lowering, and dropping the tree afterwards. Left
+alone, `((((...))))` is not a parse error but a stack overflow — a crash instead
+of a diagnostic. Two constants keep that from happening, and have to be read
+together:
+
+* `parser::MAX_NESTING` caps how deeply expressions and blocks may nest, three
+  orders of magnitude beyond anything written by hand;
+* `STACK_SIZE` is the stack the pipeline runs on, because a debug build spends
+  several kilobytes per level and a thread gets a megabyte by default.
+
+Anything running the pipeline should go through `tinyc::with_compiler_stack`,
+which is what the CLI does.
+
 ## Register allocation
 
 The allocator is a linear scan over the IR's virtual registers, and it is
@@ -319,6 +352,79 @@ order. The cost is a `push`/`pop` pair per register used, which is a good trade
 at this size — and it is the kind of decision a register allocator exists to
 make explicit.
 
+## What gets optimised
+
+Four passes, each small enough to read in one sitting, and each visible in the
+output of some `--emit`.
+
+**Constant folding, during lowering.** `print(1 + 2 * 3)` reaches the backend as
+`print int 7`: no `add`, no `mul`, and no register to hold the answer. A division
+the machine would refuse is deliberately *not* folded — `checked_div` answers
+`None` for both `x / 0` and `i64::MIN / -1`, so those stay instructions and the
+program fails where it was written rather than inside the compiler.
+
+**Dead functions, during lowering.** `ir::prune_unreachable_functions` walks the
+call graph from `main` exactly as `prune_unreachable` walks the control flow
+graph from block 0, and renumbers the `FuncId`s the survivors call each other
+by. A helper nobody calls costs a label, a prologue and an epilogue otherwise.
+
+**Compare-and-branch fusion, in the backend.** x86 compares by setting flags and
+`jcc` reads them straight back, so a comparison whose only reader is the branch
+right after it never has to become a 0 or a 1:
+
+```
+  3  %t2 = cmp <= %i, 5          .loop1:
+  4  branch %t2 ? body2 : done3      cmp  rsi, 5
+                                     jg   .done3
+```
+
+Seven instructions became two, in the hottest place a program has. This lives in
+the backend rather than in the IR because flags are an x86 concept — with the
+one cost that the allocator has already found `%t2` a register by then, and
+keeps it reserved. Moving the decision earlier would mean teaching the
+target-independent half of the compiler about flags.
+
+**Leaf frames.** A function that calls nothing — not another function, and not
+the runtime's abort — has no call to align the stack for and no callee to leave
+shadow space for, so it reserves room for its spills and nothing else. Most
+leaves spill nothing and get no frame at all.
+
+## Runtime failures
+
+`idiv` does not answer `x / 0`, and it does not answer `i64::MIN / -1` either:
+the quotient does not fit, so the CPU faults exactly as it does on a zero
+divisor. Left alone that is a silent `0xC0000094` with nothing printed.
+
+Each division is guarded, and each guard a literal operand already answers is
+left out — `n / 7` carries no check at all, `n / (0 - 1)` checks only for
+overflow. When a check does fire, control jumps to an out-of-line stub that
+writes a message to standard error and leaves with a non-zero status:
+
+```
+$ ./divide_by_zero.exe
+runtime error: division by zero
+$ echo $?
+1
+```
+
+The stub is reached by `jmp`, not `call`, so it runs on the frame of whoever
+jumped to it — which is why a function containing a guarded division is never
+treated as a leaf.
+
+## Symbol names
+
+Every TinyC function is emitted as `tc$name`, and the compiler's own helpers as
+`tc$rt$name`. A `$` is a valid character in a NASM identifier and one TinyC's
+lexer will never produce, so the two namespaces cannot meet.
+
+That matters more than it looks. `print` compiles into a call to the C runtime's
+`printf`; without the prefix, `fn printf()` defines the very symbol that call
+reaches, and the program compiles, links, runs, and quietly does nothing — while
+`fn str0()` collides with a string literal's label and stops NASM outright.
+
+`main` is the exception, and has to be: it is the name the C runtime startup
+calls. Nothing the backend generates is called `main`, so it is safe alone.
+
 ## Targeting another platform
 
 Everything up to and including register allocation is target-independent. A new
@@ -338,5 +444,28 @@ out of the allocator's hands, so the allocator only ever reasons about
 cargo test
 ```
 
-Unit tests live beside each stage; `tests/error_positions.rs` asserts the exact
-line and column reported for every program in `examples/errors/`.
+Unit tests live beside each stage, and two integration suites sit on top:
+
+* `tests/error_positions.rs` asserts the exact line and column reported for
+  every program in `examples/errors/`, and checks the *shape* of the emitted
+  assembly — that every path out of a function undoes its prologue, and that no
+  generated symbol is one a TinyC function could also claim.
+* `tests/execution.rs` **runs the compiled programs.** Every other test in the
+  repository inspects text, and text cannot tell a `setl` from a `setg` or
+  notice a register clobbered between two instructions that each look right on
+  their own. Each example is assembled, linked and run, and its output compared
+  against `examples/expected/`; a second test does the same for the corners of
+  code generation that are easiest to get subtly wrong — a destination that
+  aliases its own operand, an immediate too wide for an instruction, enough live
+  values to force spills.
+
+The execution suite needs `nasm` and the Microsoft linker. When it cannot find
+them it says so and passes, so `cargo test` still works without a toolchain:
+
+```bash
+cargo test --test execution -- --nocapture
+```
+
+`link.exe` only knows where the C runtime is if `vcvars64.bat` has told it, so
+the suite runs that once, keeps the `LIB` it sets, and calls the linker directly
+from then on.

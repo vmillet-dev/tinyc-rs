@@ -23,8 +23,20 @@
 //! precisely how a dead temporary's register gets reused by the temporary that
 //! replaces it — at the cost of one aliasing case the backend has to guard
 //! against (see `x64_win`'s `work_reg`).
+//!
+//! ## The invariant that rule rests on
+//!
+//! Two intervals that merely *touch*, `a.end == b.start`, are allowed to share a
+//! register: whatever happens at that index reads `a` and writes `b`. That is
+//! only sound because two operands of the same instruction can never be a
+//! touching pair, and they cannot because **[`crate::ir`] always emits a
+//! register's definition before any of its uses in the flat layout**. A lowering
+//! that broke that — one that could reach a use before its definition, the way
+//! short-circuit `&&` or a `continue` might — would need this rule revisited,
+//! not just the backend's aliasing guards. [`verify`] checks the consequence;
+//! `definitions_precede_uses` in the tests checks the cause.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::ir::{Function, VReg};
 
@@ -34,6 +46,7 @@ use crate::ir::{Function, VReg};
 pub struct PhysReg(pub u8);
 
 /// What the backend tells the allocator about its machine registers.
+#[derive(Clone)]
 pub struct RegisterFile {
     /// Name of every machine register, indexed by [`PhysReg`].
     pub names: Vec<&'static str>,
@@ -42,6 +55,13 @@ pub struct RegisterFile {
     /// Allocatable registers that survive a call, at the cost of being saved
     /// and restored in the prologue and epilogue.
     pub callee_saved: Vec<PhysReg>,
+    /// How many arguments this target passes in registers, and therefore the
+    /// most parameters a function may declare.
+    ///
+    /// It lives here rather than in [`crate::sema`] because it is an ABI fact,
+    /// not a language one: the type checker enforces the number the target
+    /// reports instead of hard-coding one backend's answer.
+    pub max_args: usize,
 }
 
 impl RegisterFile {
@@ -159,10 +179,67 @@ impl Layout {
     }
 }
 
+/// A set of virtual registers, one bit each.
+///
+/// [`VReg`]s are dense indices from zero, which is exactly what a bitmap wants.
+/// The dataflow below unions and subtracts these sets on every round of its
+/// fixpoint, and here that is a handful of word operations rather than a hash
+/// per register.
+#[derive(Clone, PartialEq, Eq)]
+struct VRegSet {
+    words: Vec<u64>,
+}
+
+impl VRegSet {
+    fn new(registers: usize) -> VRegSet {
+        VRegSet { words: vec![0; registers.div_ceil(64)] }
+    }
+
+    fn insert(&mut self, reg: VReg) {
+        let (word, bit) = (reg.0 as usize / 64, reg.0 as usize % 64);
+        self.words[word] |= 1 << bit;
+    }
+
+    fn contains(&self, reg: VReg) -> bool {
+        let (word, bit) = (reg.0 as usize / 64, reg.0 as usize % 64);
+        self.words[word] & (1 << bit) != 0
+    }
+
+    /// `self |= other`, answering whether that added anything.
+    fn union_with(&mut self, other: &VRegSet) -> bool {
+        let mut grew = false;
+        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
+            let merged = *mine | theirs;
+            grew |= merged != *mine;
+            *mine = merged;
+        }
+        grew
+    }
+
+    /// `self |= other - excluded`, answering whether that added anything.
+    fn union_without(&mut self, other: &VRegSet, excluded: &VRegSet) -> bool {
+        let mut grew = false;
+        for ((mine, theirs), gone) in
+            self.words.iter_mut().zip(&other.words).zip(&excluded.words)
+        {
+            let merged = *mine | (theirs & !gone);
+            grew |= merged != *mine;
+            *mine = merged;
+        }
+        grew
+    }
+
+    fn iter(&self) -> impl Iterator<Item = VReg> + '_ {
+        self.words.iter().enumerate().flat_map(|(word, bits)| {
+            (0..64).filter(move |bit| bits & (1 << bit) != 0).map(move |bit| VReg((word * 64 + bit) as u32))
+        })
+    }
+}
+
 /// Live-in and live-out sets, one per block.
 struct Liveness {
-    live_in: Vec<HashSet<VReg>>,
-    live_out: Vec<HashSet<VReg>>,
+    live_in: Vec<VRegSet>,
+    live_out: Vec<VRegSet>,
 }
 
 /// Which registers are live where, by backward dataflow over the CFG.
@@ -178,30 +255,34 @@ struct Liveness {
 /// ```
 fn liveness(function: &Function) -> Liveness {
     let count = function.blocks.len();
+    let registers = function.vreg_count();
 
     // Per block: registers read before being written, and registers written.
-    let mut upward_exposed = vec![HashSet::new(); count];
-    let mut written = vec![HashSet::new(); count];
+    let mut upward_exposed = vec![VRegSet::new(registers); count];
+    let mut written = vec![VRegSet::new(registers); count];
     for (b, block) in function.blocks.iter().enumerate() {
+        let (exposed, written) = (&mut upward_exposed[b], &mut written[b]);
         for instr in &block.instrs {
-            for used in instr.uses() {
-                if !written[b].contains(&used) {
-                    upward_exposed[b].insert(used);
+            instr.uses(|used| {
+                if !written.contains(used) {
+                    exposed.insert(used);
                 }
-            }
+            });
             if let Some(def) = instr.def() {
-                written[b].insert(def);
+                written.insert(def);
             }
         }
-        for used in block.term.uses() {
-            if !written[b].contains(&used) {
-                upward_exposed[b].insert(used);
+        block.term.uses(|used| {
+            if !written.contains(used) {
+                exposed.insert(used);
             }
-        }
+        });
     }
 
-    let mut live_in = vec![HashSet::new(); count];
-    let mut live_out: Vec<HashSet<VReg>> = vec![HashSet::new(); count];
+    // Both sets only ever grow, so the fixpoint can accumulate in place: a round
+    // that adds nothing anywhere is the last one.
+    let mut live_in = upward_exposed;
+    let mut live_out = vec![VRegSet::new(registers); count];
 
     let mut changed = true;
     while changed {
@@ -209,19 +290,13 @@ fn liveness(function: &Function) -> Liveness {
         // Blocks are emitted roughly in forward order, so walking backwards
         // reaches the fixpoint in few passes.
         for b in (0..count).rev() {
-            let mut out = HashSet::new();
             for successor in function.blocks[b].term.successors() {
-                out.extend(live_in[successor.0 as usize].iter().copied());
+                // Two different vectors, so both can be borrowed at once.
+                let (out, entering) = (&mut live_out[b], &live_in[successor.0 as usize]);
+                changed |= out.union_with(entering);
             }
-
-            let mut in_ = upward_exposed[b].clone();
-            in_.extend(out.iter().filter(|reg| !written[b].contains(reg)).copied());
-
-            if out != live_out[b] || in_ != live_in[b] {
-                live_out[b] = out;
-                live_in[b] = in_;
-                changed = true;
-            }
+            let (entering, leaving) = (&mut live_in[b], &live_out[b]);
+            changed |= entering.union_without(leaving, &written[b]);
         }
     }
 
@@ -251,26 +326,20 @@ pub fn live_intervals(function: &Function) -> Vec<Interval> {
 
     for (b, block) in function.blocks.iter().enumerate() {
         // Live across the whole block boundary, so the interval must span it.
-        for &reg in &live.live_in[b] {
+        for reg in live.live_in[b].iter() {
             extend(reg, layout.start[b], &mut start, &mut end);
         }
-        for &reg in &live.live_out[b] {
+        for reg in live.live_out[b].iter() {
             extend(reg, layout.end[b], &mut start, &mut end);
         }
 
-        let mut index = layout.start[b];
-        for instr in &block.instrs {
+        for (index, instr) in (layout.start[b]..).zip(&block.instrs) {
             if let Some(def) = instr.def() {
                 extend(def, index, &mut start, &mut end);
             }
-            for used in instr.uses() {
-                extend(used, index, &mut start, &mut end);
-            }
-            index += 1;
+            instr.uses(|used| extend(used, index, &mut start, &mut end));
         }
-        for used in block.term.uses() {
-            extend(used, layout.end[b], &mut start, &mut end);
-        }
+        block.term.uses(|used| extend(used, layout.end[b], &mut start, &mut end));
     }
 
     let mut intervals: Vec<Interval> = (0..function.vreg_count() as u32)
@@ -438,8 +507,11 @@ impl Scan {
     }
 
     fn activate(&mut self, interval: Interval, location: Location, pool: Option<Pool>) {
-        self.active.push(Active { vreg: interval.vreg, end: interval.end, location, pool });
-        self.active.sort_by_key(|entry| entry.end);
+        // `active` is kept sorted by increasing `end`, so inserting at the right
+        // place keeps the invariant without re-sorting the whole list.
+        let entry = Active { vreg: interval.vreg, end: interval.end, location, pool };
+        let at = self.active.partition_point(|other| other.end <= entry.end);
+        self.active.insert(at, entry);
     }
 }
 
@@ -483,18 +555,68 @@ mod tests {
             names: vec!["v0", "v1", "s0", "s1"],
             caller_saved: vec![PhysReg(0), PhysReg(1)],
             callee_saved: vec![PhysReg(2), PhysReg(3)],
+            max_args: 4,
         }
     }
 
     fn ir_of(src: &str) -> Program {
         let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
-        let types = sema::check(&ast).unwrap();
+        let types = sema::check(&ast, 4).unwrap();
         crate::ir::lower(&ast, &types)
     }
 
     /// Lower a `main` body; every test below is about one function's frame.
     fn ir_of_main(body: &str) -> Program {
         ir_of(&format!("fn main() {{\n{body}\n}}\n"))
+    }
+
+    /// The invariant the "touching intervals may share a register" rule rests
+    /// on — see the module docs.
+    ///
+    /// If lowering could ever reach a use before the definition it belongs to,
+    /// two operands of one instruction could end up in the same register, and
+    /// no amount of care in the backend would save them.
+    #[test]
+    fn definitions_precede_uses() {
+        let programs = [
+            "fn main() {\n  int i = 0;\n  while (i < 3) {\n    i = i + 1;\n  }\n  print(i);\n}",
+            "fn main() {\n  for (int j = 1; j <= 5; j = j + 1) {\n    print(j);\n  }\n}",
+            "fn main() {\n  int n = 1;\n  if (n < 2) {\n    n = 2;\n  } else {\n    n = 3;\n  }\n  \
+             print(n);\n}",
+            "fn f(int a, int b) -> int {\n  return a * b - a;\n}\n\
+             fn main() {\n  print(f(6, 7));\n}",
+            "fn fib(int n) -> int {\n  if (n < 2) {\n    return n;\n  }\n  \
+             return fib(n - 1) + fib(n - 2);\n}\nfn main() {\n  print(fib(10));\n}",
+            "fn main() {\n  int a = 1;\n  int b = 2;\n  int c = 3;\n  \
+             while (a < 100) {\n    a = a + b * c;\n    b = a - b;\n  }\n  print(b);\n}",
+        ];
+
+        for source in programs {
+            let ir = ir_of(source);
+            for function in &ir.functions {
+                let mut defined = vec![false; function.vreg_count()];
+                let check = |defined: &Vec<bool>, reg: VReg| {
+                    assert!(
+                        defined[reg.0 as usize],
+                        "%{} is read before it is written in `{}`:\n{}",
+                        function.name_of(reg),
+                        function.name,
+                        ir.dump()
+                    );
+                };
+                for block in &function.blocks {
+                    for instr in &block.instrs {
+                        // Reading and writing the same register in one
+                        // instruction is fine: operands are read first.
+                        instr.uses(|reg| check(&defined, reg));
+                        if let Some(def) = instr.def() {
+                            defined[def.0 as usize] = true;
+                        }
+                    }
+                    block.term.uses(|reg| check(&defined, reg));
+                }
+            }
+        }
     }
 
     #[test]
@@ -555,7 +677,7 @@ mod tests {
         let mut index = 0;
         for block in &function.blocks {
             index += block.instrs.len() as u32;
-            if block.label == label {
+            if block.label() == label {
                 return index;
             }
             index += 1;

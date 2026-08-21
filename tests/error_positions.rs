@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use tinyc::codegen::Target;
+use tinyc::codegen::x64_win::is_runtime_symbol;
 use tinyc::diag::SourceFile;
 
 /// The examples these tests compile.
@@ -185,7 +186,14 @@ fn the_working_examples_compile() {
         // Every path out of a function must undo its prologue exactly once. A
         // function with two `return`s has two epilogues, so the counts balance
         // per exit, not per file.
-        for (name, body) in functions_in(&compiled.asm) {
+        let functions = functions_in(&compiled.asm);
+        assert!(!functions.is_empty(), "{file}: no function was recognised in the assembly");
+        for (name, body) in functions {
+            // The runtime helpers are jumped to and never come back, so they
+            // have neither a prologue nor an epilogue to balance.
+            if is_runtime_symbol(name) {
+                continue;
+            }
             let pushes = body.matches("push ").count();
             let exits = body.matches("\n    ret\n").count();
             assert!(exits > 0, "{file}: {name} never returns");
@@ -194,10 +202,32 @@ fn the_working_examples_compile() {
                 pushes * exits,
                 "unbalanced prologue in {file}: {name}"
             );
+            // A leaf that spills nothing reserves no frame, and so has nothing
+            // to release — but a `sub` without a matching `add` on some path
+            // would leave the stack wrong.
+            let reserved = body.matches("sub  rsp,").count();
             assert_eq!(
                 body.matches("add  rsp,").count(),
-                exits,
+                reserved * exits,
                 "{file}: {name} does not release its frame on every path"
+            );
+        }
+    }
+}
+
+/// Every symbol the assembly defines, other than the entry point, must be one
+/// no runtime or literal can also claim.
+#[test]
+fn generated_symbols_cannot_collide_with_a_tinyc_function() {
+    for file in EXAMPLES {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let compiled = tinyc::compile(&text, Target::X86_64Windows).unwrap();
+
+        for (name, _) in functions_in(&compiled.asm) {
+            assert!(
+                name == "main" || name.contains('$'),
+                "{file}: `{name}` is a bare symbol a TinyC function could also define"
             );
         }
     }
@@ -214,7 +244,7 @@ fn functions_in(asm: &str) -> Vec<(&str, &str)> {
             let line = asm[offset + 1..].lines().next()?;
             let name = line.strip_suffix(':')?;
             let plain = !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
                 && !name.starts_with(|c: char| c.is_ascii_digit());
             plain.then_some((offset + 1, name))
         })

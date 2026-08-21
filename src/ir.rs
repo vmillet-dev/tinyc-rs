@@ -110,42 +110,95 @@ impl Terminator {
         }
     }
 
-    /// Virtual registers read by the terminator itself.
-    pub fn uses(&self) -> Vec<VReg> {
+    /// Show `visit` every virtual register the terminator reads.
+    ///
+    /// A callback rather than an iterator or a `Vec`: liveness asks this of
+    /// every terminator on every round of its fixpoint, and there is nothing to
+    /// allocate for at most one register.
+    pub fn uses(&self, mut visit: impl FnMut(VReg)) {
+        if let Terminator::Branch { cond: Value::Reg(reg), .. }
+        | Terminator::Return(Some(Value::Reg(reg))) = self
+        {
+            visit(*reg);
+        }
+    }
+}
+
+/// What a block is *for*, which is the half of its name that survives
+/// renumbering.
+///
+/// A label is derived from this and the block's index rather than stored as
+/// text, so pruning renumbers a block by assigning a number instead of by
+/// editing a string.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockKind {
+    /// Where the function starts. Always block 0.
+    Entry,
+    Then,
+    Else,
+    /// Where the arms of an `if` meet again.
+    Join,
+    /// A loop header: it re-tests the condition on every iteration.
+    Loop,
+    Body,
+    /// Where a loop leaves.
+    Done,
+    /// Opened after a `return` for whatever follows it, and reached by nothing.
+    Unreachable,
+}
+
+impl BlockKind {
+    fn prefix(self) -> &'static str {
         match self {
-            Terminator::Branch { cond: Value::Reg(reg), .. }
-            | Terminator::Return(Some(Value::Reg(reg))) => vec![*reg],
-            _ => Vec::new(),
+            BlockKind::Entry => "entry",
+            BlockKind::Then => "then",
+            BlockKind::Else => "else",
+            BlockKind::Join => "join",
+            BlockKind::Loop => "loop",
+            BlockKind::Body => "body",
+            BlockKind::Done => "done",
+            BlockKind::Unreachable => "unreachable",
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Block {
-    /// Assembly label and dump name, e.g. `then0` or `loop2`.
-    pub label: String,
+    pub kind: BlockKind,
+    /// Position in [`Function::blocks`], repeated here so a block can name
+    /// itself.
+    pub index: u32,
     pub instrs: Vec<Instr>,
     pub term: Terminator,
 }
 
+impl Block {
+    /// Assembly label and dump name, e.g. `then0` or `loop2`.
+    pub fn label(&self) -> String {
+        format!("{}{}", self.kind.prefix(), self.index)
+    }
+}
+
 impl Instr {
-    /// Virtual registers read by this instruction.
-    pub fn uses(&self) -> Vec<VReg> {
-        let regs = |values: &[Value]| {
-            values
-                .iter()
-                .filter_map(|v| match v {
-                    Value::Reg(r) => Some(*r),
-                    Value::Const(_) => None,
-                })
-                .collect()
+    /// Show `visit` every virtual register this instruction reads.
+    ///
+    /// See [`Terminator::uses`] for why this hands registers to a callback
+    /// rather than collecting them.
+    pub fn uses(&self, mut visit: impl FnMut(VReg)) {
+        let mut reg = |value: &Value| {
+            if let Value::Reg(r) = value {
+                visit(*r);
+            }
         };
         match self {
-            Instr::Const { .. } | Instr::StrAddr { .. } | Instr::Param { .. } => Vec::new(),
-            Instr::Copy { src, .. } => regs(&[*src]),
-            Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => regs(&[*lhs, *rhs]),
-            Instr::Print { val, .. } => regs(&[*val]),
-            Instr::Call { args, .. } => regs(args),
+            Instr::Const { .. } | Instr::StrAddr { .. } | Instr::Param { .. } => {}
+            Instr::Copy { src, .. } => reg(src),
+            Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => {
+                reg(lhs);
+                reg(rhs);
+            }
+            Instr::Print { val, .. } => reg(val),
+            Instr::Call { args, .. } => args.iter().for_each(reg),
         }
     }
 
@@ -243,7 +296,7 @@ impl Program {
             // allocator works with.
             let mut index = 0;
             for block in &function.blocks {
-                out.push_str(&format!("{}:\n", block.label));
+                out.push_str(&format!("{}:\n", block.label()));
                 for instr in &block.instrs {
                     let text = self.instr_text(function, instr);
                     out.push_str(&format!("{index:>3}  {text}\n"));
@@ -252,13 +305,13 @@ impl Program {
 
                 let text = match &block.term {
                     Terminator::Jump(target) => {
-                        format!("jump {}", function.block(*target).label)
+                        format!("jump {}", function.block(*target).label())
                     }
                     Terminator::Branch { cond, then_blk, else_blk } => format!(
                         "branch {} ? {} : {}",
                         function.value_name(cond),
-                        function.block(*then_blk).label,
-                        function.block(*else_blk).label
+                        function.block(*then_blk).label(),
+                        function.block(*else_blk).label()
                     ),
                     Terminator::Return(None) => "return".to_string(),
                     Terminator::Return(Some(value)) => {
@@ -273,7 +326,10 @@ impl Program {
         out
     }
 
-    fn instr_text(&self, function: &Function, instr: &Instr) -> String {
+    /// One instruction, in the form `--emit ir` prints it. The backend echoes
+    /// these as comments, so a reader can line the assembly up against the IR
+    /// dump instruction by instruction.
+    pub fn instr_text(&self, function: &Function, instr: &Instr) -> String {
         let value = |v: &Value| function.value_name(v);
         match instr {
             Instr::Const { dst, val } => format!("%{} = const {val}", function.name_of(*dst)),
@@ -327,14 +383,16 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
     // Function ids follow declaration order, so a call can be lowered to an
     // index without caring whether the callee has been lowered yet — which is
     // exactly what recursion and forward calls need.
-    let ids: HashMap<String, FuncId> = ast
-        .functions
-        .iter()
-        .enumerate()
-        .map(|(index, f)| (f.name.clone(), FuncId(index as u32)))
-        .collect();
+    //
+    // The first declaration of a name wins, matching the table `sema` built:
+    // a duplicate is an error, and the two stages must at least agree on which
+    // one they were talking about.
+    let mut ids: HashMap<String, FuncId> = HashMap::new();
+    for (index, function) in ast.functions.iter().enumerate() {
+        ids.entry(function.name.clone()).or_insert(FuncId(index as u32));
+    }
 
-    let mut strings = Vec::new();
+    let mut strings = Strings::default();
     let mut functions = Vec::new();
     for decl in &ast.functions {
         let lowering = Lowering {
@@ -350,7 +408,71 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
         functions.push(lowering.run(decl));
     }
 
-    Program { functions, strings }
+    let functions = prune_unreachable_functions(functions, ids.get(crate::sema::ENTRY_POINT));
+    Program { functions, strings: strings.bytes }
+}
+
+/// The literals every function shares, plus the index that keeps interning them
+/// a lookup rather than a scan.
+#[derive(Default)]
+struct Strings {
+    bytes: Vec<Vec<u8>>,
+    ids: HashMap<Vec<u8>, StrId>,
+}
+
+/// Drop the functions nothing can call, and renumber the survivors.
+///
+/// The same walk as [`prune_unreachable`], one level up: the call graph instead
+/// of the control flow graph, rooted at the entry point rather than at block 0.
+/// A helper nobody calls costs a label, a prologue and an epilogue otherwise.
+fn prune_unreachable_functions(functions: Vec<Function>, entry: Option<&FuncId>) -> Vec<Function> {
+    let Some(&entry) = entry else {
+        // No entry point: `sema` has already rejected the program, and there is
+        // no root to walk from.
+        return functions;
+    };
+
+    let mut reachable = vec![false; functions.len()];
+    let mut stack = vec![entry];
+    while let Some(id) = stack.pop() {
+        let index = id.0 as usize;
+        if std::mem::replace(&mut reachable[index], true) {
+            continue;
+        }
+        for block in &functions[index].blocks {
+            for instr in &block.instrs {
+                if let Instr::Call { callee, .. } = instr {
+                    stack.push(*callee);
+                }
+            }
+        }
+    }
+
+    // Old index -> new index, for the calls that name them.
+    let mut renumber = vec![FuncId(0); functions.len()];
+    let mut next = 0;
+    for (index, keep) in reachable.iter().enumerate() {
+        if *keep {
+            renumber[index] = FuncId(next);
+            next += 1;
+        }
+    }
+
+    functions
+        .into_iter()
+        .zip(&reachable)
+        .filter(|(_, keep)| **keep)
+        .map(|(mut function, _)| {
+            for block in &mut function.blocks {
+                for instr in &mut block.instrs {
+                    if let Instr::Call { callee, .. } = instr {
+                        *callee = renumber[callee.0 as usize];
+                    }
+                }
+            }
+            function
+        })
+        .collect()
 }
 
 /// Drop the blocks nothing can reach, and renumber the survivors.
@@ -388,12 +510,10 @@ fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
         .filter(|(_, keep)| **keep)
         .enumerate()
         .map(|(index, (mut block, _))| {
-            // A label carries the block's number, so it has to follow the
-            // renumbering: `else3` becomes `else2` when a block ahead of it went
-            // away. Only the digits change; the prefix still says where the
-            // block came from.
-            let stem = block.label.trim_end_matches(|c: char| c.is_ascii_digit());
-            block.label = format!("{stem}{index}");
+            // A label is derived from the index, so renumbering is a single
+            // assignment: `else3` becomes `else2` when a block ahead of it went
+            // away, and the kind still says where the block came from.
+            block.index = index as u32;
 
             block.term = match block.term {
                 Terminator::Jump(target) => Terminator::Jump(renumber[target.0 as usize]),
@@ -409,8 +529,21 @@ fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
         .collect()
 }
 
+/// A block while it is still being filled in.
+///
+/// The terminator is an `Option` on purpose: "not decided yet" is a state the
+/// lowering really is in, and giving it a `Terminator` value instead would mean
+/// a block whose terminator was never patched still assembles — into a plausible
+/// but wrong `ret`. [`Lowering::run`] turns the `None` that should be impossible
+/// into a panic rather than a miscompilation.
+struct PendingBlock {
+    kind: BlockKind,
+    instrs: Vec<Instr>,
+    term: Option<Terminator>,
+}
+
 struct Lowering<'a> {
-    blocks: Vec<Block>,
+    blocks: Vec<PendingBlock>,
     vreg_names: Vec<String>,
     /// The block instructions are currently appended to.
     current: BlockId,
@@ -421,13 +554,13 @@ struct Lowering<'a> {
     name_counts: HashMap<String, u32>,
     types: &'a Types,
     /// Shared with every other function: the strings all land in one section.
-    strings: &'a mut Vec<Vec<u8>>,
+    strings: &'a mut Strings,
     ids: &'a HashMap<String, FuncId>,
 }
 
 impl Lowering<'_> {
     fn run(mut self, decl: &FnDecl) -> Function {
-        self.new_block("entry");
+        self.new_block(BlockKind::Entry);
 
         // Parameters first, so each one is defined at the top of the function.
         let mut params = Vec::new();
@@ -444,23 +577,39 @@ impl Lowering<'_> {
         // type sema has already proved this is unreachable.
         self.terminate(Terminator::Return(None));
 
+        // Every block that stopped being the current one was finished by the
+        // construct that moved away from it, and the last one was just finished
+        // above. A `None` here would mean a path forgot to.
+        let blocks = self
+            .blocks
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| Block {
+                kind: block.kind,
+                index: index as u32,
+                instrs: block.instrs,
+                term: block.term.unwrap_or_else(|| {
+                    panic!("block {index} of `{}` was left unterminated", decl.name)
+                }),
+            })
+            .collect();
+
         Function {
             name: decl.name.clone(),
             params,
             ret: decl.ret,
-            blocks: prune_unreachable(self.blocks),
+            blocks: prune_unreachable(blocks),
             vreg_names: self.vreg_names,
         }
     }
 
     // -- blocks ------------------------------------------------------------
 
-    /// Append a new block and return its id. It starts with a placeholder
-    /// terminator that [`Self::terminate`] replaces.
-    fn new_block(&mut self, label: &str) -> BlockId {
+    /// Append a new block, make it current, and return its id. It has no
+    /// terminator until [`Self::terminate`] gives it one.
+    fn new_block(&mut self, kind: BlockKind) -> BlockId {
         let id = BlockId(self.blocks.len() as u32);
-        let label = format!("{label}{}", id.0);
-        self.blocks.push(Block { label, instrs: Vec::new(), term: Terminator::Return(None) });
+        self.blocks.push(PendingBlock { kind, instrs: Vec::new(), term: None });
         self.current = id;
         id
     }
@@ -471,7 +620,12 @@ impl Lowering<'_> {
 
     /// Finish the current block.
     fn terminate(&mut self, term: Terminator) {
-        self.blocks[self.current.0 as usize].term = term;
+        self.finish(self.current, term);
+    }
+
+    /// Finish a block that is no longer the current one.
+    fn finish(&mut self, block: BlockId, term: Terminator) {
+        self.blocks[block.0 as usize].term = Some(term);
     }
 
     fn switch_to(&mut self, block: BlockId) {
@@ -553,7 +707,7 @@ impl Lowering<'_> {
                 // Anything written after a `return` still needs somewhere to
                 // go. This block has no predecessor, so it is dead code the
                 // backend simply never reaches.
-                self.new_block("unreachable");
+                self.new_block(BlockKind::Unreachable);
             }
             Stmt::Call(call) => {
                 let (callee, args) = self.call_parts(call);
@@ -567,30 +721,32 @@ impl Lowering<'_> {
         // The branch belongs to whichever block the condition was computed in.
         let entry = self.current;
 
-        let then_id = self.new_block("then");
+        let then_id = self.new_block(BlockKind::Then);
         self.block_stmts(then_block);
         let then_exit = self.current;
 
-        let (else_id, else_exit) = match else_block {
-            Some(block) => {
-                let id = self.new_block("else");
-                self.block_stmts(block);
-                (id, Some(self.current))
-            }
-            None => (BlockId(0), None), // patched below
-        };
+        // `None` all the way through: with no `else`, there is no block to name
+        // and no exit to send to the join — the branch goes straight there.
+        let alternative = else_block.as_ref().map(|block| {
+            let id = self.new_block(BlockKind::Else);
+            self.block_stmts(block);
+            (id, self.current)
+        });
 
-        let join = self.new_block("join");
+        let join = self.new_block(BlockKind::Join);
 
-        self.blocks[entry.0 as usize].term = Terminator::Branch {
-            cond,
-            then_blk: then_id,
-            else_blk: if else_block.is_some() { else_id } else { join },
-        };
+        self.finish(
+            entry,
+            Terminator::Branch {
+                cond,
+                then_blk: then_id,
+                else_blk: alternative.map_or(join, |(id, _)| id),
+            },
+        );
 
-        self.blocks[then_exit.0 as usize].term = Terminator::Jump(join);
-        if let Some(exit) = else_exit {
-            self.blocks[exit.0 as usize].term = Terminator::Jump(join);
+        self.finish(then_exit, Terminator::Jump(join));
+        if let Some((_, exit)) = alternative {
+            self.finish(exit, Terminator::Jump(join));
         }
 
         self.switch_to(join);
@@ -608,24 +764,23 @@ impl Lowering<'_> {
 
         // The condition must be re-evaluated each time round, so it gets a
         // block of its own that the body jumps back to.
-        let header = self.new_block("loop");
+        let header = self.new_block(BlockKind::Loop);
         let cond = self.expr(cond);
         let header_exit = self.current;
 
-        let body_id = self.new_block("body");
+        let body_id = self.new_block(BlockKind::Body);
         self.block_stmts(body);
         if let Some(step) = step {
             self.stmt(step);
         }
         let body_exit = self.current;
 
-        let after = self.new_block("done");
+        let after = self.new_block(BlockKind::Done);
 
-        self.blocks[before.0 as usize].term = Terminator::Jump(header);
-        self.blocks[header_exit.0 as usize].term =
-            Terminator::Branch { cond, then_blk: body_id, else_blk: after };
+        self.finish(before, Terminator::Jump(header));
+        self.finish(header_exit, Terminator::Branch { cond, then_blk: body_id, else_blk: after });
         // The back edge: this is what makes liveness need a fixpoint.
-        self.blocks[body_exit.0 as usize].term = Terminator::Jump(header);
+        self.finish(body_exit, Terminator::Jump(header));
 
         self.switch_to(after);
     }
@@ -657,16 +812,30 @@ impl Lowering<'_> {
             ExprKind::Bin { op, lhs, rhs } => {
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                self.emit(Instr::Bin { op: *op, dst, lhs, rhs });
+                match fold_bin(*op, lhs, rhs) {
+                    Some(val) => self.emit(Instr::Const { dst, val }),
+                    None => self.emit(Instr::Bin { op: *op, dst, lhs, rhs }),
+                }
             }
             ExprKind::Cmp { op, lhs, rhs } => {
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                self.emit(Instr::Cmp { op: *op, dst, lhs, rhs });
+                match fold_cmp(*op, lhs, rhs) {
+                    Some(val) => self.emit(Instr::Const { dst, val }),
+                    None => self.emit(Instr::Cmp { op: *op, dst, lhs, rhs }),
+                }
             }
             ExprKind::Neg(operand) => {
                 let val = self.expr(operand);
-                self.emit(Instr::Bin { op: BinOp::Sub, dst, lhs: Value::Const(0), rhs: val });
+                match val {
+                    Value::Const(c) => self.emit(Instr::Const { dst, val: c.wrapping_neg() }),
+                    val => self.emit(Instr::Bin {
+                        op: BinOp::Sub,
+                        dst,
+                        lhs: Value::Const(0),
+                        rhs: val,
+                    }),
+                }
             }
             ExprKind::Call { .. } => {
                 let (callee, args) = self.call_parts(expr);
@@ -687,18 +856,42 @@ impl Lowering<'_> {
             ExprKind::Int(v) => Value::Const(*v),
             ExprKind::Bool(v) => Value::Const(i64::from(*v)),
             ExprKind::Var(name) => Value::Reg(self.lookup(name)),
-            ExprKind::Neg(operand) => {
-                if let ExprKind::Int(v) = operand.kind {
-                    return Value::Const(v.wrapping_neg());
+            ExprKind::Neg(operand) => match self.expr(operand) {
+                // An operand that is already a literal folds, and so does the
+                // whole tree above it: `-(2 * 3)` never reaches an instruction.
+                Value::Const(c) => Value::Const(c.wrapping_neg()),
+                val => {
+                    let dst = self.fresh_temp();
+                    self.emit(Instr::Bin {
+                        op: BinOp::Sub,
+                        dst,
+                        lhs: Value::Const(0),
+                        rhs: val,
+                    });
+                    Value::Reg(dst)
+                }
+            },
+            ExprKind::Bin { op, lhs, rhs } => {
+                let lhs = self.expr(lhs);
+                let rhs = self.expr(rhs);
+                if let Some(val) = fold_bin(*op, lhs, rhs) {
+                    return Value::Const(val);
                 }
                 let dst = self.fresh_temp();
-                self.expr_into(dst, expr);
+                self.emit(Instr::Bin { op: *op, dst, lhs, rhs });
                 Value::Reg(dst)
             }
-            ExprKind::Str(_)
-            | ExprKind::Bin { .. }
-            | ExprKind::Cmp { .. }
-            | ExprKind::Call { .. } => {
+            ExprKind::Cmp { op, lhs, rhs } => {
+                let lhs = self.expr(lhs);
+                let rhs = self.expr(rhs);
+                if let Some(val) = fold_cmp(*op, lhs, rhs) {
+                    return Value::Const(val);
+                }
+                let dst = self.fresh_temp();
+                self.emit(Instr::Cmp { op: *op, dst, lhs, rhs });
+                Value::Reg(dst)
+            }
+            ExprKind::Str(_) | ExprKind::Call { .. } => {
                 let dst = self.fresh_temp();
                 self.expr_into(dst, expr);
                 Value::Reg(dst)
@@ -707,12 +900,46 @@ impl Lowering<'_> {
     }
 
     fn intern(&mut self, bytes: &[u8]) -> StrId {
-        if let Some(i) = self.strings.iter().position(|s| s == bytes) {
-            return StrId(i as u32);
+        if let Some(&id) = self.strings.ids.get(bytes) {
+            return id;
         }
-        self.strings.push(bytes.to_vec());
-        StrId(self.strings.len() as u32 - 1)
+        let id = StrId(self.strings.bytes.len() as u32);
+        self.strings.bytes.push(bytes.to_vec());
+        self.strings.ids.insert(bytes.to_vec(), id);
+        id
     }
+}
+
+/// Evaluate `lhs op rhs` now, when both are already known.
+///
+/// Answers `None` whenever the machine would not agree with the answer: a
+/// division the CPU would trap on stays an instruction, so the program still
+/// fails where it was written to instead of in the compiler.
+fn fold_bin(op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
+    let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else { return None };
+    match op {
+        // Wrapping, because that is what the hardware does with these operands.
+        BinOp::Add => Some(a.wrapping_add(b)),
+        BinOp::Sub => Some(a.wrapping_sub(b)),
+        BinOp::Mul => Some(a.wrapping_mul(b)),
+        // `checked_div` answers `None` for both `x / 0` and `MIN / -1`, which
+        // are exactly the two divisions `idiv` refuses.
+        BinOp::Div => a.checked_div(b),
+    }
+}
+
+/// The same for a comparison, whose result is the 0 or 1 a `bool` is.
+fn fold_cmp(op: CmpOp, lhs: Value, rhs: Value) -> Option<i64> {
+    let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else { return None };
+    let answer = match op {
+        CmpOp::Eq => a == b,
+        CmpOp::Ne => a != b,
+        CmpOp::Lt => a < b,
+        CmpOp::Le => a <= b,
+        CmpOp::Gt => a > b,
+        CmpOp::Ge => a >= b,
+    };
+    Some(i64::from(answer))
 }
 
 #[cfg(test)]
@@ -722,7 +949,7 @@ mod tests {
 
     fn lower_src(src: &str) -> Program {
         let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
-        let types = sema::check(&ast).unwrap();
+        let types = sema::check(&ast, 4).unwrap();
         lower(&ast, &types)
     }
 
@@ -739,8 +966,8 @@ mod tests {
         dump[start..].trim_end().to_string() + "\n"
     }
 
-    fn labels(function: &Function) -> Vec<&str> {
-        function.blocks.iter().map(|b| b.label.as_str()).collect()
+    fn labels(function: &Function) -> Vec<String> {
+        function.blocks.iter().map(|b| b.label()).collect()
     }
 
     #[test]
@@ -820,13 +1047,105 @@ mod tests {
 
     #[test]
     fn literal_operands_stay_immediates() {
-        let ir = lower_main("print(1 + 2);");
+        // `x` is unknown, so the addition survives — but the 2 next to it is
+        // still an operand rather than a register of its own.
+        let ir = lower_main("int x = 1;\nprint(x + 2);");
         let main = &ir.functions[0];
-        assert_eq!(main.blocks[0].instrs.len(), 2);
-        assert!(matches!(
-            main.blocks[0].instrs[0],
-            Instr::Bin { lhs: Value::Const(1), rhs: Value::Const(2), .. }
-        ));
+        assert!(
+            main.blocks[0]
+                .instrs
+                .iter()
+                .any(|i| matches!(i, Instr::Bin { rhs: Value::Const(2), .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn arithmetic_between_literals_is_done_at_compile_time() {
+        let ir = lower_main("print(1 + 2 * 3);");
+        let main = &ir.functions[0];
+        // The whole tree collapses into the operand of the print: no `add`, no
+        // `mul`, and no register to hold the answer either.
+        assert_eq!(main.blocks[0].instrs.len(), 1, "{}", ir.dump());
+        assert!(
+            matches!(main.blocks[0].instrs[0], Instr::Print { val: Value::Const(7), .. }),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_division_the_machine_would_refuse_is_never_folded() {
+        // `checked_div` answers `None` for both, so the instruction survives and
+        // the program fails where it was written rather than in the compiler.
+        for source in ["print(1 / (3 - 3));", "print((0 - 9223372036854775807 - 1) / (0 - 1));"] {
+            let ir = lower_main(source);
+            assert!(
+                ir.functions[0].blocks[0]
+                    .instrs
+                    .iter()
+                    .any(|i| matches!(i, Instr::Bin { op: BinOp::Div, .. })),
+                "{source}: {}",
+                ir.dump()
+            );
+        }
+    }
+
+    #[test]
+    fn a_comparison_between_literals_is_folded_too() {
+        let ir = lower_main("bool b = 1 < 2;\nprint(b);");
+        assert!(
+            matches!(ir.functions[0].blocks[0].instrs[0], Instr::Const { val: 1, .. }),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_function_nothing_calls_is_dropped() {
+        let ir = lower_src(
+            "fn used() -> int {\n  return 1;\n}\n\
+             fn unused() -> int {\n  return 2;\n}\n\
+             fn main() {\n  print(used());\n}",
+        );
+        let names: Vec<&str> = ir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["used", "main"]);
+    }
+
+    #[test]
+    fn dropping_a_function_renumbers_the_calls_that_survive() {
+        // `unused` sits between the entry point and its callee, so every
+        // `FuncId` after it shifts down by one.
+        let ir = lower_src(
+            "fn unused() {\n}\n\
+             fn helper() -> int {\n  return 7;\n}\n\
+             fn main() {\n  print(helper());\n}",
+        );
+        let main = ir.functions.iter().find(|f| f.name == "main").expect("main survives");
+        let Instr::Call { callee, .. } = &main.blocks[0].instrs[0] else { panic!("a call") };
+        assert_eq!(ir.function(*callee).name, "helper");
+    }
+
+    #[test]
+    fn a_function_only_an_unused_one_calls_goes_too() {
+        let ir = lower_src(
+            "fn deep() -> int {\n  return 1;\n}\n\
+             fn unused() -> int {\n  return deep();\n}\n\
+             fn main() {\n}",
+        );
+        let names: Vec<&str> = ir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["main"]);
+    }
+
+    #[test]
+    fn recursion_keeps_a_function_alive_through_itself() {
+        let ir = lower_src(
+            "fn fib(int n) -> int {\n  if (n < 2) {\n    return n;\n  }\n  \
+             return fib(n - 1) + fib(n - 2);\n}\n\
+             fn main() {\n  print(fib(5));\n}",
+        );
+        assert!(ir.functions.iter().any(|f| f.name == "fib"), "{}", ir.dump());
     }
 
     #[test]
@@ -879,8 +1198,8 @@ mod tests {
         );
         assert_eq!(ir.functions.len(), 2);
         // Both functions number their blocks and registers from zero.
-        assert_eq!(ir.functions[0].blocks[0].label, "entry0");
-        assert_eq!(ir.functions[1].blocks[0].label, "entry0");
+        assert_eq!(ir.functions[0].blocks[0].label(), "entry0");
+        assert_eq!(ir.functions[1].blocks[0].label(), "entry0");
         assert_eq!(ir.functions[0].params, vec![VReg(0), VReg(1)]);
     }
 
@@ -915,7 +1234,7 @@ mod tests {
 
     #[test]
     fn a_return_carries_its_value_in_the_terminator() {
-        let ir = lower_src("fn one() -> int {\n  return 1;\n}\nfn main() {\n}");
+        let ir = lower_src("fn one() -> int {\n  return 1;\n}\nfn main() {\n  print(one());\n}");
         assert!(matches!(
             ir.functions[0].blocks[0].term,
             Terminator::Return(Some(Value::Const(1)))
@@ -924,7 +1243,7 @@ mod tests {
 
     #[test]
     fn a_bare_return_carries_nothing() {
-        let ir = lower_src("fn f() {\n  return;\n}\nfn main() {\n}");
+        let ir = lower_src("fn f() {\n  return;\n}\nfn main() {\n  f();\n}");
         assert!(matches!(ir.functions[0].blocks[0].term, Terminator::Return(None)));
     }
 
@@ -932,7 +1251,7 @@ mod tests {
     fn code_after_a_return_is_pruned() {
         // The `print` is lowered into a block nothing jumps to, and that block
         // never reaches the backend.
-        let ir = lower_src("fn f() {\n  return;\n  print(1);\n}\nfn main() {\n}");
+        let ir = lower_src("fn f() {\n  return;\n  print(1);\n}\nfn main() {\n  f();\n}");
         assert_eq!(labels(&ir.functions[0]), vec!["entry0"]);
     }
 
@@ -942,7 +1261,7 @@ mod tests {
         // terminators must survive the pruning intact.
         let ir = lower_src(
             "fn f(int n) -> int {\n  if (n < 2) {\n    return 1;\n  } else {\n    \
-             return 2;\n  }\n}\nfn main() {\n}",
+             return 2;\n  }\n}\nfn main() {\n  print(f(1));\n}",
         );
         let f = &ir.functions[0];
         assert_eq!(labels(f), vec!["entry0", "then1", "else2"]);

@@ -63,10 +63,15 @@ impl TokenKind {
         }
     }
 
-    /// The spelling of a keyword or punctuation token (a description for the
-    /// variants that carry a value).
+    /// How this token is spelled.
+    ///
+    /// A keyword or a punctuation mark has exactly one spelling, which is what
+    /// the parser puts in "expected `;`". The variants that carry a value have
+    /// none, so they answer with a generic noun; [`Self::describe`] is what
+    /// names the actual value instead.
     pub fn text(&self) -> &'static str {
         match self {
+            // Keywords.
             TokenKind::KwInt => "int",
             TokenKind::KwString => "string",
             TokenKind::KwBool => "bool",
@@ -77,6 +82,8 @@ impl TokenKind {
             TokenKind::KwFor => "for",
             TokenKind::KwFn => "fn",
             TokenKind::KwReturn => "return",
+
+            // Punctuation.
             TokenKind::LParen => "(",
             TokenKind::RParen => ")",
             TokenKind::LBrace => "{",
@@ -87,19 +94,23 @@ impl TokenKind {
             TokenKind::Minus => "-",
             TokenKind::Star => "*",
             TokenKind::Slash => "/",
+            TokenKind::Comma => ",",
+            TokenKind::Arrow => "->",
+
+            // Comparison.
             TokenKind::EqEq => "==",
             TokenKind::BangEq => "!=",
             TokenKind::Lt => "<",
             TokenKind::Le => "<=",
             TokenKind::Gt => ">",
             TokenKind::Ge => ">=",
+
+            // No fixed spelling: a generic noun, not a value.
             TokenKind::Int(_) => "integer literal",
             TokenKind::Str(_) => "string literal",
+            TokenKind::Bool(_) => "boolean literal",
             TokenKind::Ident(_) => "identifier",
             TokenKind::Eof => "end of file",
-            TokenKind::Bool(_) => "boolean literal",
-            TokenKind::Comma => ",",
-            TokenKind::Arrow => "->"
         }
     }
 }
