@@ -1,14 +1,16 @@
 // The sample program: typed variables, integer arithmetic and printing.
-int x = -10;
-int y = 20;
-string s = "Hello World";
-print(x + y);
-print(s);
-bool isReady = true;
-print(isReady);
+fn main() {
+  int x = -10;
+  int y = 20;
+  string s = "Hello World";
+  print(x + y);
+  print(s);
+  bool isReady = true;
+  print(isReady);
 
-int i = 3;
-while (i > 0) {
-  print(i);
-  i = i - 1;
+  int i = 3;
+  while (i > 0) {
+    print(i);
+    i = i - 1;
+  }
 }

@@ -1,4 +1,6 @@
-int n = 1;
-while (n) {
-  print(n);
+fn main() {
+  int n = 1;
+  while (n) {
+    print(n);
+  }
 }

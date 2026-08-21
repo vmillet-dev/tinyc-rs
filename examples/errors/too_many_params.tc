@@ -1,0 +1,7 @@
+fn wide(int a, int b, int c, int d, int e) -> int {
+  return a;
+}
+
+fn main() {
+  print(wide(1, 2, 3, 4, 5));
+}

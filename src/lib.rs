@@ -29,7 +29,7 @@ use codegen::{Allocation, Target};
 /// Everything the pipeline produced, for the CLI to print or write out.
 pub struct Compiled {
     pub ir: ir::Program,
-    pub allocation: Allocation,
+    pub allocations: Vec<Allocation>,
     pub asm: String,
 }
 
@@ -39,6 +39,6 @@ pub fn compile(source: &str, target: Target) -> diag::Result<Compiled> {
     let ast = parser::parse(&tokens)?;
     let types = sema::check(&ast)?;
     let ir = ir::lower(&ast, &types);
-    let (_, allocation, asm) = codegen::compile(&ir, target);
-    Ok(Compiled { ir, allocation, asm })
+    let (_, allocations, asm) = codegen::compile(&ir, target);
+    Ok(Compiled { ir, allocations, asm })
 }

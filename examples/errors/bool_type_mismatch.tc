@@ -1,2 +1,4 @@
-bool ready = 1;
-print(ready);
+fn main() {
+  bool ready = 1;
+  print(ready);
+}

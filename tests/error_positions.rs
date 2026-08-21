@@ -11,7 +11,8 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 5] = ["arith.tc", "spill.tc", "reassign.tc", "bool.tc", "control_flow.tc"];
+const EXAMPLES: [&str; 6] =
+    ["arith.tc", "spill.tc", "reassign.tc", "bool.tc", "control_flow.tc", "functions.tc"];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
 fn error_positions(file: &str) -> Vec<String> {
@@ -38,79 +39,79 @@ fn assert_error_at(file: &str, expected: &str) {
 
 #[test]
 fn unterminated_string_points_at_the_opening_quote() {
-    assert_error_at("unterminated_string.tc", "1:12");
+    assert_error_at("unterminated_string.tc", "2:14");
 }
 
 #[test]
 fn missing_semicolon_points_at_the_token_that_should_have_followed_it() {
-    assert_error_at("missing_semicolon.tc", "2:1");
+    assert_error_at("missing_semicolon.tc", "3:3");
 }
 
 #[test]
 fn undeclared_variable_points_at_the_use() {
-    assert_error_at("undeclared_variable.tc", "2:11");
+    assert_error_at("undeclared_variable.tc", "3:13");
 }
 
 #[test]
 fn type_mismatch_points_at_the_offending_operand() {
-    assert_error_at("type_mismatch.tc", "3:11");
+    assert_error_at("type_mismatch.tc", "4:13");
 }
 
 #[test]
 fn bad_initializer_points_at_the_initializer() {
-    assert_error_at("bad_initializer.tc", "1:9");
+    assert_error_at("bad_initializer.tc", "2:11");
 }
 
 #[test]
 fn division_by_zero_points_at_the_divisor() {
-    assert_error_at("division_by_zero.tc", "2:11");
+    assert_error_at("division_by_zero.tc", "3:13");
 }
 
 #[test]
 fn an_int_initializer_for_a_bool_points_at_the_initializer() {
-    assert_error_at("bool_type_mismatch.tc", "1:14");
+    assert_error_at("bool_type_mismatch.tc", "2:16");
 }
 
 #[test]
 fn a_reserved_word_cannot_be_used_as_a_variable_name() {
     // `true` and `false` became keywords with the bool type, so they are no
     // longer available as identifiers.
-    assert_error_at("reserved_word_as_name.tc", "1:6");
+    assert_error_at("reserved_word_as_name.tc", "2:8");
 }
 
 #[test]
 fn arithmetic_on_a_bool_points_at_the_bool_operand() {
-    assert_error_at("bool_arithmetic.tc", "2:7");
+    assert_error_at("bool_arithmetic.tc", "3:9");
 }
 
 #[test]
 fn a_non_bool_condition_points_at_the_condition() {
-    assert_error_at("non_bool_condition.tc", "2:8");
+    assert_error_at("non_bool_condition.tc", "3:10");
 }
 
 #[test]
 fn comparing_different_types_points_at_the_right_operand() {
-    assert_error_at("compare_different_types.tc", "3:12");
+    assert_error_at("compare_different_types.tc", "4:14");
 }
 
 #[test]
 fn a_variable_used_outside_its_block_points_at_the_use() {
-    assert_error_at("out_of_scope.tc", "4:7");
+    assert_error_at("out_of_scope.tc", "5:9");
 }
 
 #[test]
 fn assigning_the_wrong_type_points_at_the_value() {
-    assert_error_at("assign_wrong_type.tc", "2:9");
+    assert_error_at("assign_wrong_type.tc", "3:11");
 }
 
 #[test]
 fn assigning_to_an_undeclared_variable_points_at_the_name() {
-    assert_error_at("assign_undeclared.tc", "2:1");
+    assert_error_at("assign_undeclared.tc", "3:3");
 }
 
 #[test]
 fn redeclaration_points_at_both_declarations() {
-    assert_error_at("redeclaration.tc", "2:5");
+    assert_error_at("redeclaration.tc", "3:7");
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/errors/redeclaration.tc");
     let source = SourceFile::new("redeclaration.tc", std::fs::read_to_string(path).unwrap());
@@ -118,7 +119,54 @@ fn redeclaration_points_at_both_declarations() {
         panic!("redeclaration.tc was expected to fail");
     };
     let (_, note_span) = errors[0].note.clone().expect("a note pointing at the first declaration");
-    assert_eq!(source.line_col(note_span.unwrap().offset), (1, 5));
+    assert_eq!(source.line_col(note_span.unwrap().offset), (2, 7));
+}
+
+// -- functions ------------------------------------------------------------
+
+#[test]
+fn a_program_without_main_is_reported_at_the_start_of_the_file() {
+    assert_error_at("no_main.tc", "1:1");
+}
+
+#[test]
+fn an_unknown_callee_points_at_the_name() {
+    assert_error_at("unknown_function.tc", "2:9");
+}
+
+#[test]
+fn the_wrong_number_of_arguments_points_at_the_whole_call() {
+    assert_error_at("wrong_argument_count.tc", "6:9");
+}
+
+#[test]
+fn an_argument_of_the_wrong_type_points_at_that_argument() {
+    assert_error_at("wrong_argument_type.tc", "6:16");
+}
+
+#[test]
+fn a_body_that_can_fall_off_the_end_points_at_its_closing_brace() {
+    assert_error_at("missing_return.tc", "5:1");
+}
+
+#[test]
+fn too_many_parameters_points_at_the_first_one_that_does_not_fit() {
+    assert_error_at("too_many_params.tc", "1:37");
+}
+
+#[test]
+fn a_void_call_used_as_a_value_points_at_the_call() {
+    assert_error_at("void_used_as_value.tc", "6:11");
+}
+
+#[test]
+fn a_duplicate_function_points_at_the_second_definition() {
+    assert_error_at("duplicate_function.tc", "5:4");
+}
+
+#[test]
+fn a_bare_return_in_a_returning_function_points_at_the_keyword() {
+    assert_error_at("return_without_value.tc", "2:3");
 }
 
 /// The good examples must keep compiling, and keep producing the same answers
@@ -133,13 +181,53 @@ fn the_working_examples_compile() {
 
         assert!(compiled.asm.contains("global main"));
         assert!(compiled.asm.contains("section .text"));
-        // Every pushed register must be popped again.
-        assert_eq!(
-            compiled.asm.matches("push ").count(),
-            compiled.asm.matches("pop  ").count(),
-            "unbalanced prologue in {file}"
-        );
+
+        // Every path out of a function must undo its prologue exactly once. A
+        // function with two `return`s has two epilogues, so the counts balance
+        // per exit, not per file.
+        for (name, body) in functions_in(&compiled.asm) {
+            let pushes = body.matches("push ").count();
+            let exits = body.matches("\n    ret\n").count();
+            assert!(exits > 0, "{file}: {name} never returns");
+            assert_eq!(
+                body.matches("pop  ").count(),
+                pushes * exits,
+                "unbalanced prologue in {file}: {name}"
+            );
+            assert_eq!(
+                body.matches("add  rsp,").count(),
+                exits,
+                "{file}: {name} does not release its frame on every path"
+            );
+        }
     }
+}
+
+/// Split emitted assembly into `(name, body)` per function.
+///
+/// A function starts at a label in the first column; the block labels inside it
+/// all begin with a `.`, which is exactly how NASM scopes them too.
+fn functions_in(asm: &str) -> Vec<(&str, &str)> {
+    let starts: Vec<(usize, &str)> = asm
+        .match_indices('\n')
+        .filter_map(|(offset, _)| {
+            let line = asm[offset + 1..].lines().next()?;
+            let name = line.strip_suffix(':')?;
+            let plain = !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit());
+            plain.then_some((offset + 1, name))
+        })
+        .collect();
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, &(offset, name))| {
+            let end = starts.get(index + 1).map_or(asm.len(), |&(next, _)| next);
+            (name, &asm[offset..end])
+        })
+        .collect()
 }
 
 /// The allocation the backend is handed must be internally consistent.
@@ -153,8 +241,10 @@ fn allocations_are_valid() {
         let compiled = tinyc::compile(&text, Target::X86_64Windows).unwrap();
         let backend = backend_for(Target::X86_64Windows);
 
-        if let Err(problem) = regalloc::verify(&compiled.allocation, backend.register_file()) {
-            panic!("{file}: {problem}");
+        for allocation in &compiled.allocations {
+            if let Err(problem) = regalloc::verify(allocation, backend.register_file()) {
+                panic!("{file}: {problem}");
+            }
         }
     }
 }

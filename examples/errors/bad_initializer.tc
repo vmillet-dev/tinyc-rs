@@ -1,2 +1,4 @@
-int n = "not a number";
-print(n);
+fn main() {
+  int n = "not a number";
+  print(n);
+}

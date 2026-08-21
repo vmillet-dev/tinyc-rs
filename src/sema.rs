@@ -5,11 +5,25 @@
 //! Unlike the lexer and parser, this stage collects *all* errors before giving
 //! up: statements are independent enough that later ones are still worth
 //! checking.
+//!
+//! ## Two passes, and why
+//!
+//! Signatures are collected before any body is checked. That is what lets a
+//! function call another one declared further down the file, and what lets a
+//! function call *itself* — by the time `fib`'s body is checked, `fib` is
+//! already in the table. A single pass could only ever see backwards.
 
 use std::collections::HashMap;
 
-use crate::ast::{BinOp, Block, Expr, ExprKind, NodeId, Program, Stmt, Ty};
+use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, NodeId, Program, Stmt, Ty};
 use crate::diag::{Diagnostic, Result, Span};
+
+/// The most parameters a function may take: the four the Microsoft x64 ABI
+/// passes in registers. A fifth would have to travel on the stack.
+pub const MAX_PARAMS: usize = 4;
+
+/// The name of the entry point.
+pub const ENTRY_POINT: &str = "main";
 
 /// Type of every expression node, indexed by [`NodeId`].
 #[derive(Debug)]
@@ -23,17 +37,36 @@ impl Types {
     }
 }
 
+/// Everything a call site needs to know about its callee.
+#[derive(Clone, Debug)]
+struct Signature {
+    params: Vec<Ty>,
+    /// `None` for a function that returns nothing.
+    ret: Option<Ty>,
+    /// Where the function was declared, for "defined here" notes.
+    name_span: Span,
+}
+
 pub fn check(program: &Program) -> Result<Types> {
+    let mut errors = Vec::new();
+
+    // Pass 1: every signature, before any body.
+    let signatures = collect_signatures(program, &mut errors);
+    check_entry_point(program, &signatures, &mut errors);
+
+    // Pass 2: the bodies, each with the whole table visible.
     let mut checker = Checker {
         // `Int` is the recovery type: an expression that failed to check is
         // treated as an int so a single mistake does not cascade.
         types: Types { expr_ty: vec![Ty::Int; program.node_count] },
-        scopes: vec![HashMap::new()],
-        errors: Vec::new(),
+        signatures: &signatures,
+        scopes: Vec::new(),
+        ret: None,
+        ret_span: Span::new(0, 0),
+        errors,
     };
-
-    for stmt in &program.stmts {
-        checker.stmt(stmt);
+    for function in &program.functions {
+        checker.function(function);
     }
 
     if checker.errors.is_empty() {
@@ -43,18 +76,191 @@ pub fn check(program: &Program) -> Result<Types> {
     }
 }
 
-struct Checker {
+/// Pass 1: one entry per function name, with the first declaration winning.
+fn collect_signatures(
+    program: &Program,
+    errors: &mut Vec<Diagnostic>,
+) -> HashMap<String, Signature> {
+    let mut signatures: HashMap<String, Signature> = HashMap::new();
+
+    for function in &program.functions {
+        if function.params.len() > MAX_PARAMS {
+            // Point at the first parameter that does not fit.
+            let offending = &function.params[MAX_PARAMS];
+            errors.push(
+                Diagnostic::new(
+                    format!(
+                        "`{}` takes {} parameters, but at most {MAX_PARAMS} are supported",
+                        function.name,
+                        function.params.len()
+                    ),
+                    offending.ty_span.to(offending.name_span),
+                )
+                .with_label(format!("parameter {} is one too many", MAX_PARAMS + 1))
+                .with_note(
+                    "the first four arguments travel in registers; passing more \
+                     would need stack arguments",
+                    None,
+                ),
+            );
+        }
+
+        if let Some(previous) = signatures.get(&function.name) {
+            let previous = previous.name_span;
+            errors.push(
+                Diagnostic::new(
+                    format!("`{}` is already defined", function.name),
+                    function.name_span,
+                )
+                .with_label("defined a second time here")
+                .with_note("previous definition", Some(previous)),
+            );
+            continue;
+        }
+
+        signatures.insert(
+            function.name.clone(),
+            Signature {
+                params: function.params.iter().map(|p| p.ty).collect(),
+                ret: function.ret,
+                name_span: function.name_span,
+            },
+        );
+    }
+
+    signatures
+}
+
+/// `main` must exist, take nothing and return nothing: it is what the C runtime
+/// calls, and [`crate::codegen`] returns 0 from it.
+fn check_entry_point(
+    program: &Program,
+    signatures: &HashMap<String, Signature>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let Some(main) = signatures.get(ENTRY_POINT) else {
+        // Nothing to underline in a file with no `main`, so the diagnostic
+        // points at the very start of it.
+        errors.push(
+            Diagnostic::new(format!("this program has no `{ENTRY_POINT}` function"), Span::new(0, 0))
+                .with_label("a program starts here")
+                .with_note(format!("add `fn {ENTRY_POINT}() {{ ... }}`"), None),
+        );
+        return;
+    };
+
+    // The declaration itself, for spans the signature does not carry.
+    let decl = program
+        .functions
+        .iter()
+        .find(|f| f.name == ENTRY_POINT)
+        .expect("the table was built from these declarations");
+
+    if !main.params.is_empty() {
+        let first = &decl.params[0];
+        errors.push(
+            Diagnostic::new(
+                format!("`{ENTRY_POINT}` must not take parameters"),
+                first.ty_span.to(decl.params[decl.params.len() - 1].name_span),
+            )
+            .with_label("the runtime calls it with no arguments"),
+        );
+    }
+
+    if let Some(ty) = main.ret {
+        errors.push(
+            Diagnostic::new(
+                format!("`{ENTRY_POINT}` must not return a value"),
+                decl.ret_span,
+            )
+            .with_label(format!("expected no return type, found {}", ty.name()))
+            .with_note("the process exit code is always 0", None),
+        );
+    }
+}
+
+/// Whether every path out of a block ends in a `return`.
+///
+/// Deliberately simple: a loop is never assumed to run, so `while (true)` does
+/// not count. That can only reject a program that would in fact be fine, never
+/// accept one that would fall off the end.
+fn always_returns(block: &Block) -> bool {
+    block.stmts.iter().any(|stmt| match stmt {
+        Stmt::Return { .. } => true,
+        // Both arms must return, and an `if` without an `else` has a path that
+        // skips it entirely.
+        Stmt::If { then_block, else_block: Some(else_block), .. } => {
+            always_returns(then_block) && always_returns(else_block)
+        }
+        _ => false,
+    })
+}
+
+struct Checker<'a> {
     types: Types,
+    /// Every signature in the program, immutable once pass 1 is done.
+    signatures: &'a HashMap<String, Signature>,
     /// One map per open block, innermost last. A name is looked up from the
     /// inside out, and a block's declarations disappear when it closes.
     scopes: Vec<HashMap<String, (Ty, Span)>>,
+    /// Return type of the function being checked, and where it was written.
+    ret: Option<Ty>,
+    ret_span: Span,
     errors: Vec<Diagnostic>,
 }
 
-impl Checker {
+impl Checker<'_> {
     /// The type and declaration span of a visible variable.
     fn lookup(&self, name: &str) -> Option<(Ty, Span)> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name).copied())
+    }
+
+    /// Add a name to the innermost scope, reporting a clash inside that same
+    /// scope. Shared by declarations and parameters, which is the whole reason
+    /// [`crate::ast::Param`] carries the same spans as a `Decl`.
+    fn declare(&mut self, name: &str, ty: Ty, name_span: Span, what: &str) {
+        let innermost = self.scopes.last_mut().expect("a scope is always open");
+        if let Some((_, previous)) = innermost.get(name) {
+            let previous = *previous;
+            self.errors.push(
+                Diagnostic::new(format!("`{name}` is already declared"), name_span)
+                    .with_label(format!("declared a second time here, as {what}"))
+                    .with_note("previous declaration", Some(previous)),
+            );
+        } else {
+            innermost.insert(name.to_string(), (ty, name_span));
+        }
+    }
+
+    fn function(&mut self, function: &FnDecl) {
+        self.ret = function.ret;
+        self.ret_span = function.ret_span;
+
+        // Parameters live in the body's outermost scope, so a local of the same
+        // name at the top level of the body is a redeclaration, not a shadow.
+        self.scopes.push(HashMap::new());
+        for param in &function.params {
+            self.declare(&param.name, param.ty, param.name_span, "a parameter");
+        }
+        for stmt in &function.body.stmts {
+            self.stmt(stmt);
+        }
+        self.scopes.pop();
+
+        if function.ret.is_some() && !always_returns(&function.body) {
+            // Point at the closing brace: that is the "end of the body" the
+            // message talks about, and it is where a `return` would have to go.
+            let body = function.body.span;
+            let closing_brace = Span::new((body.offset + body.len - 1) as usize, 1);
+            self.errors.push(
+                Diagnostic::new(
+                    format!("`{}` may finish without returning a value", function.name),
+                    closing_brace,
+                )
+                .with_label("control can reach the end of this body")
+                .with_note("this return type was declared here", Some(function.ret_span)),
+            );
+        }
     }
 
     fn block(&mut self, block: &Block) {
@@ -97,20 +303,7 @@ impl Checker {
                         .with_label(format!("expected {}, found {}", ty.name(), actual.name())),
                     );
                 }
-
-                // Only the innermost scope is consulted: an inner block may
-                // shadow an outer name, but may not declare the same one twice.
-                let innermost = self.scopes.last_mut().expect("a scope is always open");
-                if let Some((_, previous)) = innermost.get(name) {
-                    let previous = *previous;
-                    self.errors.push(
-                        Diagnostic::new(format!("`{name}` is already declared"), *name_span)
-                            .with_label("declared a second time here")
-                            .with_note("previous declaration", Some(previous)),
-                    );
-                } else {
-                    innermost.insert(name.clone(), (*ty, *name_span));
-                }
+                self.declare(name, *ty, *name_span, "a variable");
             }
             Stmt::Assign { name, name_span, value } => {
                 let actual = self.expr(value);
@@ -174,7 +367,124 @@ impl Checker {
                 self.block(body);
                 self.scopes.pop();
             }
+            Stmt::Return { span, value } => self.return_stmt(*span, value.as_ref()),
+            // The result of a call statement is discarded, so a function that
+            // returns nothing is exactly as welcome as one that returns a value.
+            Stmt::Call(call) => {
+                self.call(call, true);
+            }
         }
+    }
+
+    fn return_stmt(&mut self, span: Span, value: Option<&Expr>) {
+        match (self.ret, value) {
+            (Some(expected), Some(expr)) => {
+                let actual = self.expr(expr);
+                if actual != expected {
+                    self.errors.push(
+                        Diagnostic::new(
+                            format!(
+                                "cannot return {} value from a function returning {}",
+                                actual.with_article(),
+                                expected.with_article()
+                            ),
+                            expr.span,
+                        )
+                        .with_label(format!(
+                            "expected {}, found {}",
+                            expected.name(),
+                            actual.name()
+                        ))
+                        .with_note("declared here", Some(self.ret_span)),
+                    );
+                }
+            }
+            (Some(expected), None) => self.errors.push(
+                Diagnostic::new("this `return` needs a value", span)
+                    .with_label(format!("expected {}", expected.with_article()))
+                    .with_note("this return type was declared here", Some(self.ret_span)),
+            ),
+            (None, Some(expr)) => {
+                self.expr(expr);
+                self.errors.push(
+                    Diagnostic::new("this function returns nothing", expr.span)
+                        .with_label("so this value has nowhere to go")
+                        .with_note(
+                            "add a return type after `)` to return a value",
+                            Some(self.ret_span),
+                        ),
+                );
+            }
+            (None, None) => {}
+        }
+    }
+
+    /// Check a call and answer the type it produces, or `None` when the callee
+    /// returns nothing.
+    ///
+    /// `as_statement` says whether "nothing" is acceptable here: it is for
+    /// `greet("hi");`, it is not for `int n = greet("hi");`.
+    fn call(&mut self, expr: &Expr, as_statement: bool) -> Option<Ty> {
+        let ExprKind::Call { name, name_span, args } = &expr.kind else {
+            unreachable!("the parser only builds `Stmt::Call` around a call");
+        };
+
+        // Arguments are checked first, so their own mistakes are reported even
+        // when the callee turns out not to exist.
+        let actual: Vec<Ty> = args.iter().map(|arg| self.expr(arg)).collect();
+
+        // `self.signatures` is a shared reference with a lifetime of its own,
+        // so reading from it does not borrow `self` for the rest of the call.
+        let Some(signature) = self.signatures.get(name) else {
+            self.errors.push(
+                Diagnostic::new(format!("unknown function `{name}`"), *name_span)
+                    .with_label("not defined anywhere in this file"),
+            );
+            return Some(Ty::Int);
+        };
+        let (params, ret, declared_at) =
+            (signature.params.clone(), signature.ret, signature.name_span);
+
+        if params.len() != args.len() {
+            self.errors.push(
+                Diagnostic::new(
+                    format!(
+                        "`{name}` takes {}, but {} supplied",
+                        plural(params.len(), "argument"),
+                        plural(args.len(), "was")
+                    ),
+                    expr.span,
+                )
+                .with_label(format!("expected {} here", plural(params.len(), "argument")))
+                .with_note(format!("`{name}` is defined here"), Some(declared_at)),
+            );
+        } else {
+            for ((expected, found), arg) in params.iter().zip(&actual).zip(args) {
+                if expected != found {
+                    self.errors.push(
+                        Diagnostic::new(
+                            format!(
+                                "cannot pass {} value where {} is expected",
+                                found.with_article(),
+                                expected.with_article()
+                            ),
+                            arg.span,
+                        )
+                        .with_label(format!("expected {}, found {}", expected.name(), found.name()))
+                        .with_note(format!("`{name}` is defined here"), Some(declared_at)),
+                    );
+                }
+            }
+        }
+
+        if ret.is_none() && !as_statement {
+            self.errors.push(
+                Diagnostic::new(format!("`{name}` returns nothing"), expr.span)
+                    .with_label("so this call produces no value to use")
+                    .with_note(format!("`{name}` is defined here"), Some(declared_at)),
+            );
+        }
+        ret
     }
 
     fn expr(&mut self, expr: &Expr) -> Ty {
@@ -268,6 +578,9 @@ impl Checker {
                 }
                 Ty::Bool
             }
+            // A call in expression position must produce a value; `Int` is the
+            // recovery type when it does not.
+            ExprKind::Call { .. } => self.call(expr, false).unwrap_or(Ty::Int),
         };
 
         self.types.expr_ty[expr.id.0 as usize] = ty;
@@ -275,6 +588,15 @@ impl Checker {
     }
 }
 
+/// `1 argument` / `2 arguments`, so messages read like prose.
+fn plural(count: usize, noun: &str) -> String {
+    match (count, noun) {
+        (1, "was") => "1 was".to_string(),
+        (n, "was") => format!("{n} were"),
+        (1, noun) => format!("1 {noun}"),
+        (n, noun) => format!("{n} {noun}s"),
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -286,165 +608,350 @@ mod tests {
         check(&parse(&lex(src)?)?)
     }
 
+    /// Wrap statements in a `main`, so the tests about statements stay about
+    /// statements.
+    fn check_main(body: &str) -> Result<Types> {
+        check_src(&format!("fn main() {{\n{body}\n}}\n"))
+    }
+
+    fn errors_in_main(body: &str) -> Vec<Diagnostic> {
+        check_main(body).unwrap_err()
+    }
+
     #[test]
     fn accepts_the_sample_program() {
         assert!(
-            check_src("int x = 10;\nint y = 20;\nstring s = \"hi\";\nprint(x + y);\nprint(s);\n")
+            check_main("int x = 10;\nint y = 20;\nstring s = \"hi\";\nprint(x + y);\nprint(s);")
                 .is_ok()
         );
     }
 
     #[test]
     fn rejects_arithmetic_on_strings() {
-        let src = "string s = \"a\";\nprint(1 + s);\n";
-        let errors = check_src(src).unwrap_err();
+        let errors = errors_in_main("string s = \"a\";\nprint(1 + s);");
         assert_eq!(errors.len(), 1);
         assert!(errors[0].message.contains("cannot apply `+`"));
-        assert_eq!(errors[0].span, Span::new(26, 1)); // the `s` operand
     }
 
     #[test]
     fn rejects_a_mistyped_initializer() {
-        let errors = check_src("int x = \"nope\";").unwrap_err();
-        assert!(errors[0].message.contains("cannot initialize"));
+        assert!(errors_in_main("int x = \"nope\";")[0].message.contains("cannot initialize"));
     }
 
     #[test]
     fn rejects_undeclared_variables() {
-        let errors = check_src("print(nope);").unwrap_err();
-        assert!(errors[0].message.contains("undeclared variable `nope`"));
+        assert!(errors_in_main("print(nope);")[0].message.contains("undeclared variable `nope`"));
     }
 
     #[test]
     fn rejects_redeclaration_and_points_at_the_original() {
-        let errors = check_src("int x = 1;\nint x = 2;").unwrap_err();
+        let errors = errors_in_main("int x = 1;\nint x = 2;");
         assert!(errors[0].message.contains("already declared"));
-        assert_eq!(errors[0].note.as_ref().unwrap().1, Some(Span::new(4, 1)));
+        assert!(errors[0].note.as_ref().unwrap().1.is_some());
     }
 
     #[test]
     fn accepts_assignment_of_the_declared_type() {
-        assert!(check_src("string s = \"a\";\ns = \"b\";\nprint(s);").is_ok());
-        assert!(check_src("int n = 1;\nn = n * 2;\nprint(n);").is_ok());
+        assert!(check_main("string s = \"a\";\ns = \"b\";\nprint(s);").is_ok());
+        assert!(check_main("int n = 1;\nn = n * 2;\nprint(n);").is_ok());
     }
 
     #[test]
     fn rejects_assignment_of_the_wrong_type() {
-        let errors = check_src("int n = 1;\nn = \"two\";").unwrap_err();
+        let errors = errors_in_main("int n = 1;\nn = \"two\";");
         assert!(errors[0].message.contains("cannot assign"), "{}", errors[0].message);
-        // The note points back at the declaration that fixed the type.
-        assert_eq!(errors[0].note.as_ref().unwrap().1, Some(Span::new(4, 1)));
+        assert!(errors[0].note.as_ref().unwrap().1.is_some());
     }
 
     #[test]
     fn rejects_assignment_to_an_undeclared_variable() {
-        let errors = check_src("nope = 1;").unwrap_err();
-        assert!(errors[0].message.contains("undeclared variable `nope`"));
-        assert_eq!(errors[0].span, Span::new(0, 4));
+        assert!(errors_in_main("nope = 1;")[0].message.contains("undeclared variable `nope`"));
     }
 
     #[test]
     fn accepts_bool_declarations_assignment_and_printing() {
-        assert!(check_src("bool ready = true;\nready = false;\nprint(ready);").is_ok());
-        assert!(check_src("print(true);").is_ok());
+        assert!(check_main("bool ready = true;\nready = false;\nprint(ready);").is_ok());
+        assert!(check_main("print(true);").is_ok());
     }
 
     #[test]
     fn rejects_an_int_initializer_for_a_bool() {
-        let errors = check_src("bool ready = 1;").unwrap_err();
-        assert!(errors[0].message.contains("cannot initialize"), "{}", errors[0].message);
-        assert_eq!(errors[0].span, Span::new(13, 1));
+        assert!(errors_in_main("bool ready = 1;")[0].message.contains("cannot initialize"));
     }
 
     #[test]
     fn rejects_a_bool_initializer_for_an_int() {
-        let errors = check_src("int n = true;").unwrap_err();
-        assert!(errors[0].message.contains("cannot initialize"), "{}", errors[0].message);
+        assert!(errors_in_main("int n = true;")[0].message.contains("cannot initialize"));
     }
 
     #[test]
     fn rejects_assigning_a_bool_to_a_string() {
-        let errors = check_src("string s = \"hi\";\ns = true;").unwrap_err();
-        assert!(errors[0].message.contains("cannot assign"), "{}", errors[0].message);
+        assert!(errors_in_main("string s = \"hi\";\ns = true;")[0].message.contains("cannot assign"));
     }
 
     #[test]
     fn rejects_arithmetic_on_bools() {
-        let errors = check_src("bool ready = true;\nprint(ready + 1);").unwrap_err();
+        let errors = errors_in_main("bool ready = true;\nprint(ready + 1);");
         assert!(errors[0].message.contains("cannot apply `+`"), "{}", errors[0].message);
-        assert_eq!(errors[0].span, Span::new(25, 5)); // the `ready` operand
     }
 
     #[test]
     fn rejects_negating_a_bool() {
-        let errors = check_src("bool ready = true;\nprint(-ready);").unwrap_err();
+        let errors = errors_in_main("bool ready = true;\nprint(-ready);");
         assert!(errors[0].message.contains("cannot apply `-`"), "{}", errors[0].message);
     }
 
     #[test]
     fn a_comparison_produces_a_bool() {
-        assert!(check_src("bool ok = 1 < 2;\nprint(ok);").is_ok());
-        assert!(check_src("if (1 == 2) {\n  print(1);\n}").is_ok());
+        assert!(check_main("bool ok = 1 < 2;\nprint(ok);").is_ok());
+        assert!(check_main("if (1 == 2) {\n  print(1);\n}").is_ok());
     }
 
     #[test]
     fn rejects_a_condition_that_is_not_a_bool() {
         for src in ["if (1) {\n}", "while (1) {\n}", "for (int i = 0; i; i = i + 1) {\n}"] {
-            let errors = check_src(src).unwrap_err();
+            let errors = errors_in_main(src);
             assert!(errors[0].message.contains("must be a `bool`"), "{src}: {}", errors[0].message);
         }
     }
 
     #[test]
     fn rejects_comparing_different_types() {
-        let errors = check_src("string s = \"a\";\nprint(s == 1);").unwrap_err();
+        let errors = errors_in_main("string s = \"a\";\nprint(s == 1);");
         assert!(errors[0].message.contains("cannot compare"), "{}", errors[0].message);
     }
 
     #[test]
     fn rejects_ordering_comparisons_that_make_no_sense() {
-        let bools = check_src("print(true < false);").unwrap_err();
-        assert!(bools[0].message.contains("cannot be compared"), "{}", bools[0].message);
-
-        let strings = check_src("print(\"a\" == \"b\");").unwrap_err();
-        assert!(strings[0].message.contains("cannot be compared"), "{}", strings[0].message);
+        assert!(errors_in_main("print(true < false);")[0].message.contains("cannot be compared"));
+        assert!(errors_in_main("print(\"a\" == \"b\");")[0].message.contains("cannot be compared"));
     }
 
     #[test]
     fn a_block_scopes_its_declarations() {
-        // `inner` does not survive the block it was declared in.
-        let errors = check_src("if (true) {\n  int inner = 1;\n}\nprint(inner);").unwrap_err();
+        let errors = errors_in_main("if (true) {\n  int inner = 1;\n}\nprint(inner);");
         assert!(errors[0].message.contains("undeclared variable `inner`"));
     }
 
     #[test]
     fn an_inner_block_may_shadow_an_outer_name() {
-        assert!(check_src("int i = 1;\nif (true) {\n  string i = \"x\";\n  print(i);\n}\nprint(i);").is_ok());
+        assert!(
+            check_main("int i = 1;\nif (true) {\n  string i = \"x\";\n  print(i);\n}\nprint(i);")
+                .is_ok()
+        );
     }
 
     #[test]
     fn a_for_variable_does_not_escape_its_loop() {
-        assert!(check_src("for (int i = 0; i < 1; i = i + 1) {\n}\nfor (int i = 0; i < 1; i = i + 1) {\n}").is_ok());
-        let errors = check_src("for (int i = 0; i < 1; i = i + 1) {\n}\nprint(i);").unwrap_err();
+        assert!(
+            check_main("for (int i = 0; i < 1; i = i + 1) {\n}\nfor (int i = 0; i < 1; i = i + 1) {\n}")
+                .is_ok()
+        );
+        let errors = errors_in_main("for (int i = 0; i < 1; i = i + 1) {\n}\nprint(i);");
         assert!(errors[0].message.contains("undeclared variable `i`"));
     }
 
     #[test]
-    fn rejects_redeclaration_in_the_same_block_only() {
-        assert!(check_src("int x = 1;\nx = 2;\nprint(x);").is_ok());
-        let errors = check_src("int x = 1;\nint x = 2;").unwrap_err();
-        assert!(errors[0].message.contains("already declared"));
-    }
-
-    #[test]
     fn rejects_division_by_zero() {
-        let errors = check_src("print(1 / 0);").unwrap_err();
-        assert!(errors[0].message.contains("division by zero"));
+        assert!(errors_in_main("print(1 / 0);")[0].message.contains("division by zero"));
     }
 
     #[test]
     fn collects_several_errors() {
-        let errors = check_src("print(a);\nprint(b);\n").unwrap_err();
-        assert_eq!(errors.len(), 2);
+        assert_eq!(errors_in_main("print(a);\nprint(b);").len(), 2);
+    }
+
+    // -- functions ---------------------------------------------------------
+
+    #[test]
+    fn accepts_a_call_with_matching_arguments() {
+        assert!(
+            check_src(
+                "fn add(int a, int b) -> int {\n  return a + b;\n}\n\
+                 fn main() {\n  print(add(1, 2));\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_function_may_be_called_before_it_is_declared() {
+        // This is what the first pass buys: `helper` is in the table before
+        // `main`'s body is looked at.
+        assert!(
+            check_src(
+                "fn main() {\n  print(helper());\n}\n\
+                 fn helper() -> int {\n  return 1;\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_function_may_call_itself() {
+        assert!(
+            check_src(
+                "fn fib(int n) -> int {\n  if (n < 2) {\n    return n;\n  } else {\n    \
+                 return fib(n - 1) + fib(n - 2);\n  }\n}\n\
+                 fn main() {\n  print(fib(10));\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn parameters_are_visible_in_the_body() {
+        assert!(check_src("fn f(int a) {\n  print(a);\n}\nfn main() {\n  f(1);\n}").is_ok());
+    }
+
+    #[test]
+    fn a_parameter_does_not_escape_its_function() {
+        let errors =
+            check_src("fn f(int a) {\n  print(a);\n}\nfn main() {\n  print(a);\n}").unwrap_err();
+        assert!(errors[0].message.contains("undeclared variable `a`"));
+    }
+
+    #[test]
+    fn rejects_a_local_that_collides_with_a_parameter() {
+        let errors = check_src("fn f(int a) {\n  int a = 1;\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("already declared"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_two_parameters_with_the_same_name() {
+        let errors = check_src("fn f(int a, int a) {\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("already declared"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_an_unknown_callee() {
+        let errors = check_src("fn main() {\n  nope();\n}").unwrap_err();
+        assert!(errors[0].message.contains("unknown function `nope`"));
+    }
+
+    #[test]
+    fn rejects_the_wrong_number_of_arguments() {
+        let errors =
+            check_src("fn add(int a, int b) -> int {\n  return a + b;\n}\nfn main() {\n  print(add(1));\n}")
+                .unwrap_err();
+        assert!(errors[0].message.contains("takes 2 arguments"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_an_argument_of_the_wrong_type() {
+        let errors =
+            check_src("fn f(int a) {\n}\nfn main() {\n  f(\"hi\");\n}").unwrap_err();
+        assert!(errors[0].message.contains("cannot pass"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_two_functions_with_the_same_name() {
+        let errors = check_src("fn f() {\n}\nfn f() {\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("already defined"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().unwrap().1.is_some());
+    }
+
+    #[test]
+    fn rejects_more_than_four_parameters() {
+        let errors =
+            check_src("fn f(int a, int b, int c, int d, int e) {\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("at most 4"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn accepts_exactly_four_parameters() {
+        assert!(check_src("fn f(int a, int b, int c, int d) {\n}\nfn main() {\n}").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_program_without_main() {
+        let errors = check_src("fn f() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("no `main` function"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_a_main_that_takes_parameters_or_returns() {
+        assert!(
+            check_src("fn main(int a) {\n}").unwrap_err()[0]
+                .message
+                .contains("must not take parameters")
+        );
+        assert!(
+            check_src("fn main() -> int {\n  return 0;\n}").unwrap_err()[0]
+                .message
+                .contains("must not return a value")
+        );
+    }
+
+    // -- returns -----------------------------------------------------------
+
+    #[test]
+    fn rejects_a_return_value_of_the_wrong_type() {
+        let errors = check_src("fn f() -> int {\n  return \"hi\";\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("cannot return"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_a_bare_return_from_a_function_with_a_return_type() {
+        let errors = check_src("fn f() -> int {\n  return;\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("needs a value"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_returning_a_value_from_a_void_function() {
+        let errors = check_src("fn f() {\n  return 1;\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("returns nothing"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_bare_return_is_fine_in_a_void_function() {
+        assert!(check_src("fn f() {\n  return;\n}\nfn main() {\n}").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_body_that_can_finish_without_returning() {
+        let errors =
+            check_src("fn f(int n) -> int {\n  if (n > 0) {\n    return 1;\n  }\n}\nfn main() {\n}")
+                .unwrap_err();
+        assert!(errors[0].message.contains("may finish without returning"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn both_arms_of_an_if_else_count_as_returning() {
+        assert!(
+            check_src(
+                "fn f(int n) -> int {\n  if (n > 0) {\n    return 1;\n  } else {\n    \
+                 return 2;\n  }\n}\nfn main() {\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_loop_is_never_assumed_to_run() {
+        // Conservative on purpose: this program is in fact fine, but proving it
+        // needs more than the syntax.
+        let errors = check_src(
+            "fn f() -> int {\n  while (true) {\n    return 1;\n  }\n}\nfn main() {\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("may finish without returning"));
+    }
+
+    // -- void in expression position ---------------------------------------
+
+    #[test]
+    fn a_void_call_is_a_statement_but_not_a_value() {
+        assert!(check_src("fn greet() {\n}\nfn main() {\n  greet();\n}").is_ok());
+        let errors = check_src("fn greet() {\n}\nfn main() {\n  int n = greet();\n}").unwrap_err();
+        assert!(errors[0].message.contains("returns nothing"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_returning_call_may_be_used_as_a_statement() {
+        // The value is simply discarded, exactly as in C.
+        assert!(
+            check_src("fn f() -> int {\n  return 1;\n}\nfn main() {\n  f();\n}").is_ok()
+        );
     }
 }

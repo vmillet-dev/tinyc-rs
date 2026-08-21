@@ -1,4 +1,6 @@
-if (true) {
-  int inner = 1;
+fn main() {
+  if (true) {
+    int inner = 1;
+  }
+  print(inner);
 }
-print(inner);

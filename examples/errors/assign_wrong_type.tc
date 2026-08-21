@@ -1,3 +1,5 @@
-int count = 1;
-count = "many";
-print(count);
+fn main() {
+  int count = 1;
+  count = "many";
+  print(count);
+}

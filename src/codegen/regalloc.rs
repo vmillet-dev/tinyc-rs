@@ -26,7 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{Program, VReg};
+use crate::ir::{Function, VReg};
 
 /// Index of a machine register, interpreted by the backend that supplied the
 /// [`RegisterFile`].
@@ -87,13 +87,13 @@ impl Allocation {
     }
 
     /// Render intervals and assignments for `--dump-regalloc`.
-    pub fn dump(&self, program: &Program, rf: &RegisterFile) -> String {
+    pub fn dump(&self, function: &Function, rf: &RegisterFile) -> String {
         // Names grow with reassignment (`%n`, `%n.1`, ...), so size the first
         // column to the widest one.
         let width = self
             .intervals
             .iter()
-            .map(|i| program.name_of(i.vreg).len() + 2)
+            .map(|i| function.name_of(i.vreg).len() + 2)
             .chain(std::iter::once(6))
             .max()
             .unwrap_or(6);
@@ -106,7 +106,7 @@ impl Allocation {
             };
             out.push_str(&format!(
                 "{:<width$}[{:>2}, {:>2}]{:>10}  {:>10}\n",
-                format!("%{}", program.name_of(interval.vreg)),
+                format!("%{}", function.name_of(interval.vreg)),
                 interval.start,
                 interval.end,
                 if interval.crosses_call { "yes" } else { "no" },
@@ -141,10 +141,10 @@ struct Layout {
 }
 
 impl Layout {
-    fn new(program: &Program) -> Layout {
+    fn new(function: &Function) -> Layout {
         let (mut start, mut end, mut call_sites) = (Vec::new(), Vec::new(), Vec::new());
         let mut index = 0;
-        for block in &program.blocks {
+        for block in &function.blocks {
             start.push(index);
             for instr in &block.instrs {
                 if instr.is_call() {
@@ -176,13 +176,13 @@ struct Liveness {
 /// live_out(B) = union of live_in(S) for every successor S of B
 /// live_in(B)  = used_before_written(B) + (live_out(B) - written(B))
 /// ```
-fn liveness(program: &Program) -> Liveness {
-    let count = program.blocks.len();
+fn liveness(function: &Function) -> Liveness {
+    let count = function.blocks.len();
 
     // Per block: registers read before being written, and registers written.
     let mut upward_exposed = vec![HashSet::new(); count];
     let mut written = vec![HashSet::new(); count];
-    for (b, block) in program.blocks.iter().enumerate() {
+    for (b, block) in function.blocks.iter().enumerate() {
         for instr in &block.instrs {
             for used in instr.uses() {
                 if !written[b].contains(&used) {
@@ -210,7 +210,7 @@ fn liveness(program: &Program) -> Liveness {
         // reaches the fixpoint in few passes.
         for b in (0..count).rev() {
             let mut out = HashSet::new();
-            for successor in program.blocks[b].term.successors() {
+            for successor in function.blocks[b].term.successors() {
                 out.extend(live_in[successor.0 as usize].iter().copied());
             }
 
@@ -234,13 +234,13 @@ fn liveness(program: &Program) -> Liveness {
 /// conservative approximation: a register live at the top and bottom of a loop
 /// is treated as live throughout, so it cannot be handed to anything else in
 /// between. That is exactly what a back edge requires.
-pub fn live_intervals(program: &Program) -> Vec<Interval> {
-    let layout = Layout::new(program);
-    let live = liveness(program);
+pub fn live_intervals(function: &Function) -> Vec<Interval> {
+    let layout = Layout::new(function);
+    let live = liveness(function);
 
-    let mut start = vec![u32::MAX; program.vreg_count()];
-    let mut end = vec![0u32; program.vreg_count()];
-    let mut seen = vec![false; program.vreg_count()];
+    let mut start = vec![u32::MAX; function.vreg_count()];
+    let mut end = vec![0u32; function.vreg_count()];
+    let mut seen = vec![false; function.vreg_count()];
 
     let mut extend = |reg: VReg, at: u32, start: &mut Vec<u32>, end: &mut Vec<u32>| {
         let slot = reg.0 as usize;
@@ -249,7 +249,7 @@ pub fn live_intervals(program: &Program) -> Vec<Interval> {
         seen[slot] = true;
     };
 
-    for (b, block) in program.blocks.iter().enumerate() {
+    for (b, block) in function.blocks.iter().enumerate() {
         // Live across the whole block boundary, so the interval must span it.
         for &reg in &live.live_in[b] {
             extend(reg, layout.start[b], &mut start, &mut end);
@@ -273,7 +273,7 @@ pub fn live_intervals(program: &Program) -> Vec<Interval> {
         }
     }
 
-    let mut intervals: Vec<Interval> = (0..program.vreg_count() as u32)
+    let mut intervals: Vec<Interval> = (0..function.vreg_count() as u32)
         .map(VReg)
         .filter(|reg| seen[reg.0 as usize])
         .map(|vreg| {
@@ -292,8 +292,8 @@ pub fn live_intervals(program: &Program) -> Vec<Interval> {
     intervals
 }
 
-pub fn allocate(program: &Program, rf: &RegisterFile) -> Allocation {
-    let intervals = live_intervals(program);
+pub fn allocate(function: &Function, rf: &RegisterFile) -> Allocation {
+    let intervals = live_intervals(function);
 
     let mut state = Scan {
         free_caller_saved: rf.caller_saved.iter().rev().copied().collect(),
@@ -474,6 +474,7 @@ pub fn verify(allocation: &Allocation, rf: &RegisterFile) -> std::result::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::Program;
     use crate::{lexer, parser, sema};
 
     /// A deliberately tiny register file: 2 caller-saved, 2 callee-saved.
@@ -491,10 +492,15 @@ mod tests {
         crate::ir::lower(&ast, &types)
     }
 
+    /// Lower a `main` body; every test below is about one function's frame.
+    fn ir_of_main(body: &str) -> Program {
+        ir_of(&format!("fn main() {{\n{body}\n}}\n"))
+    }
+
     #[test]
     fn intervals_end_at_the_last_use() {
-        let ir = ir_of("int x = 10;\nint y = 20;\nprint(x + y);");
-        let intervals = live_intervals(&ir);
+        let ir = ir_of_main("int x = 10;\nint y = 20;\nprint(x + y);");
+        let intervals = live_intervals(&ir.functions[0]);
         assert_eq!((intervals[0].start, intervals[0].end), (0, 2)); // x
         assert_eq!((intervals[1].start, intervals[1].end), (1, 2)); // y
         assert_eq!((intervals[2].start, intervals[2].end), (2, 3)); // x + y
@@ -502,11 +508,12 @@ mod tests {
 
     #[test]
     fn a_value_live_across_a_call_gets_a_callee_saved_register() {
-        let ir = ir_of("string s = \"hi\";\nprint(1 + 2);\nprint(s);");
+        let ir = ir_of_main("string s = \"hi\";\nprint(1 + 2);\nprint(s);");
+        let main = &ir.functions[0];
         let rf = tiny_file();
-        let allocation = allocate(&ir, &rf);
-        let s = ir.blocks[0].instrs.iter().find_map(|i| i.def()).unwrap();
-        assert!(live_intervals(&ir)[0].crosses_call);
+        let allocation = allocate(main, &rf);
+        let s = main.blocks[0].instrs.iter().find_map(|i| i.def()).unwrap();
+        assert!(live_intervals(main)[0].crosses_call);
         match allocation.location(s) {
             Location::Reg(reg) => assert!(rf.callee_saved.contains(&reg)),
             other => panic!("expected a register, got {other:?}"),
@@ -518,10 +525,11 @@ mod tests {
     fn a_dead_temporary_hands_its_register_to_the_next_one() {
         // Each product dies at the sum that consumes it, so the later temporaries
         // reuse the earlier ones' registers instead of growing the frame.
-        let ir = ir_of("int a = 2;\nprint(a * 3 + a * 4 + a * 5 + a * 6);");
+        let ir = ir_of_main("int a = 2;\nprint(a * 3 + a * 4 + a * 5 + a * 6);");
+        let main = &ir.functions[0];
         let rf = tiny_file();
-        let allocation = allocate(&ir, &rf);
-        assert_eq!(allocation.spill_slots, 0, "{}", allocation.dump(&ir, &rf));
+        let allocation = allocate(main, &rf);
+        assert_eq!(allocation.spill_slots, 0, "{}", allocation.dump(main, &rf));
         assert!(verify(&allocation, &rf).is_ok());
     }
 
@@ -531,23 +539,21 @@ mod tests {
         // header, so its interval has to cover the whole loop even though the
         // definition comes *after* the use in program order. A single forward
         // pass would end its interval at the last instruction that mentions it.
-        let ir = ir_of("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
-        let intervals = live_intervals(&ir);
-        let i = intervals.iter().find(|interval| ir.name_of(interval.vreg) == "i").unwrap();
+        let ir = ir_of_main("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
+        let main = &ir.functions[0];
+        let intervals = live_intervals(main);
+        let i = intervals.iter().find(|interval| main.name_of(interval.vreg) == "i").unwrap();
 
         // The interval has to reach past the bottom of the body, where `i` is
         // redefined, and back to the header that reads it again.
         assert_eq!(i.start, 0, "`i` is defined before the loop");
-        assert!(
-            i.end > block_end(&ir, "body2"),
-            "`i` must outlive the loop body, got {i:?}"
-        );
+        assert!(i.end > block_end(main, "body2"), "`i` must outlive the loop body, got {i:?}");
     }
 
     /// Index of a block's terminator in the flattened layout.
-    fn block_end(program: &Program, label: &str) -> u32 {
+    fn block_end(function: &Function, label: &str) -> u32 {
         let mut index = 0;
-        for block in &program.blocks {
+        for block in &function.blocks {
             index += block.instrs.len() as u32;
             if block.label == label {
                 return index;
@@ -559,9 +565,11 @@ mod tests {
 
     #[test]
     fn a_temporary_inside_a_loop_does_not_escape_it() {
-        let ir = ir_of("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
-        let intervals = live_intervals(&ir);
-        let t = intervals.iter().find(|interval| ir.name_of(interval.vreg).starts_with('t')).unwrap();
+        let ir = ir_of_main("int i = 0;\nwhile (i < 3) {\n  i = i + 1;\n}\nprint(i);");
+        let main = &ir.functions[0];
+        let intervals = live_intervals(main);
+        let t =
+            intervals.iter().find(|interval| main.name_of(interval.vreg).starts_with('t')).unwrap();
         // The comparison result is consumed by the branch in the same block.
         assert!(t.end - t.start <= 1, "{t:?}");
     }
@@ -574,20 +582,90 @@ mod tests {
             "int t = 0;\nfor (int i = 0; i < 4; i = i + 1) {\n  t = t + i;\n  print(t);\n}",
             "int a = 1;\nif (a < 2) {\n  a = 2;\n} else {\n  a = 3;\n}\nprint(a);",
         ] {
-            let ir = ir_of(src);
-            let allocation = allocate(&ir, &rf);
-            assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(&ir, &rf));
+            let ir = ir_of_main(src);
+            let main = &ir.functions[0];
+            let allocation = allocate(main, &rf);
+            assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(main, &rf));
         }
     }
 
     #[test]
     fn spills_when_the_register_file_runs_out() {
-        let src = "int a = 1;\nint b = 2;\nint c = 3;\nint d = 4;\nint e = 5;\n\
-                   print(a + b + c + d + e);";
-        let ir = ir_of(src);
+        let ir = ir_of_main(
+            "int a = 1;\nint b = 2;\nint c = 3;\nint d = 4;\nint e = 5;\n\
+             print(a + b + c + d + e);",
+        );
+        let main = &ir.functions[0];
         let rf = tiny_file();
-        let allocation = allocate(&ir, &rf);
+        let allocation = allocate(main, &rf);
         assert!(allocation.spill_slots > 0);
-        assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(&ir, &rf));
+        assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(main, &rf));
+    }
+
+    // -- functions ---------------------------------------------------------
+
+    #[test]
+    fn every_function_is_allocated_on_its_own() {
+        // Two frames, computed independently: `main` spills nothing just
+        // because `crowded` had to.
+        let ir = ir_of(
+            "fn crowded(int a, int b, int c, int d) -> int {\n  return a + b + c + d;\n}\n\
+             fn main() {\n  print(crowded(1, 2, 3, 4));\n}",
+        );
+        let rf = tiny_file();
+        for function in &ir.functions {
+            let allocation = allocate(function, &rf);
+            assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(function, &rf));
+        }
+    }
+
+    #[test]
+    fn a_parameter_is_live_from_the_top_of_its_function() {
+        // `Instr::Param` is what gives a parameter a definition point. Without
+        // it the interval would start at the first use, and the register the
+        // argument arrived in could be handed to something else in between.
+        let ir = ir_of(
+            "fn f(int a) -> int {\n  int filler = 1;\n  print(filler);\n  return a;\n}\n\
+             fn main() {\n  print(f(1));\n}",
+        );
+        let f = &ir.functions[0];
+        let intervals = live_intervals(f);
+        let a = intervals.iter().find(|i| f.name_of(i.vreg) == "a").unwrap();
+        assert_eq!(a.start, 0, "a parameter is defined by the entry block's first instruction");
+        // It survives the `print`, so it may not sit in a caller-saved register.
+        assert!(a.crosses_call, "{a:?}");
+    }
+
+    #[test]
+    fn an_argument_of_a_call_does_not_cross_it() {
+        // A value read *by* the call dies at the call, so it can stay in a
+        // cheap caller-saved register.
+        let ir = ir_of(
+            "fn g(int n) -> int {\n  return n;\n}\n\
+             fn main() {\n  int x = 1;\n  print(g(x));\n}",
+        );
+        let main = ir.functions.last().unwrap();
+        let intervals = live_intervals(main);
+        let x = intervals.iter().find(|i| main.name_of(i.vreg) == "x").unwrap();
+        assert!(!x.crosses_call, "{x:?}");
+    }
+
+    #[test]
+    fn a_nested_call_forces_the_outer_argument_into_a_callee_saved_register() {
+        // In `f(g(1), h(2))` the result of `g` is live across the call to `h`.
+        let ir = ir_of(
+            "fn g(int n) -> int {\n  return n;\n}\nfn h(int n) -> int {\n  return n;\n}\n\
+             fn f(int a, int b) -> int {\n  return a + b;\n}\n\
+             fn main() {\n  print(f(g(1), h(2)));\n}",
+        );
+        let main = ir.functions.last().unwrap();
+        let rf = tiny_file();
+        let allocation = allocate(main, &rf);
+        assert!(
+            live_intervals(main).iter().any(|i| i.crosses_call),
+            "{}",
+            allocation.dump(main, &rf)
+        );
+        assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(main, &rf));
     }
 }

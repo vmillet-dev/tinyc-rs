@@ -1,0 +1,11 @@
+fn twice() -> int {
+  return 2;
+}
+
+fn twice() -> int {
+  return 3;
+}
+
+fn main() {
+  print(twice());
+}

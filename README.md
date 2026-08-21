@@ -4,11 +4,15 @@ A small compiler, written in Rust 2024 with no dependencies except `clap`, that
 turns a tiny typed language into x86-64 assembly.
 
 ```c
-int x = 10;
-int y = 20;
-string s = "Hello World";
-print(x + y);
-print(s);
+fn add(int a, int b) -> int {
+  return a + b;
+}
+
+fn main() {
+  string s = "Hello World";
+  print(add(10, 20));
+  print(s);
+}
 ```
 
 ```
@@ -39,15 +43,22 @@ cargo run -- examples/hello.tc --emit ir
 ```
 
 ```
-str0 = "Hello World"
+fn double(%n) -> int:
+entry0:
+  0  %n = param 0
+  1  %t1 = mul %n, 2
+  2  return %t1
 
-  0  %x = const 10
-  1  %y = const 20
-  2  %s = straddr str0
-  3  %t3 = add %x, %y
-  4  print int %t3
-  5  print string %s
+fn main():
+entry0:
+  0  %t0 = call double(21)
+  1  print int %t0
+  2  return
 ```
+
+Each function owns its blocks and its virtual registers, so both are numbered
+from zero in every one of them. Only string literals are shared, because they
+all end up in a single `.data` section.
 
 ## Compiling to assembly
 
@@ -94,26 +105,95 @@ symbol, since the UCRT headers normally supply it as an inline function.
 ## The language
 
 ```
-program := stmt*
-stmt    := decl | assign | print | if | while | for
-decl    := ("int" | "string" | "bool") IDENT "=" expr ";"
+program := fn_decl*
+fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
+params  := param ("," param)*
+param   := type IDENT
+type    := "int" | "string" | "bool"
+stmt    := decl | assign | print | if | while | for | return | call ";"
+decl    := type IDENT "=" expr ";"
 assign  := IDENT "=" expr ";"
 print   := "print" "(" expr ")" ";"
 if      := "if" "(" expr ")" block ("else" (block | if))?
 while   := "while" "(" expr ")" block
 for     := "for" "(" (decl | assign) expr ";" assign ")" block
+return  := "return" expr? ";"
 block   := "{" stmt* "}"
 expr    := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 sum     := term (("+" | "-") term)*
 term    := unary (("*" | "/") unary)*
 unary   := "-" unary | primary
-primary := INT | STRING | BOOL | IDENT | "(" expr ")"
+primary := INT | STRING | BOOL | IDENT | call | "(" expr ")"
+call    := IDENT "(" (expr ("," expr)*)? ")"
 ```
 
 `int` is a 64-bit signed integer, `string` is a pointer to static bytes, `bool`
 is `true` or `false`. Arithmetic is `int`-only, `//` starts a comment, and a
 variable keeps the type it was declared with — assigning a `string` to an `int`
-is an error. There are deliberately no functions or arrays yet.
+is an error. There are deliberately no arrays yet.
+
+### Functions
+
+A program is a list of functions and nothing else; execution starts at `main`,
+which takes no parameters and returns nothing
+([`examples/functions.tc`](examples/functions.tc)):
+
+```c
+fn add(int a, int b) -> int {
+  return a + b;
+}
+
+fn banner(string title) {     // no `->`: this one returns nothing
+  print(title);
+}
+
+fn fib(int n) -> int {
+  if (n < 2) { return n; }
+  else { return fib(n - 1) + fib(n - 2); }
+}
+```
+
+* **Signatures are collected before any body is checked.** That is what makes
+  `fib` visible inside `fib`, and lets `main` call a function declared below it.
+  A single pass could only ever look backwards.
+* **A function returning nothing has no return type at all**, rather than a
+  `void` one. In the AST that is `ret: Option<Ty>`, so `Ty` keeps meaning "a type
+  a value can have" and no `match` anywhere gains an impossible arm.
+* **A non-`void` function must return on every path.** The check is deliberately
+  simple — a loop is never assumed to run, so `while (true) { return 1; }` is
+  rejected. It can only ever reject a program that would in fact have been fine.
+* **A call returning nothing is a statement, never a value.** `greet("hi");` is
+  the only expression statement in the language, and it exists precisely so that
+  a `void` function is callable at all.
+* **At most four parameters**, because that is how many the Microsoft x64 ABI
+  passes in registers. A fifth would need stack arguments.
+
+### What functions changed underneath
+
+Two things stopped being singular.
+
+* **The IR grew a level.** `ir::Program` used to be one list of basic blocks;
+  it is now a list of `Function`s, each owning its own blocks *and* its own
+  virtual registers. `BlockId` and `VReg` became indices into a function rather
+  than into the program, which is what lets the allocator run once per function
+  and give each one its own frame.
+* **A parameter needs a definition point.** Arguments arrive in registers, and
+  `Instr::Param` at the top of the entry block is what records that. Without it
+  liveness would start a parameter's interval at its *first use*, and the
+  register the argument arrived in could be handed to something else in the
+  meantime.
+
+```
+$ cargo run -- examples/functions.tc --emit ir | head
+str0 = "--------"
+
+fn add(%a, %b) -> int:
+entry0:
+  0  %a = param 0
+  1  %b = param 1
+  2  %t2 = add %a, %b
+  3  return %t2
+```
 
 ### Control flow
 
@@ -177,10 +257,10 @@ Every diagnostic points at a line and a column:
 ```
 $ cargo run -- examples/errors/type_mismatch.tc
 error: cannot apply `+` to `int` and `string`
- --> examples/errors/type_mismatch.tc:3:11
+ --> examples/errors/type_mismatch.tc:4:13
   |
-3 | print(x + s);
-  |           ^ expected int, found string
+4 |   print(x + s);
+  |             ^ expected int, found string
 ```
 
 Columns are counted in characters rather than bytes, so non-ASCII text earlier
@@ -194,32 +274,50 @@ target-independent: the backend hands it a `RegisterFile` describing which
 machine registers exist and which of them survive a call, and gets back a
 location for every value. Live ranges come from a backward dataflow analysis
 over the control flow graph, so a value carried around a loop stays live across
-the back edge.
+the back edge. It runs **once per function**, so each one gets its own registers,
+its own spill slots and its own frame.
 
 ```bash
 cargo run -- examples/hello.tc --dump-regalloc
 ```
 
 ```
-vreg  live range   across call  location
-%x    [ 0,  3]        no          r8
-%y    [ 1,  3]        no          r9
-%s    [ 2,  5]       yes         rbx
-%t3   [ 3,  4]        no          r9
+fn main():
+vreg     live range   across call  location
+%x       [ 0,  3]        no         rbx
+%y       [ 1,  3]        no         rsi
+%s       [ 2,  5]       yes         rdi
+%t3      [ 3,  4]        no         rsi
+%isReady [ 6,  7]        no         rdi
+%i       [ 8, 14]       yes         rdi
+%t6      [10, 11]        no         rsi
 
-0 spill slot(s), callee-saved used: rbx
+0 spill slot(s), callee-saved used: rbx, rsi, rdi
 ```
 
 Three things worth noticing:
 
-* `%t3` reuses `r9`, the register `%y` occupied — a temporary hands its register
+* `%t3` reuses `rsi`, the register `%y` occupied — a temporary hands its register
   to the next one as soon as it dies, so long expressions do not need long rows
   of registers. `examples/arith.tc` computes twenty-one temporaries in two.
-* `%s` is still needed after the first `printf`, so it goes in `rbx`, a
-  callee-saved register, and the prologue pushes it. Values that die before the
-  call stay in the cheap caller-saved registers.
+* `%s` is still needed after the first `printf`, so it must survive that call.
+  `%t3` dies before it and can share `rsi` with `%y`.
 * When registers run out the longest-lived value is spilled to a stack slot, and
   slots are recycled just like registers. `examples/spill.tc` forces this.
+
+### Why every register here is callee-saved
+
+`r8` and `r9` used to be allocatable. They are also argument registers three and
+four, and once calls exist that is a contradiction: setting up `f(x, y, z)`
+writes `r8`, which may be exactly where `z` is still waiting to be read. Solving
+that in general is the *parallel move* problem — the moves have to be ordered,
+and cycles broken with a temporary.
+
+Withdrawing `r8` and `r9` from the pool sidesteps it. No source of an argument
+move can be an argument register any more, so the moves can be emitted in any
+order. The cost is a `push`/`pop` pair per register used, which is a good trade
+at this size — and it is the kind of decision a register allocator exists to
+make explicit.
 
 ## Targeting another platform
 
@@ -229,10 +327,10 @@ target needs:
 1. a module implementing `Backend` (`name`, `register_file`, `emit`);
 2. a variant in `codegen::Target` and an entry in `codegen::TARGETS`.
 
-The x64 Windows backend keeps the ABI-critical registers (`rcx`, `rdx` for
-arguments, `rax`/`rdx` for `idiv`, `r10`/`r11` as scratch) out of the
-allocator's hands, so the allocator only ever reasons about "caller-saved" and
-"callee-saved" pools.
+The x64 Windows backend keeps the ABI-critical registers (`rcx`, `rdx`, `r8`,
+`r9` for arguments, `rax` for `idiv` and return values, `r10`/`r11` as scratch)
+out of the allocator's hands, so the allocator only ever reasons about
+"caller-saved" and "callee-saved" pools — never about x86.
 
 ## Tests
 

@@ -2,9 +2,10 @@
 //!
 //! ## Calling convention
 //!
-//! The generated `main` follows the Microsoft x64 ABI:
+//! Generated functions follow the Microsoft x64 ABI:
 //!
-//! * integer arguments go in `rcx`, `rdx`, `r8`, `r9`;
+//! * integer arguments go in `rcx`, `rdx`, `r8`, `r9`, and a return value comes
+//!   back in `rax`;
 //! * the caller reserves 32 bytes of *shadow space* for the callee;
 //! * `rsp` must be 16-byte aligned at every `call`;
 //! * `rax`, `rcx`, `rdx`, `r8`-`r11` are destroyed by a call, the rest survive.
@@ -13,18 +14,33 @@
 //!
 //! | Role | Registers |
 //! |------|-----------|
-//! | call arguments, `idiv` remainder (never allocated) | `rcx`, `rdx` |
-//! | `idiv` dividend (never allocated)                  | `rax` |
+//! | call arguments, `idiv` remainder (never allocated) | `rcx`, `rdx`, `r8`, `r9` |
+//! | `idiv` dividend and return value (never allocated) | `rax` |
 //! | scratch for spilled operands (never allocated)     | `r10`, `r11` |
-//! | allocatable, caller-saved                          | `r8`, `r9` |
 //! | allocatable, callee-saved                          | `rbx`, `rsi`, `rdi`, `r12`-`r15` |
 //!
 //! Keeping the ABI-critical registers out of the allocator's hands is what lets
-//! the allocator stay target-independent: it only ever sees the last two rows.
+//! the allocator stay target-independent: it only ever sees the last row.
+//!
+//! ### Why nothing is allocatable and caller-saved
+//!
+//! `r8` and `r9` used to be handed out by the allocator. They are also
+//! argument registers three and four, and that is a contradiction as soon as
+//! calls exist: setting up `f(x, y, z)` writes `r8`, which may be exactly where
+//! `z` is still waiting to be read. Solving that in general is the *parallel
+//! move* problem — you have to order the moves, and break cycles with a
+//! temporary.
+//!
+//! Withdrawing `r8` and `r9` from the pool sidesteps it entirely. Every value
+//! the allocator hands out now lives in a callee-saved register or a spill
+//! slot, so no source of an argument move can ever be an argument register, and
+//! the moves can be emitted in any order. The cost is a `push`/`pop` pair in the
+//! prologue for each register used, which is a good trade for a compiler this
+//! size.
 
 use crate::ast::{BinOp, CmpOp, Ty};
 use crate::codegen::{Allocation, Backend, Location, PhysReg, RegisterFile};
-use crate::ir::{Block, Instr, Program, Terminator, VReg, Value};
+use crate::ir::{Block, Function, Instr, Program, Terminator, VReg, Value};
 
 /// Register numbers follow the usual x86-64 encoding order.
 const NAMES: [&str; 16] = [
@@ -42,6 +58,9 @@ const SCRATCH1: &str = "r11";
 /// The low byte of [`SCRATCH1`], which is where `setcc` deposits its result.
 const SCRATCH1_8: &str = "r11b";
 
+/// Where the first four integer arguments travel, in order.
+const ARG_REGS: [&str; 4] = ["rcx", "rdx", "r8", "r9"];
+
 const FMT_INT: &str = "fmt_int";
 const FMT_STR: &str = "fmt_str";
 const FMT_BOOL: &str = "fmt_bool";
@@ -50,6 +69,10 @@ const BOOL_FALSE: &str = "bool_false";
 
 /// Bytes of shadow space every caller must reserve on Windows.
 const SHADOW_SPACE: u32 = 32;
+
+/// The entry point, which returns 0 to the C runtime rather than a value of
+/// its own.
+const ENTRY_POINT: &str = "main";
 
 pub struct X64Windows {
     registers: RegisterFile,
@@ -60,7 +83,9 @@ impl X64Windows {
         X64Windows {
             registers: RegisterFile {
                 names: NAMES.to_vec(),
-                caller_saved: vec![PhysReg(8), PhysReg(9)],
+                // See the module docs: the caller-saved registers that remain
+                // free are all argument registers, so none is allocatable.
+                caller_saved: Vec::new(),
                 callee_saved: vec![
                     PhysReg(3),  // rbx
                     PhysReg(6),  // rsi
@@ -90,31 +115,47 @@ impl Backend for X64Windows {
         &self.registers
     }
 
-    fn emit(&self, program: &Program, allocation: &Allocation) -> String {
-        Emitter { program, allocation, backend: self, out: String::new() }.run()
+    fn emit(&self, program: &Program, allocations: &[Allocation]) -> String {
+        Emitter { program, allocations, backend: self, current: 0, out: String::new() }.run()
     }
 }
 
 struct Emitter<'a> {
     program: &'a Program,
-    allocation: &'a Allocation,
+    allocations: &'a [Allocation],
     backend: &'a X64Windows,
+    /// Index of the function being emitted.
+    current: usize,
     out: String,
 }
 
 impl<'a> Emitter<'a> {
     fn run(mut self) -> String {
-        let frame = FrameLayout::new(self.allocation);
-        let program = self.program;
-
         self.header();
         self.data_section();
         self.line("section .text");
+
+        for index in 0..self.program.functions.len() {
+            self.current = index;
+            self.function();
+        }
+        self.out
+    }
+
+    /// The function being emitted, and its allocation.
+    fn function(&mut self) {
+        let function = self.func();
+        let allocation = self.alloc();
+        let frame = FrameLayout::new(allocation);
+
         self.blank();
-        self.line("main:");
+        for line in allocation.dump(function, self.backend.register_file()).lines() {
+            self.comment(line);
+        }
+        self.line(&format!("{}:", function.name));
         self.prologue(&frame);
 
-        for (index, block) in program.blocks.iter().enumerate() {
+        for (index, block) in function.blocks.iter().enumerate() {
             self.blank();
             self.line(&format!(".{}:", block.label));
             for instr in &block.instrs {
@@ -124,7 +165,18 @@ impl<'a> Emitter<'a> {
             }
             self.terminator(block, index, &frame);
         }
-        self.out
+    }
+
+    fn func(&self) -> &'a Function {
+        &self.program.functions[self.current]
+    }
+
+    fn alloc(&self) -> &'a Allocation {
+        &self.allocations[self.current]
+    }
+
+    fn is_entry_point(&self) -> bool {
+        self.func().name == ENTRY_POINT
     }
 
     /// Emit a block's exit. A jump to the very next block is left out: control
@@ -133,15 +185,15 @@ impl<'a> Emitter<'a> {
         let next = index + 1;
         match &block.term {
             Terminator::Jump(target) => {
-                let label = self.program.block(*target).label.clone();
+                let label = self.func().block(*target).label.clone();
                 if target.0 as usize != next {
                     self.comment(&format!("jump {label}"));
                     self.asm(&format!("jmp  .{label}"));
                 }
             }
             Terminator::Branch { cond, then_blk, else_blk } => {
-                let then_label = self.program.block(*then_blk).label.clone();
-                let else_label = self.program.block(*else_blk).label.clone();
+                let then_label = self.func().block(*then_blk).label.clone();
+                let else_label = self.func().block(*else_blk).label.clone();
                 self.comment(&format!("branch to {then_label} or {else_label}"));
 
                 // `test` needs a register, and the condition may be a literal.
@@ -153,7 +205,22 @@ impl<'a> Emitter<'a> {
                     self.asm(&format!("jmp  .{then_label}"));
                 }
             }
-            Terminator::Return => self.epilogue(frame),
+            Terminator::Return(value) => {
+                match value {
+                    // `main` always reports success, whatever it computed.
+                    _ if self.is_entry_point() => {
+                        self.comment("return 0 to the CRT");
+                        self.asm("xor  eax, eax");
+                    }
+                    Some(value) => {
+                        self.comment("return value in rax");
+                        let value = self.value(value, frame);
+                        self.mov(RAX, &value);
+                    }
+                    None => self.comment("return"),
+                }
+                self.epilogue(frame);
+            }
         }
     }
 
@@ -188,21 +255,16 @@ impl<'a> Emitter<'a> {
     fn header(&mut self) {
         let rule = format!("; {}", "-".repeat(68));
         let name = self.backend.name();
-        let allocation = self.allocation.dump(self.program, self.backend.register_file());
 
         self.line(&rule);
         self.line(&format!("; Generated by tinyc for {name} (NASM syntax)"));
-        self.line(";");
-        for line in allocation.lines() {
-            self.line(&format!("; {line}"));
-        }
         self.line(&rule);
         // Without `default rel`, `lea rcx, [label]` would use a 32-bit absolute
         // address instead of the RIP-relative form 64-bit code wants.
         self.line("default rel");
         self.blank();
         self.line("extern printf");
-        self.line("global main");
+        self.line(&format!("global {ENTRY_POINT}"));
         self.blank();
     }
 
@@ -236,20 +298,21 @@ impl<'a> Emitter<'a> {
 
     fn uses_format(&self, ty: Ty) -> bool {
         self.program
-            .blocks
+            .functions
             .iter()
+            .flat_map(|function| &function.blocks)
             .flat_map(|block| &block.instrs)
             .any(|instr| matches!(instr, Instr::Print { ty: t, .. } if *t == ty))
     }
 
     fn prologue(&mut self, frame: &FrameLayout) {
         let saved: Vec<&str> = self
-            .allocation
+            .alloc()
             .used_callee_saved
             .iter()
             .map(|&reg| self.backend.registers.name(reg))
             .collect();
-        let slots = self.allocation.spill_slots;
+        let slots = self.alloc().spill_slots;
 
         self.comment("prologue: save callee-saved registers, then reserve the frame");
         for reg in saved {
@@ -263,15 +326,13 @@ impl<'a> Emitter<'a> {
 
     fn epilogue(&mut self, frame: &FrameLayout) {
         let saved: Vec<&str> = self
-            .allocation
+            .alloc()
             .used_callee_saved
             .iter()
             .rev()
             .map(|&reg| self.backend.registers.name(reg))
             .collect();
 
-        self.comment("epilogue: return 0 to the CRT");
-        self.asm("xor  eax, eax");
         self.asm(&format!("add  rsp, {}", frame.size));
         for reg in saved {
             self.asm(&format!("pop  {reg}"));
@@ -297,6 +358,14 @@ impl<'a> Emitter<'a> {
                 let src = self.value(src, frame);
                 let work = self.work_reg(*dst, false);
                 self.mov(&work, &src);
+                self.store_back(*dst, &work, frame);
+            }
+            // The argument is already sitting in its ABI register; this just
+            // moves it to wherever the allocator decided it should live.
+            Instr::Param { dst, index } => {
+                let src = ARG_REGS[*index as usize];
+                let work = self.work_reg(*dst, false);
+                self.mov(&work, src);
                 self.store_back(*dst, &work, frame);
             }
             // `cmp` sets the flags; `setcc` turns the one that matters into a
@@ -342,6 +411,20 @@ impl<'a> Emitter<'a> {
                     BinOp::Div => unreachable!("handled above"),
                 }
                 self.store_back(*dst, &work, frame);
+            }
+            // No source of these moves can be an argument register, because the
+            // allocator is never given one — see the module docs.
+            Instr::Call { dst, callee, args } => {
+                for (index, arg) in args.iter().enumerate() {
+                    let src = self.value(arg, frame);
+                    self.mov(ARG_REGS[index], &src);
+                }
+                self.asm(&format!("call {}", self.program.function(*callee).name));
+                if let Some(dst) = dst {
+                    let work = self.work_reg(*dst, false);
+                    self.mov(&work, RAX);
+                    self.store_back(*dst, &work, frame);
+                }
             }
             Instr::Print { ty, val } => {
                 // Load the value first: the format string is a constant, so it
@@ -394,7 +477,7 @@ impl<'a> Emitter<'a> {
 
     /// Where a virtual register lives, as an assembly operand.
     fn location(&self, vreg: VReg, frame: &FrameLayout) -> String {
-        match self.allocation.location(vreg) {
+        match self.alloc().location(vreg) {
             Location::Reg(reg) => self.backend.registers.name(reg).to_string(),
             Location::Spill(slot) => format!("qword [rsp+{}]", frame.slot_offset(slot)),
         }
@@ -425,7 +508,7 @@ impl<'a> Emitter<'a> {
     fn shares_register(&self, dst: VReg, value: &Value) -> bool {
         matches!(
             value,
-            Value::Reg(other) if self.allocation.location(*other) == self.allocation.location(dst)
+            Value::Reg(other) if self.alloc().location(*other) == self.alloc().location(dst)
         )
     }
 
@@ -433,7 +516,7 @@ impl<'a> Emitter<'a> {
     /// register, or a scratch register when the destination is spilled or would
     /// clobber an operand that has not been read yet.
     fn work_reg(&self, dst: VReg, force_scratch: bool) -> String {
-        match self.allocation.location(dst) {
+        match self.alloc().location(dst) {
             Location::Reg(reg) if !force_scratch => self.backend.registers.name(reg).to_string(),
             _ => SCRATCH0.to_string(),
         }
@@ -442,7 +525,7 @@ impl<'a> Emitter<'a> {
     /// Move the result out of the scratch register or into its stack slot, if
     /// it was not computed in place.
     fn store_back(&mut self, dst: VReg, work: &str, frame: &FrameLayout) {
-        match self.allocation.location(dst) {
+        match self.alloc().location(dst) {
             Location::Reg(reg) => {
                 let home = self.backend.registers.name(reg);
                 if home != work {
@@ -457,32 +540,44 @@ impl<'a> Emitter<'a> {
 
     /// The IR instruction, echoed into the assembly as a comment.
     fn describe(&self, instr: &Instr) -> String {
+        let function = self.func();
         let value = |v: &Value| match v {
             Value::Const(c) => c.to_string(),
-            Value::Reg(r) => format!("%{}", self.program.name_of(*r)),
+            Value::Reg(r) => format!("%{}", function.name_of(*r)),
         };
         match instr {
-            Instr::Const { dst, val } => format!("%{} = {val}", self.program.name_of(*dst)),
+            Instr::Const { dst, val } => format!("%{} = {val}", function.name_of(*dst)),
             Instr::StrAddr { dst, id } => {
-                format!("%{} = &str{}", self.program.name_of(*dst), id.0)
+                format!("%{} = &str{}", function.name_of(*dst), id.0)
             }
             Instr::Copy { dst, src } => {
-                format!("%{} = {}", self.program.name_of(*dst), value(src))
+                format!("%{} = {}", function.name_of(*dst), value(src))
+            }
+            Instr::Param { dst, index } => {
+                format!("%{} = argument {index}", function.name_of(*dst))
             }
             Instr::Bin { op, dst, lhs, rhs } => format!(
                 "%{} = {} {} {}",
-                self.program.name_of(*dst),
+                function.name_of(*dst),
                 value(lhs),
                 op.symbol(),
                 value(rhs)
             ),
             Instr::Cmp { op, dst, lhs, rhs } => format!(
                 "%{} = {} {} {}",
-                self.program.name_of(*dst),
+                function.name_of(*dst),
                 value(lhs),
                 op.symbol(),
                 value(rhs)
             ),
+            Instr::Call { dst, callee, args } => {
+                let args: Vec<String> = args.iter().map(value).collect();
+                let call = format!("{}({})", self.program.function(*callee).name, args.join(", "));
+                match dst {
+                    Some(dst) => format!("%{} = {call}", function.name_of(*dst)),
+                    None => call,
+                }
+            }
             Instr::Print { ty, val } => format!("print {} {}", ty.name(), value(val)),
         }
     }
@@ -501,11 +596,15 @@ fn setcc(op: CmpOp) -> &'static str {
     }
 }
 
-/// Stack frame layout for `main`.
+/// Stack frame layout for one function.
 ///
 /// At function entry `rsp % 16 == 8` (the call pushed a return address). Each
 /// pushed register subtracts 8 more, so the frame size is chosen to bring `rsp`
 /// back to a 16-byte boundary before any `call`.
+///
+/// Every frame reserves shadow space, including a function that never calls
+/// anything — 32 bytes is a small price for not having to prove a function is
+/// a leaf.
 struct FrameLayout {
     size: u32,
 }
@@ -532,13 +631,19 @@ mod tests {
     use crate::codegen::regalloc;
     use crate::{lexer, parser, sema};
 
-    fn compile(src: &str) -> String {
+    fn compile_src(src: &str) -> String {
         let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
         let types = sema::check(&ast).unwrap();
         let ir = crate::ir::lower(&ast, &types);
         let backend = X64Windows::new();
-        let allocation = regalloc::allocate(&ir, backend.register_file());
-        backend.emit(&ir, &allocation)
+        let allocations: Vec<Allocation> =
+            ir.functions.iter().map(|f| regalloc::allocate(f, backend.register_file())).collect();
+        backend.emit(&ir, &allocations)
+    }
+
+    /// Compile a `main` body; most of these tests are about one function.
+    fn compile(body: &str) -> String {
+        compile_src(&format!("fn main() {{\n{body}\n}}\n"))
     }
 
     #[test]
@@ -575,13 +680,6 @@ mod tests {
     }
 
     #[test]
-    fn no_pushes_when_nothing_survives_a_call() {
-        let asm = compile("print(1 + 2);");
-        assert!(!asm.contains("push"), "{asm}");
-        assert!(asm.contains("sub  rsp, 40"), "{asm}");
-    }
-
-    #[test]
     fn printing_a_bool_picks_its_text_without_branching() {
         let asm = compile("bool ready = true;\nprint(ready);");
         // `false` is loaded first and overwritten only when the value is not 0.
@@ -589,7 +687,7 @@ mod tests {
         assert!(asm.contains("lea  r11, [bool_true]"), "{asm}");
         assert!(asm.contains("cmovnz rdx, r11"), "{asm}");
         assert!(asm.contains("lea  rcx, [fmt_bool]"), "{asm}");
-        // A conditional move, not a jump: the backend has no labels.
+        // A conditional move, not a jump.
         assert!(!asm.contains("jmp"), "{asm}");
         assert!(!asm.contains("jnz"), "{asm}");
     }
@@ -673,5 +771,91 @@ mod tests {
     fn strings_are_emitted_as_bytes() {
         let asm = compile("string s = \"hi\";\nprint(s);");
         assert!(asm.contains("str0: db 104, 105, 0"), "{asm}");
+    }
+
+    // -- functions ---------------------------------------------------------
+
+    #[test]
+    fn every_function_gets_a_label_a_prologue_and_an_epilogue() {
+        let asm = compile_src(
+            "fn add(int a, int b) -> int {\n  return a + b;\n}\nfn main() {\n  print(add(1, 2));\n}",
+        );
+        assert!(asm.contains("\nadd:\n"), "{asm}");
+        assert!(asm.contains("\nmain:\n"), "{asm}");
+        // One `ret` per function, and only `main` is exported.
+        assert_eq!(asm.matches("\n    ret\n").count(), 2, "{asm}");
+        assert!(asm.contains("global main"), "{asm}");
+        assert!(!asm.contains("global add"), "{asm}");
+    }
+
+    #[test]
+    fn block_labels_are_local_so_two_functions_may_share_them() {
+        // NASM scopes a `.label` to the preceding global one, so `.entry0`
+        // inside `a` and inside `main` are different labels.
+        let asm = compile_src("fn a() {\n  print(1);\n}\nfn main() {\n  a();\n}");
+        assert_eq!(asm.matches(".entry0:").count(), 2, "{asm}");
+    }
+
+    #[test]
+    fn arguments_travel_in_the_abi_registers() {
+        let asm = compile_src(
+            "fn f(int a, int b, int c, int d) {\n  print(a);\n}\n\
+             fn main() {\n  f(1, 2, 3, 4);\n}",
+        );
+        assert!(asm.contains("mov  rcx, 1"), "{asm}");
+        assert!(asm.contains("mov  rdx, 2"), "{asm}");
+        assert!(asm.contains("mov  r8, 3"), "{asm}");
+        assert!(asm.contains("mov  r9, 4"), "{asm}");
+        assert!(asm.contains("call f"), "{asm}");
+    }
+
+    #[test]
+    fn a_parameter_is_moved_out_of_its_argument_register_on_entry() {
+        let asm = compile_src("fn f(int a) -> int {\n  return a;\n}\nfn main() {\n  f(1);\n}");
+        // `a` lands in the first allocatable callee-saved register.
+        assert!(asm.contains("mov  rbx, rcx"), "{asm}");
+    }
+
+    #[test]
+    fn a_returned_value_comes_back_in_rax() {
+        let asm = compile_src("fn one() -> int {\n  return 1;\n}\nfn main() {\n  print(one());\n}");
+        assert!(asm.contains("mov  rax, 1"), "{asm}");
+        // The caller reads the result out of rax.
+        assert!(asm.contains("call one"), "{asm}");
+    }
+
+    #[test]
+    fn main_always_returns_zero_whatever_it_computed() {
+        let asm = compile("print(1);");
+        assert!(asm.contains("xor  eax, eax"), "{asm}");
+    }
+
+    #[test]
+    fn a_void_function_returns_without_touching_rax() {
+        let asm = compile_src("fn greet() {\n  print(1);\n}\nfn main() {\n  greet();\n}");
+        // Only `main`'s epilogue zeroes eax.
+        assert_eq!(asm.matches("xor  eax, eax").count(), 1, "{asm}");
+    }
+
+    #[test]
+    fn no_allocatable_register_is_an_argument_register() {
+        // This is the invariant the whole argument-move story rests on: if the
+        // allocator could hand out rcx/rdx/r8/r9, setting up a call could
+        // clobber a value that call still has to read.
+        let backend = X64Windows::new();
+        let file = backend.register_file();
+        assert!(file.caller_saved.is_empty());
+        for &reg in &file.callee_saved {
+            assert!(!ARG_REGS.contains(&file.name(reg)), "{} is an argument register", file.name(reg));
+        }
+    }
+
+    #[test]
+    fn a_recursive_function_calls_itself_by_name() {
+        let asm = compile_src(
+            "fn fib(int n) -> int {\n  if (n < 2) {\n    return n;\n  } else {\n    \
+             return fib(n - 1) + fib(n - 2);\n  }\n}\nfn main() {\n  print(fib(10));\n}",
+        );
+        assert_eq!(asm.matches("call fib").count(), 3, "{asm}"); // twice inside, once from main
     }
 }

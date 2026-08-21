@@ -21,6 +21,8 @@ pub enum TokenKind {
     KwElse,
     KwWhile,
     KwFor,
+    KwFn,
+    KwReturn,
 
     // Punctuation.
     LParen,
@@ -33,6 +35,8 @@ pub enum TokenKind {
     Minus,
     Star,
     Slash,
+    Comma,
+    Arrow,
 
     // Comparison.
     EqEq,
@@ -65,11 +69,14 @@ impl TokenKind {
         match self {
             TokenKind::KwInt => "int",
             TokenKind::KwString => "string",
+            TokenKind::KwBool => "bool",
             TokenKind::KwPrint => "print",
             TokenKind::KwIf => "if",
             TokenKind::KwElse => "else",
             TokenKind::KwWhile => "while",
             TokenKind::KwFor => "for",
+            TokenKind::KwFn => "fn",
+            TokenKind::KwReturn => "return",
             TokenKind::LParen => "(",
             TokenKind::RParen => ")",
             TokenKind::LBrace => "{",
@@ -90,8 +97,9 @@ impl TokenKind {
             TokenKind::Str(_) => "string literal",
             TokenKind::Ident(_) => "identifier",
             TokenKind::Eof => "end of file",
-            TokenKind::KwBool => "bool",
-            TokenKind::Bool(_) => "boolean literal"
+            TokenKind::Bool(_) => "boolean literal",
+            TokenKind::Comma => ",",
+            TokenKind::Arrow => "->"
         }
     }
 }

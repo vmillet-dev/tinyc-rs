@@ -1,3 +1,5 @@
-int total = 1;
-int total = 2;
-print(total);
+fn main() {
+  int total = 1;
+  int total = 2;
+  print(total);
+}

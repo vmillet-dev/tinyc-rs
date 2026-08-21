@@ -1,2 +1,4 @@
-bool true = true;
-print(true);
+fn main() {
+  bool true = true;
+  print(true);
+}

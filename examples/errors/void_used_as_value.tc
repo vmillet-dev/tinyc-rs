@@ -1,0 +1,8 @@
+fn greet() {
+  print("hi");
+}
+
+fn main() {
+  int n = greet();
+  print(n);
+}

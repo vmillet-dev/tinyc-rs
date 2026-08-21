@@ -2,37 +2,39 @@
 
 // if / else if / else. The condition must be a bool, which is what a
 // comparison produces.
-int n = 7;
-if (n < 5) {
-  print("small");
-} else if (n < 10) {
-  print("medium");
-} else {
-  print("large");
-}
+fn main() {
+  int n = 7;
+  if (n < 5) {
+    print("small");
+  } else if (n < 10) {
+    print("medium");
+  } else {
+    print("large");
+  }
 
-// while: the condition is re-tested at the top of every iteration.
-int i = 3;
-while (i > 0) {
-  print(i);
-  i = i - 1;
-}
+  // while: the condition is re-tested at the top of every iteration.
+  int i = 3;
+  while (i > 0) {
+    print(i);
+    i = i - 1;
+  }
 
-// for: init, condition, step. `j` exists only inside the loop.
-int total = 0;
-for (int j = 1; j <= 5; j = j + 1) {
-  total = total + j;
-}
-print(total);        // 15
+  // for: init, condition, step. `j` exists only inside the loop.
+  int total = 0;
+  for (int j = 1; j <= 5; j = j + 1) {
+    total = total + j;
+  }
+  print(total);        // 15
 
-bool big = total > 10;
-print(big);          // true
+  bool big = total > 10;
+  print(big);          // true
 
-// Nested loops, with an `if` inside.
-for (int a = 1; a <= 3; a = a + 1) {
-  for (int b = 1; b <= 3; b = b + 1) {
-    if (a == b) {
-      print(a * 10 + b);   // 11, 22, 33
+  // Nested loops, with an `if` inside.
+  for (int a = 1; a <= 3; a = a + 1) {
+    for (int b = 1; b <= 3; b = b + 1) {
+      if (a == b) {
+        print(a * 10 + b);   // 11, 22, 33
+      }
     }
   }
 }

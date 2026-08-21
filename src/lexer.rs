@@ -74,9 +74,10 @@ impl<'a> Lexer<'a> {
                     }
                 }
                 '+' => self.single(TokenKind::Plus),
-                '-' => self.single(TokenKind::Minus),
+                '-' => self.one_or_two('>', TokenKind::Arrow, TokenKind::Minus),
                 '*' => self.single(TokenKind::Star),
                 '/' => self.single(TokenKind::Slash),
+                ',' => self.single(TokenKind::Comma),
                 '"' => self.string()?,
                 c if c.is_ascii_digit() => self.number()?,
                 c if is_ident_start(c) => self.ident(),
@@ -148,6 +149,8 @@ impl<'a> Lexer<'a> {
             "for" => TokenKind::KwFor,
             "true" => TokenKind::Bool(true),
             "false" => TokenKind::Bool(false),
+            "fn" => TokenKind::KwFn,
+            "return" => TokenKind::KwReturn,
             name => TokenKind::Ident(name.to_string()),
         }
     }
@@ -248,6 +251,13 @@ mod tests {
         lex(src).unwrap().into_iter().map(|t| t.kind).collect()
     }
 
+    /// The single diagnostic a malformed source produces.
+    fn error(src: &str) -> Diagnostic {
+        let errors = lex(src).unwrap_err();
+        assert_eq!(errors.len(), 1, "expected exactly one error, got {errors:#?}");
+        errors.into_iter().next().expect("just asserted there is one")
+    }
+
     #[test]
     fn lexes_a_declaration() {
         assert_eq!(
@@ -299,7 +309,7 @@ mod tests {
     #[test]
     fn two_character_operators_win_over_their_prefixes() {
         assert_eq!(
-            kinds("<= < == = >= > !="),
+            kinds("<= < == = >= > != -> -"),
             vec![
                 TokenKind::Le,
                 TokenKind::Lt,
@@ -308,6 +318,8 @@ mod tests {
                 TokenKind::Ge,
                 TokenKind::Gt,
                 TokenKind::BangEq,
+                TokenKind::Arrow,
+                TokenKind::Minus,
                 TokenKind::Eof,
             ]
         );
@@ -354,5 +366,274 @@ mod tests {
     fn reports_integer_overflow() {
         let errors = lex("int x = 99999999999999999999;").unwrap_err();
         assert!(errors[0].message.contains("too large"));
+    }
+
+    #[test]
+    fn lexes_a_function_declaration() {
+        assert_eq!(
+            kinds("fn add(int a, int b) -> int { return a + b; }"),
+            vec![
+                TokenKind::KwFn,
+                TokenKind::Ident("add".into()),
+                TokenKind::LParen,
+                TokenKind::KwInt,
+                TokenKind::Ident("a".into()),
+                TokenKind::Comma,
+                TokenKind::KwInt,
+                TokenKind::Ident("b".into()),
+                TokenKind::RParen,
+                TokenKind::Arrow,
+                TokenKind::KwInt,
+                TokenKind::LBrace,
+                TokenKind::KwReturn,
+                TokenKind::Ident("a".into()),
+                TokenKind::Plus,
+                TokenKind::Ident("b".into()),
+                TokenKind::Semi,
+                TokenKind::RBrace,
+                TokenKind::Eof
+            ]
+        )
+    }
+
+    // -- token vocabulary --------------------------------------------------
+
+    #[test]
+    fn lexes_every_punctuation_token() {
+        assert_eq!(
+            kinds("( ) { } ; = + - * / ,"),
+            vec![
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::LBrace,
+                TokenKind::RBrace,
+                TokenKind::Semi,
+                TokenKind::Eq,
+                TokenKind::Plus,
+                TokenKind::Minus,
+                TokenKind::Star,
+                TokenKind::Slash,
+                TokenKind::Comma,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_every_keyword() {
+        assert_eq!(
+            kinds("int string bool print if else while for fn return"),
+            vec![
+                TokenKind::KwInt,
+                TokenKind::KwString,
+                TokenKind::KwBool,
+                TokenKind::KwPrint,
+                TokenKind::KwIf,
+                TokenKind::KwElse,
+                TokenKind::KwWhile,
+                TokenKind::KwFor,
+                TokenKind::KwFn,
+                TokenKind::KwReturn,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_minus_is_an_arrow_only_when_a_greater_than_follows_it() {
+        // The cases the sweep above cannot express: a `-` followed by something
+        // other than `>`, and a `>` that is not adjacent to it.
+        assert_eq!(kinds("-"), vec![TokenKind::Minus, TokenKind::Eof]);
+        assert_eq!(kinds("-->"), vec![TokenKind::Minus, TokenKind::Arrow, TokenKind::Eof]);
+        assert_eq!(kinds("- >"), vec![TokenKind::Minus, TokenKind::Gt, TokenKind::Eof]);
+    }
+
+    #[test]
+    fn a_negative_number_is_a_minus_and_a_literal() {
+        // The lexer never produces a negative `Int`; unary minus is the parser's
+        // job, which is also why `i64::MIN` cannot be written literally.
+        assert_eq!(kinds("-1"), vec![TokenKind::Minus, TokenKind::Int(1), TokenKind::Eof]);
+    }
+
+    // -- identifiers -------------------------------------------------------
+
+    #[test]
+    fn a_keyword_is_never_recognised_as_a_prefix() {
+        // Each of these starts with a keyword's spelling but is longer, so the
+        // match on the whole identifier has to fall through to `Ident`.
+        for name in ["fnx", "returns", "printer", "intx", "forth", "elsewhere", "boolean"] {
+            assert_eq!(
+                kinds(name),
+                vec![TokenKind::Ident(name.into()), TokenKind::Eof],
+                "`{name}` should be an identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn identifiers_may_hold_underscores_and_digits() {
+        // A digit may continue an identifier but may not start one, or `1a`
+        // would lex as a name instead of a malformed literal.
+        assert_eq!(
+            kinds("_ _x1 a_b_2"),
+            vec![
+                TokenKind::Ident("_".into()),
+                TokenKind::Ident("_x1".into()),
+                TokenKind::Ident("a_b_2".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn identifiers_may_be_non_ascii() {
+        // `is_ident_start` asks for `is_alphabetic`, not `is_ascii_alphabetic`.
+        assert_eq!(kinds("café"), vec![TokenKind::Ident("café".into()), TokenKind::Eof]);
+    }
+
+    // -- integer literals --------------------------------------------------
+
+    #[test]
+    fn lexes_the_largest_int() {
+        assert_eq!(kinds("9223372036854775807"), vec![TokenKind::Int(i64::MAX), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn the_smallest_int_cannot_be_written_as_a_literal() {
+        // `-9223372036854775808` is two tokens, and the literal half overflows
+        // on its own. A known limitation, pinned here so it changes on purpose.
+        assert!(error("9223372036854775808").message.contains("too large"));
+    }
+
+    #[test]
+    fn leading_zeros_are_accepted() {
+        assert_eq!(kinds("007"), vec![TokenKind::Int(7), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn rejects_a_suffix_on_an_integer_literal() {
+        // The whole malformed token is consumed, so the caret covers `123abc`
+        // instead of stopping at the first letter.
+        let error = error("123abc");
+        assert!(error.message.contains("invalid suffix"), "{}", error.message);
+        assert_eq!(error.span, Span::new(0, 6));
+    }
+
+    // -- string literals ---------------------------------------------------
+
+    #[test]
+    fn decodes_every_escape() {
+        assert_eq!(
+            kinds(r#""\n\t\r\0\\\"""#),
+            vec![TokenKind::Str(b"\n\t\r\0\\\"".to_vec()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn an_empty_string_is_valid() {
+        assert_eq!(kinds(r#""""#), vec![TokenKind::Str(Vec::new()), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn a_string_holds_utf8_bytes() {
+        // Characters are re-encoded on the way in, so the token carries bytes
+        // and not chars.
+        assert_eq!(
+            kinds(r#""héllo""#),
+            vec![TokenKind::Str("héllo".as_bytes().to_vec()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_comment_marker_inside_a_string_is_just_text() {
+        assert_eq!(
+            kinds(r#""// not a comment""#),
+            vec![TokenKind::Str(b"// not a comment".to_vec()), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_escape_and_lists_the_supported_ones() {
+        let error = error(r#""a\q""#);
+        assert!(error.message.contains(r"unknown escape sequence `\q`"), "{}", error.message);
+        assert_eq!(error.span, Span::new(2, 2)); // the `\q`, not the whole string
+        assert!(error.note.is_some(), "the note lists the escapes that do work");
+    }
+
+    #[test]
+    fn reports_an_unterminated_string_at_end_of_file() {
+        // The other way a string can run out: not a newline, just no more input.
+        assert_eq!(error(r#""abc"#).span, Span::new(0, 1));
+    }
+
+    // -- trivia ------------------------------------------------------------
+
+    #[test]
+    fn a_comment_may_run_to_the_end_of_the_file() {
+        // `skip_trivia` stops on `None` as well as on a newline.
+        assert_eq!(kinds("1 // hi"), vec![TokenKind::Int(1), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn a_single_slash_is_division() {
+        assert_eq!(
+            kinds("1 / 2"),
+            vec![TokenKind::Int(1), TokenKind::Slash, TokenKind::Int(2), TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn whitespace_between_tokens_is_optional() {
+        assert_eq!(
+            kinds("fn f(){return 1;}"),
+            vec![
+                TokenKind::KwFn,
+                TokenKind::Ident("f".into()),
+                TokenKind::LParen,
+                TokenKind::RParen,
+                TokenKind::LBrace,
+                TokenKind::KwReturn,
+                TokenKind::Int(1),
+                TokenKind::Semi,
+                TokenKind::RBrace,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    // -- spans and end of file ---------------------------------------------
+
+    #[test]
+    fn an_empty_source_is_just_end_of_file() {
+        let tokens = lex("").unwrap();
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0].kind, TokenKind::Eof);
+        assert_eq!(tokens[0].span, Span::new(0, 0));
+    }
+
+    #[test]
+    fn end_of_file_is_an_empty_span_after_the_last_byte() {
+        // Parser errors are reported at this span, so it has to stay inside the
+        // file for `line_col` to find a line for it.
+        let tokens = lex("x").unwrap();
+        assert_eq!(tokens.last().unwrap().span, Span::new(1, 0));
+    }
+
+    #[test]
+    fn spans_stay_byte_offsets_after_non_ascii_text() {
+        // `é` is two bytes but one character. Spans count bytes; only the
+        // rendering in `diag` converts them to a character column.
+        let tokens = lex("int café = 1;").unwrap();
+        assert_eq!(tokens[1].span, Span::new(4, 5)); // café: 4 chars, 5 bytes
+        assert_eq!(tokens[2].span, Span::new(10, 1)); // =
+    }
+
+    // -- malformed input ---------------------------------------------------
+
+    #[test]
+    fn rejects_an_unexpected_character() {
+        let error = error("int x = @;");
+        assert!(error.message.contains("unexpected character `@`"), "{}", error.message);
+        assert_eq!(error.span, Span::new(8, 1));
     }
 }

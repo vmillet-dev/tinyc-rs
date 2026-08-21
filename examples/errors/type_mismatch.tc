@@ -1,3 +1,5 @@
-int x = 1;
-string s = "hi";
-print(x + s);
+fn main() {
+  int x = 1;
+  string s = "hi";
+  print(x + s);
+}

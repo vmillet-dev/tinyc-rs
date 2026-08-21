@@ -97,9 +97,12 @@ fn run(cli: &Cli) -> Result<(), String> {
         return Ok(());
     }
 
-    let (backend, allocation, asm) = codegen::compile(&ir, target);
+    let (backend, allocations, asm) = codegen::compile(&ir, target);
     if cli.dump_regalloc {
-        print!("{}", allocation.dump(&ir, backend.register_file()));
+        for (function, allocation) in ir.functions.iter().zip(&allocations) {
+            println!("{}:", function.signature());
+            print!("{}", allocation.dump(function, backend.register_file()));
+        }
     }
 
     let output = cli.output.clone().unwrap_or_else(|| cli.input.with_extension("asm"));

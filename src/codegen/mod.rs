@@ -22,8 +22,9 @@ pub trait Backend {
     /// The machine registers the allocator may hand out.
     fn register_file(&self) -> &RegisterFile;
 
-    /// Produce assembly text for an allocated program.
-    fn emit(&self, program: &Program, allocation: &Allocation) -> String;
+    /// Produce assembly text for an allocated program: one [`Allocation`] per
+    /// function, in the same order as [`Program::functions`].
+    fn emit(&self, program: &Program, allocations: &[Allocation]) -> String;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,9 +52,16 @@ pub fn backend_for(target: Target) -> Box<dyn Backend> {
 }
 
 /// Run the whole code generation stage: allocate registers, then emit.
-pub fn compile(program: &Program, target: Target) -> (Box<dyn Backend>, Allocation, String) {
+///
+/// Allocation is per function — each one gets its own registers, spill slots
+/// and stack frame, and nothing about one function's pressure affects another.
+pub fn compile(program: &Program, target: Target) -> (Box<dyn Backend>, Vec<Allocation>, String) {
     let backend = backend_for(target);
-    let allocation = regalloc::allocate(program, backend.register_file());
-    let asm = backend.emit(program, &allocation);
-    (backend, allocation, asm)
+    let allocations: Vec<Allocation> = program
+        .functions
+        .iter()
+        .map(|function| regalloc::allocate(function, backend.register_file()))
+        .collect();
+    let asm = backend.emit(program, &allocations);
+    (backend, allocations, asm)
 }
