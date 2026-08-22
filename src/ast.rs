@@ -33,6 +33,73 @@ pub struct ArrayInfo {
     pub len: u32,
 }
 
+/// Index of a class in [`TypeTable::classes`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClassId(pub u32);
+
+/// One field of a class, at a settled place in the object.
+#[derive(Clone, Debug)]
+pub struct FieldInfo {
+    pub name: String,
+    pub ty: Ty,
+    /// Where it sits, in bytes from the start of the object.
+    pub offset: u32,
+}
+
+/// One method of a class, at a settled place in the vtable.
+#[derive(Clone, Debug)]
+pub struct MethodInfo {
+    pub name: String,
+    /// The function that implements it *for this class*, as an index into
+    /// [`crate::ast::Program::functions`]. An inherited method names the base's
+    /// function; an override names the derived one, in the same slot.
+    pub function: usize,
+    pub params: Vec<Ty>,
+    pub ret: Option<Ty>,
+    /// Which entry of the vtable it occupies, fixed by the class that first
+    /// declared it so that every subclass agrees.
+    pub slot: usize,
+}
+
+/// What every stage after the parser needs to know about a class.
+///
+/// The layout is settled here and nowhere else: a vtable pointer at offset 0,
+/// then the base's fields, then this class's own. That prefix rule is what
+/// makes an upcast free — a `Circle` *is* a `Shape` at the same address.
+#[derive(Clone, Debug)]
+pub struct ClassInfo {
+    pub name: String,
+    pub base: Option<ClassId>,
+    /// Every field, inherited ones first, in layout order.
+    pub fields: Vec<FieldInfo>,
+    /// Every method, in vtable order, with overrides already resolved.
+    pub methods: Vec<MethodInfo>,
+    /// Bytes this class's own values occupy: the vtable pointer plus its fields.
+    pub size: u32,
+    /// Bytes any *storage* for this class must reserve: the largest size in
+    /// the whole hierarchy, not merely among this class's own descendants.
+    ///
+    /// Whole-program compilation is what makes this knowable — nothing can
+    /// derive from a class after the fact — and it is what lets a polymorphic
+    /// value be copied without being sliced: a `Circle` written into a `Shape`
+    /// keeps its vtable pointer and all its fields.
+    ///
+    /// Every class in a hierarchy gets the *same* number, deliberately. A
+    /// smaller one would mean copying `storage(Shape)` bytes out of a
+    /// `Circle`-sized object could read past the end of it.
+    pub storage: u32,
+}
+
+impl ClassInfo {
+    pub fn field(&self, name: &str) -> Option<&FieldInfo> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
+    pub fn method(&self, name: &str) -> Option<&MethodInfo> {
+        self.methods.iter().find(|m| m.name == name)
+    }
+}
+
 /// Every type a program declared or built, indexed by the ids a [`Ty`] holds.
 ///
 /// `Ty` is deliberately small enough to be `Copy` and to compare as an integer,
@@ -42,6 +109,7 @@ pub struct ArrayInfo {
 pub struct TypeTable {
     pub enums: Vec<EnumInfo>,
     pub arrays: Vec<ArrayInfo>,
+    pub classes: Vec<ClassInfo>,
 }
 
 impl TypeTable {
@@ -51,6 +119,71 @@ impl TypeTable {
 
     pub fn enum_info(&self, id: EnumId) -> &EnumInfo {
         &self.enums[id.0 as usize]
+    }
+
+    pub fn class(&self, id: ClassId) -> &ClassInfo {
+        &self.classes[id.0 as usize]
+    }
+
+    /// Whether `sub` is `base` or descends from it, which is what makes an
+    /// argument acceptable where a base class is expected.
+    pub fn descends_from(&self, sub: ClassId, base: ClassId) -> bool {
+        let mut at = Some(sub);
+        while let Some(id) = at {
+            if id == base {
+                return true;
+            }
+            at = self.class(id).base;
+        }
+        false
+    }
+
+    /// How many bytes a value of this type occupies where it is *stored*.
+    ///
+    /// Everything that fits in a register is eight, which is what makes a
+    /// field's offset its position. An object takes its hierarchy's room, and
+    /// an array its length times whatever it holds.
+    pub fn size_of(&self, ty: Ty) -> u32 {
+        match ty {
+            Ty::Class(id) => self.class(id).storage,
+            Ty::Array(id) => {
+                let info = self.array(id);
+                info.len * self.size_of(info.elem)
+            }
+            _ => 8,
+        }
+    }
+
+    /// The class at the top of `id`'s hierarchy, which is what decides how much
+    /// room every class in it reserves.
+    pub fn root_of(&self, id: ClassId) -> ClassId {
+        let mut at = id;
+        // Cannot loop: `sema` rejects a class that is its own ancestor.
+        while let Some(base) = self.class(at).base {
+            at = base;
+        }
+        at
+    }
+
+    /// Whether nothing in the program derives from this class.
+    ///
+    /// A sealed class has exactly one implementation of each of its methods, so
+    /// a call on one has nothing to decide at run time. Only whole-program
+    /// compilation makes this answerable — a separately compiled language must
+    /// assume every class may yet be extended.
+    pub fn is_sealed(&self, id: ClassId) -> bool {
+        !self.classes.iter().any(|c| c.base == Some(id))
+    }
+
+    /// Whether a value of `from` may be used where `to` is expected.
+    ///
+    /// The only widening in the language, and it is free: a subclass lays its
+    /// base's fields out first, so the same address serves as both.
+    pub fn coerces(&self, from: Ty, to: Ty) -> bool {
+        match (from, to) {
+            (Ty::Class(sub), Ty::Class(base)) => self.descends_from(sub, base),
+            _ => from == to,
+        }
     }
 }
 
@@ -84,6 +217,9 @@ pub enum Ty {
     /// The one type that does not fit in a register: a value of one lives in
     /// the frame, and what travels in a register is its address.
     Array(ArrayId),
+    /// An instance of a declared class. Like an array, it lives in the frame
+    /// and travels as an address.
+    Class(ClassId),
 }
 
 impl Ty {
@@ -99,6 +235,7 @@ impl Ty {
             Ty::Str => "string".to_string(),
             Ty::Bool => "bool".to_string(),
             Ty::Enum(id) => types.enum_info(id).name.clone(),
+            Ty::Class(id) => types.class(id).name.clone(),
             Ty::Array(id) => {
                 let info = types.array(id);
                 format!("{}[{}]", info.elem.name(types), info.len)
@@ -134,16 +271,17 @@ impl Ty {
     /// the same reason — element by element is a loop, and the addresses are
     /// not what anybody meant to ask about.
     pub fn has_equality(self) -> bool {
-        !matches!(self, Ty::Str | Ty::Array(_))
+        !matches!(self, Ty::Str | Ty::Array(_) | Ty::Class(_))
     }
 
     /// Whether a value of this type travels in a register.
     ///
-    /// Everything but an array does. An array lives in the frame, and what a
-    /// register holds is its address — which is why one may be passed to a
-    /// function but never returned from one.
+    /// Arrays and objects do not: they live in the frame, and what a register
+    /// holds is their address. That is why assigning one copies rather than
+    /// aliases, and why returning one is done by filling room the *caller*
+    /// reserved — an address that never travels outward cannot dangle.
     pub fn fits_in_a_register(self) -> bool {
-        !matches!(self, Ty::Array(_))
+        !matches!(self, Ty::Array(_) | Ty::Class(_))
     }
 }
 
@@ -360,17 +498,22 @@ pub enum ExprKind {
     /// to infer.
     Array { elements: Vec<Expr>, span: Span },
     /// `xs[i]`.
-    ///
-    /// The array is named rather than computed, because a name is the only
-    /// place an array can be: they are not returned from functions and not
-    /// nested inside each other.
-    Index { array: String, name_span: Span, index: Box<Expr> },
+    Index { array: Box<Expr>, index: Box<Expr> },
     /// `len(xs)` — the length of an array, which is always a constant.
     ///
-    /// A word rather than a method because TinyC has no methods, and a
-    /// construct rather than a library function because there is nothing a
+    /// A construct rather than a library function because there is nothing a
     /// library function could be given: an array's length is in its *type*.
-    Len { array: String, name_span: Span },
+    Len { array: Box<Expr>, span: Span },
+    /// `Circle { r: 5 }` — the only way to make an object.
+    ///
+    /// Every field the class has, inherited ones included, must be named
+    /// exactly once. There is no default and no partial object, so a value of a
+    /// class type is complete from the moment it exists.
+    New { class: String, class_span: Span, fields: Vec<FieldInit>, span: Span },
+    /// `p.x`
+    Field { object: Box<Expr>, name: String, name_span: Span },
+    /// `s.area(1, 2)`
+    MethodCall { receiver: Box<Expr>, name: String, name_span: Span, args: Vec<Expr> },
     /// A variant of an enum, `Color::Red`.
     ///
     /// Always written qualified, so that two enums may use the same variant
@@ -414,6 +557,10 @@ pub struct Block {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Decl {
+        /// Where the *declared* type is recorded, which is not the
+        /// initialiser's: `Shape s = c;` declares a `Shape` and is given a
+        /// `Circle`. Later stages need the one that was written down.
+        id: NodeId,
         ty: TypeRef,
         name: String,
         name_span: Span,
@@ -482,30 +629,45 @@ pub enum Stmt {
     Call(Expr),
 }
 
+/// One `name: value` pair of an object literal.
+#[derive(Clone, Debug)]
+pub struct FieldInit {
+    pub name: String,
+    pub name_span: Span,
+    pub value: Expr,
+}
+
 /// Where an assignment puts its value.
 ///
 /// A separate shape from [`Expr`] rather than "an expression that happens to be
 /// assignable": what may be written to is a syntactic question, so the parser
-/// answers it once instead of every later stage re-deciding.
+/// answers it once instead of every later stage re-deciding. Rooted at a
+/// variable, because that is the only thing in TinyC that names storage.
 #[derive(Clone, Debug)]
 pub enum Place {
     /// `x = ...`
     Var { name: String, name_span: Span },
     /// `xs[i] = ...`
-    Element { array: String, name_span: Span, index: Expr },
+    Element { base: Box<Place>, index: Expr, span: Span },
+    /// `p.x = ...`
+    Field { base: Box<Place>, name: String, name_span: Span },
 }
 
 impl Place {
-    /// The name being written through, which both shapes have.
-    pub fn name(&self) -> &str {
+    /// The variable at the root of the chain, which every place has.
+    pub fn root(&self) -> (&str, Span) {
         match self {
-            Place::Var { name, .. } | Place::Element { array: name, .. } => name,
+            Place::Var { name, name_span } => (name, *name_span),
+            Place::Element { base, .. } | Place::Field { base, .. } => base.root(),
         }
     }
 
-    pub fn name_span(&self) -> Span {
+    /// Where a diagnostic about this place as a whole points.
+    pub fn span(&self) -> Span {
         match self {
-            Place::Var { name_span, .. } | Place::Element { name_span, .. } => *name_span,
+            Place::Var { name_span, .. } => *name_span,
+            Place::Element { span, .. } => *span,
+            Place::Field { base, name_span, .. } => base.span().to(*name_span),
         }
     }
 }
@@ -549,6 +711,34 @@ pub struct Variant {
     pub name_span: Span,
 }
 
+/// One field as it was declared: `int r;`.
+#[derive(Clone, Debug)]
+pub struct FieldDecl {
+    pub ty: TypeRef,
+    pub name: String,
+    pub name_span: Span,
+}
+
+/// `class Circle : Shape { int r; fn area(self) -> int { ... } }`.
+///
+/// Fields and methods may be written in any order; what settles a field's place
+/// in the object and a method's place in the vtable is [`crate::sema`], which is
+/// the first stage that knows what the base class is.
+#[derive(Clone, Debug)]
+pub struct ClassDecl {
+    pub name: String,
+    pub name_span: Span,
+    /// The class this one extends, as written.
+    pub base: Option<(String, Span)>,
+    pub fields: Vec<FieldDecl>,
+    /// Methods, as ordinary functions whose first parameter is `self`.
+    ///
+    /// They are lifted into [`Program::functions`] so that everything after the
+    /// parser sees one kind of callable — a method is a function with a
+    /// receiver, and nothing downstream needs a second concept.
+    pub methods: Vec<usize>,
+}
+
 /// `enum Color { Red, Green, Blue }`.
 ///
 /// A variant carries no payload, so a value of the type is its variant's index
@@ -568,10 +758,16 @@ pub struct EnumDecl {
 /// parameters collide.
 #[derive(Clone, Debug)]
 pub struct Param {
-    pub ty: TypeRef,
+    /// `None` for the `self` receiver, whose type is the class it belongs to —
+    /// the one type a signature never writes down, because writing it would let
+    /// it disagree with the class the method is in.
+    pub ty: Option<TypeRef>,
     pub name: String,
     pub name_span: Span,
 }
+
+/// The name a method's receiver goes by.
+pub const SELF: &str = "self";
 
 /// A function declaration: `fn add(int a, int b) -> int { ... }`.
 ///
@@ -598,6 +794,9 @@ pub struct FnDecl {
 pub struct Program {
     /// Declared enums, in source order; an [`EnumId`] indexes this.
     pub enums: Vec<EnumDecl>,
+    /// Declared classes, in source order; a [`ClassId`] indexes this.
+    pub classes: Vec<ClassDecl>,
+    /// Every function, methods included — see [`ClassDecl::methods`].
     pub functions: Vec<FnDecl>,
     /// Number of [`NodeId`]s handed out, i.e. the size of the type table.
     ///
@@ -613,10 +812,54 @@ pub fn dump(program: &Program) -> String {
         let variants: Vec<&str> = declaration.variants.iter().map(|v| v.name.as_str()).collect();
         out.push_str(&format!("enum {} {{ {} }}\n", declaration.name, variants.join(", ")));
     }
-    for function in &program.functions {
-        dump_fn(&mut out, function);
+    for declaration in &program.classes {
+        let base = match &declaration.base {
+            Some((name, _)) => format!(" : {name}"),
+            None => String::new(),
+        };
+        out.push_str(&format!("class {}{base}\n", declaration.name));
+        for field in &declaration.fields {
+            out.push_str(&format!("  field {} {}\n", written_type(&field.ty), field.name));
+        }
+        for &at in &declaration.methods {
+            let mut method = String::new();
+            dump_fn(&mut method, &program.functions[at]);
+            for line in method.lines() {
+                out.push_str(&format!("  {line}\n"));
+            }
+        }
+    }
+    // A method's body is printed under its class, so the flat list skips them.
+    let methods: Vec<usize> =
+        program.classes.iter().flat_map(|c| c.methods.iter().copied()).collect();
+    for (at, function) in program.functions.iter().enumerate() {
+        if !methods.contains(&at) {
+            dump_fn(&mut out, function);
+        }
     }
     out
+}
+
+/// Every index expression in a place, outermost name first.
+fn dump_place_indices(out: &mut String, place: &Place, depth: usize) {
+    match place {
+        Place::Var { .. } => {}
+        Place::Element { base, index, .. } => {
+            dump_place_indices(out, base, depth);
+            dump_expr(out, index, depth);
+        }
+        Place::Field { base, .. } => dump_place_indices(out, base, depth),
+    }
+}
+
+/// A place as the program spelled it, with the index left out — the dump shows
+/// the *shape*, and an index is an expression of its own.
+fn place_text(place: &Place) -> String {
+    match place {
+        Place::Var { name, .. } => name.clone(),
+        Place::Element { base, .. } => format!("{}[]", place_text(base)),
+        Place::Field { base, name, .. } => format!("{}.{name}", place_text(base)),
+    }
 }
 
 /// A type as the program spelled it, for the AST dump — which has no table to
@@ -630,7 +873,14 @@ fn written_type(ty: &TypeRef) -> String {
 
 fn dump_fn(out: &mut String, function: &FnDecl) {
     let params: Vec<String> =
-        function.params.iter().map(|p| format!("{} {}", written_type(&p.ty), p.name)).collect();
+        function
+            .params
+            .iter()
+            .map(|p| match &p.ty {
+                Some(ty) => format!("{} {}", written_type(ty), p.name),
+                None => p.name.clone(),
+            })
+            .collect();
     let ret = match &function.ret {
         Some(ty) => format!(" -> {}", written_type(ty)),
         None => String::new(),
@@ -647,13 +897,10 @@ fn dump_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             dump_expr(out, init, depth + 1);
         }
         Stmt::Assign { target, value } => {
-            match target {
-                Place::Var { name, .. } => out.push_str(&format!("{pad}assign {name}\n")),
-                Place::Element { array, index, .. } => {
-                    out.push_str(&format!("{pad}assign {array}[]\n"));
-                    dump_expr(out, index, depth + 1);
-                }
-            }
+            out.push_str(&format!("{pad}assign {}\n", place_text(target)));
+            // The shape of the place is on the line above; the expressions
+            // inside it are trees of their own, so they go underneath.
+            dump_place_indices(out, target, depth + 1);
             dump_expr(out, value, depth + 1);
         }
         Stmt::Print { value, .. } => {
@@ -719,11 +966,33 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
                 dump_expr(out, element, depth + 1);
             }
         }
-        ExprKind::Index { array, index, .. } => {
-            out.push_str(&format!("{pad}index {array}\n"));
+        ExprKind::Index { array, index } => {
+            out.push_str(&format!("{pad}index\n"));
+            dump_expr(out, array, depth + 1);
             dump_expr(out, index, depth + 1);
         }
-        ExprKind::Len { array, .. } => out.push_str(&format!("{pad}len {array}\n")),
+        ExprKind::Len { array, .. } => {
+            out.push_str(&format!("{pad}len\n"));
+            dump_expr(out, array, depth + 1);
+        }
+        ExprKind::New { class, fields, .. } => {
+            out.push_str(&format!("{pad}new {class}\n"));
+            for field in fields {
+                out.push_str(&format!("{pad}  {}\n", field.name));
+                dump_expr(out, &field.value, depth + 2);
+            }
+        }
+        ExprKind::Field { object, name, .. } => {
+            out.push_str(&format!("{pad}field {name}\n"));
+            dump_expr(out, object, depth + 1);
+        }
+        ExprKind::MethodCall { receiver, name, args, .. } => {
+            out.push_str(&format!("{pad}method {name}\n"));
+            dump_expr(out, receiver, depth + 1);
+            for arg in args {
+                dump_expr(out, arg, depth + 1);
+            }
+        }
         ExprKind::Neg(operand) => {
             out.push_str(&format!("{pad}neg\n"));
             dump_expr(out, operand, depth + 1);

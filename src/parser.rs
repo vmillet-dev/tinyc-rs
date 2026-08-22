@@ -42,9 +42,10 @@
 //! A `match` is a primary expression, and a statement only in the way a call is
 //! one — `stmt` reaches it through the same node.
 
+use crate::ast;
 use crate::ast::{
-    ArmBody, BinOp, Block, CmpOp, EnumDecl, Expr, ExprKind, FnDecl, LogicOp, MatchArm, NodeId,
-    Param, Place, Program, Stmt, TypeRef, Variant,
+    ArmBody, BinOp, Block, ClassDecl, CmpOp, EnumDecl, Expr, ExprKind, FieldDecl, FieldInit,
+    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Program, Stmt, TypeRef, Variant,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
@@ -78,14 +79,59 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn run(mut self) -> PResult<Program> {
-        let (mut enums, mut functions) = (Vec::new(), Vec::new());
+        let (mut enums, mut classes, mut functions) = (Vec::new(), Vec::new(), Vec::new());
         while !matches!(self.peek().kind, TokenKind::Eof) {
             match self.peek().kind {
                 TokenKind::KwEnum => enums.push(self.enum_decl()?),
+                TokenKind::KwClass => classes.push(self.class_decl(&mut functions)?),
                 _ => functions.push(self.fn_decl()?),
             }
         }
-        Ok(Program { enums, functions, node_count: self.next_id as usize })
+        Ok(Program { enums, classes, functions, node_count: self.next_id as usize })
+    }
+
+    /// `class Circle : Shape { int r; fn area(self) -> int { ... } }`
+    ///
+    /// Methods are appended to the program's flat list of functions and
+    /// referred to by index, so that everything downstream sees one kind of
+    /// callable: a method is a function whose first parameter is a receiver.
+    fn class_decl(&mut self, functions: &mut Vec<FnDecl>) -> PResult<ClassDecl> {
+        self.bump(); // `class`
+        let (name, name_span) = self.expect_ident("a class name")?;
+
+        let base = if self.eat(&TokenKind::Colon) {
+            Some(self.expect_ident("a base class name")?)
+        } else {
+            None
+        };
+
+        let open = self.expect(TokenKind::LBrace)?.span;
+        let (mut fields, mut methods) = (Vec::new(), Vec::new());
+        loop {
+            match self.peek().kind {
+                TokenKind::RBrace => {
+                    self.bump();
+                    return Ok(ClassDecl { name, name_span, base, fields, methods });
+                }
+                TokenKind::Eof => {
+                    let found = self.peek();
+                    return Err(Diagnostic::new("unclosed class", found.span)
+                        .with_label("expected `}` before the end of the file")
+                        .with_note("to close this `{`", Some(open)));
+                }
+                TokenKind::KwFn => {
+                    methods.push(functions.len());
+                    functions.push(self.fn_decl()?);
+                }
+                // Anything else has to be a field, which starts with a type.
+                _ => {
+                    let ty = self.expect_type("a field")?;
+                    let (name, name_span) = self.expect_ident("a field name")?;
+                    self.expect(TokenKind::Semi)?;
+                    fields.push(FieldDecl { ty, name, name_span });
+                }
+            }
+        }
     }
 
     fn peek(&self) -> &'a Token {
@@ -319,9 +365,19 @@ impl<'a> Parser<'a> {
         }
 
         loop {
+            // `self` is written alone: its type is the class the method is in,
+            // and the parser does not know which that is.
+            if matches!(&self.peek().kind, TokenKind::Ident(name) if name == ast::SELF) {
+                let name_span = self.bump().span;
+                params.push(Param { ty: None, name: ast::SELF.to_string(), name_span });
+                if !self.eat(&TokenKind::Comma) {
+                    return Ok(params);
+                }
+                continue;
+            }
             let ty = self.expect_type("a parameter")?;
             let (name, name_span) = self.expect_ident("a parameter name")?;
-            params.push(Param { ty, name, name_span });
+            params.push(Param { ty: Some(ty), name, name_span });
 
             // A comma promises another parameter, so the loop goes round again
             // and `(int a,)` fails on the `)` instead of being accepted.
@@ -373,12 +429,6 @@ impl<'a> Parser<'a> {
 
     /// A call used as a statement, `greet("hi");` — the only expression
     /// statement in the language, and the only way to call a `void` function.
-    fn call_stmt(&mut self) -> PResult<Stmt> {
-        let call = self.primary()?;
-        self.expect(TokenKind::Semi)?;
-        Ok(Stmt::Call(call))
-    }
-
     fn stmt(&mut self) -> PResult<Stmt> {
         // A declaration may begin with a plain identifier now that a type can
         // be an enum's name, so this is asked before the keywords are matched.
@@ -396,11 +446,9 @@ impl<'a> Parser<'a> {
             TokenKind::KwReturn => self.return_stmt(),
             TokenKind::KwBreak => self.loop_jump(|span| Stmt::Break { span }),
             TokenKind::KwContinue => self.loop_jump(|span| Stmt::Continue { span }),
-            // `f(...)` and `x = ...` both start with a name, which is why the
-            // second token decides here too.
-            TokenKind::Ident(_) if matches!(self.peek_at(1).kind, TokenKind::LParen) => {
-                self.call_stmt()
-            }
+            // `f(...)`, `p.m()` and `x = ...` all start with a name, and stay
+            // indistinguishable to the end of the chain — so one parse covers
+            // them and what follows decides. See `assign_without_semi`.
             TokenKind::Ident(_) => self.assign(),
             _ => {
                 let found = self.peek();
@@ -586,7 +634,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Eq)?;
         let init = self.expr()?;
         self.expect(TokenKind::Semi)?;
-        Ok(Stmt::Decl { ty, name, name_span, init })
+        Ok(Stmt::Decl { id: self.node_id(), ty, name, name_span, init })
     }
 
     fn assign(&mut self) -> PResult<Stmt> {
@@ -595,33 +643,59 @@ impl<'a> Parser<'a> {
         Ok(stmt)
     }
 
-    /// The assignment itself, without its terminator: a `for` step ends at `)`.
+    /// An assignment or a call, without its terminator: a `for` step ends at `)`.
+    ///
+    /// The two are told apart *after* the fact. Both begin with a postfix chain
+    /// — `p.items[i].count` and `p.items[i].push()` agree until the very end —
+    /// so the chain is parsed once as an expression, and what follows decides
+    /// whether it named a place or did something.
     fn assign_without_semi(&mut self) -> PResult<Stmt> {
-        let token = self.peek();
-        let TokenKind::Ident(name) = &token.kind else {
+        if !matches!(self.peek().kind, TokenKind::Ident(_)) {
+            let found = self.peek();
             return Err(Diagnostic::new(
-                format!("expected a variable name, found {}", token.kind.describe()),
-                token.span,
+                format!("expected a variable name, found {}", found.kind.describe()),
+                found.span,
             )
             .with_label("an assignment starts with a variable name"));
-        };
-        let (name, name_span) = (name.clone(), token.span);
-        self.bump();
+        }
 
-        // The two things that may be written to. Anything else assignable would
-        // have to be an expression, and TinyC has no expression that names a
-        // place a value could go.
-        let target = if self.eat(&TokenKind::LBracket) {
-            let index = self.expr()?;
-            self.expect(TokenKind::RBracket)?;
-            Place::Element { array: name, name_span, index }
-        } else {
-            Place::Var { name, name_span }
-        };
+        let expr = self.primary()?;
+        if self.eat(&TokenKind::Eq) {
+            let target = Self::into_place(expr)?;
+            let value = self.expr()?;
+            return Ok(Stmt::Assign { target, value });
+        }
 
-        self.expect(TokenKind::Eq)?;
-        let value = self.expr()?;
-        Ok(Stmt::Assign { target, value })
+        // Not an assignment, so it has to be worth writing on its own.
+        match expr.kind {
+            ExprKind::Call { .. } | ExprKind::MethodCall { .. } => Ok(Stmt::Call(expr)),
+            _ => Err(Diagnostic::new("this statement does nothing", expr.span)
+                .with_label("expected an assignment or a call")
+                .with_note("a value on its own has no effect, so TinyC does not accept one", None)),
+        }
+    }
+
+    /// Read an expression back as the place it names, or say it names none.
+    ///
+    /// Every shape that survives here is one the postfix loop built out of a
+    /// variable, which is the only thing in TinyC that names storage.
+    fn into_place(expr: Expr) -> PResult<Place> {
+        let span = expr.span;
+        match expr.kind {
+            ExprKind::Var(name) => Ok(Place::Var { name, name_span: span }),
+            ExprKind::Index { array, index } => Ok(Place::Element {
+                base: Box::new(Self::into_place(*array)?),
+                index: *index,
+                span,
+            }),
+            ExprKind::Field { object, name, name_span } => Ok(Place::Field {
+                base: Box::new(Self::into_place(*object)?),
+                name,
+                name_span,
+            }),
+            _ => Err(Diagnostic::new("cannot assign to this", span)
+                .with_label("only a variable, an element or a field names a place")),
+        }
     }
 
     fn print_stmt(&mut self) -> PResult<Stmt> {
@@ -745,7 +819,56 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// An atom, then everything written *after* it: `.field`, `.method(...)`
+    /// and `[index]`, chained as far as they go.
+    ///
+    /// One loop rather than a case per shape, which is what lets `a.b[i].c`
+    /// parse without the grammar knowing that combination exists.
     fn primary(&mut self) -> PResult<Expr> {
+        let mut expr = self.atom()?;
+        loop {
+            if self.eat(&TokenKind::Dot) {
+                let (name, name_span) = self.expect_ident("a field or method name")?;
+                // A `(` is what tells a method call from a field.
+                if matches!(self.peek().kind, TokenKind::LParen) {
+                    let open = self.bump().span;
+                    let args = self.call_args()?;
+                    let close = self.expect_closing_paren(open)?;
+                    expr = Expr {
+                        id: self.node_id(),
+                        span: expr.span.to(close),
+                        kind: ExprKind::MethodCall {
+                            receiver: Box::new(expr),
+                            name,
+                            name_span,
+                            args,
+                        },
+                    };
+                } else {
+                    expr = Expr {
+                        id: self.node_id(),
+                        span: expr.span.to(name_span),
+                        kind: ExprKind::Field { object: Box::new(expr), name, name_span },
+                    };
+                }
+            } else if self.eat(&TokenKind::LBracket) {
+                let index = self.expr()?;
+                let close = self.expect(TokenKind::RBracket)?.span;
+                expr = Expr {
+                    id: self.node_id(),
+                    span: expr.span.to(close),
+                    kind: ExprKind::Index {
+                        array: Box::new(expr),
+                        index: Box::new(index),
+                    },
+                };
+            } else {
+                return Ok(expr);
+            }
+        }
+    }
+
+    fn atom(&mut self) -> PResult<Expr> {
         let token = self.peek();
         let span = token.span;
         let kind = match &token.kind {
@@ -775,20 +898,12 @@ impl<'a> Parser<'a> {
                         },
                     });
                 }
-                // `xs[i]`. The array is a name, because a name is the only
-                // place an array can be.
-                if self.eat(&TokenKind::LBracket) {
-                    let index = self.expr()?;
-                    let close = self.expect(TokenKind::RBracket)?.span;
-                    return Ok(Expr {
-                        id: self.node_id(),
-                        span: span.to(close),
-                        kind: ExprKind::Index {
-                            array: name,
-                            name_span: span,
-                            index: Box::new(index),
-                        },
-                    });
+                // `Circle { r: 5 }`. There is no ambiguity with a block: every
+                // construct that takes an expression before one — `if`, `while`,
+                // `for`, `match` — puts the expression in parentheses, so a `{`
+                // in expression position can only open a literal.
+                if matches!(self.peek().kind, TokenKind::LBrace) {
+                    return self.object_literal(name, span);
                 }
                 if !matches!(self.peek().kind, TokenKind::LParen) {
                     let kind = ExprKind::Var(name);
@@ -810,12 +925,13 @@ impl<'a> Parser<'a> {
             TokenKind::KwLen => {
                 let keyword = self.bump().span;
                 let open = self.expect(TokenKind::LParen)?.span;
-                let (array, name_span) = self.expect_ident("an array name")?;
+                let array = self.expr()?;
                 let close = self.expect_closing_paren(open)?;
+                let span = keyword.to(close);
                 return Ok(Expr {
                     id: self.node_id(),
-                    span: keyword.to(close),
-                    kind: ExprKind::Len { array, name_span },
+                    span,
+                    kind: ExprKind::Len { array: Box::new(array), span },
                 });
             }
             // Parentheses only group: the expression between them keeps its own
@@ -839,6 +955,37 @@ impl<'a> Parser<'a> {
         };
         self.bump();
         Ok(Expr { id: self.node_id(), span, kind })
+    }
+
+    /// `Circle { r: 5 }` — the only way to make an object.
+    ///
+    /// Every field is named, in any order: which fields the class has and
+    /// whether they are all here is not a syntactic question.
+    fn object_literal(&mut self, class: String, class_span: Span) -> PResult<Expr> {
+        let open = self.expect(TokenKind::LBrace)?.span;
+        let mut fields = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RBrace) {
+            loop {
+                let (name, name_span) = self.expect_ident("a field name")?;
+                self.expect(TokenKind::Colon)?;
+                let value = self.expr()?;
+                fields.push(FieldInit { name, name_span, value });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        if !self.eat(&TokenKind::RBrace) {
+            let found = self.peek();
+            return Err(Diagnostic::new(
+                format!("expected `}}`, found {}", found.kind.describe()),
+                found.span,
+            )
+            .with_label("an object literal ends here")
+            .with_note("to close this `{`", Some(open)));
+        }
+        let span = class_span.to(self.tokens[self.pos - 1].span);
+        Ok(Expr { id: self.node_id(), span, kind: ExprKind::New { class, class_span, fields, span } })
     }
 
     /// `[1, 2, 3]` — the only way to make an array.
@@ -1186,6 +1333,100 @@ mod tests {
         assert!(errors[0].note.is_some());
     }
 
+    // -- classes -----------------------------------------------------------
+
+    #[test]
+    fn parses_a_class_with_a_base_a_field_and_a_method() {
+        let program =
+            parse_src("class Circle : Shape {\n  int r;\n  fn area(self) -> int {\n    return 1;\n  }\n}\nfn main() {\n}\n")
+                .unwrap();
+        assert_eq!(
+            ast::dump(&program),
+            concat!(
+                "class Circle : Shape\n",
+                "  field int r\n",
+                "  fn area(self) -> int\n",
+                "    return\n",
+                "      int 1\n",
+                "fn main()\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_method_is_lifted_into_the_flat_list_of_functions() {
+        // Everything after the parser sees one kind of callable; a class only
+        // says which of them are its own.
+        let program =
+            parse_src("class A {\n  fn f(self) {\n  }\n}\nfn main() {\n}\n").unwrap();
+        assert_eq!(program.functions.len(), 2);
+        assert_eq!(program.classes[0].methods, vec![0]);
+    }
+
+    #[test]
+    fn parses_an_object_literal() {
+        assert_eq!(
+            dump_main("Circle c = Circle { r: 5 };"),
+            "decl Circle c\n  new Circle\n    r\n      int 5\n"
+        );
+    }
+
+    #[test]
+    fn an_object_literal_is_told_from_a_block_by_where_it_appears() {
+        // Every construct that takes an expression before a block puts the
+        // expression in parentheses, so a `{` in expression position can only
+        // open a literal — there is nothing to disambiguate.
+        assert!(parse_src("fn main() {\n  if (c) {\n    print(1);\n  }\n}").is_ok());
+        assert_eq!(
+            dump_main("f(Circle { r: 1 });"),
+            "call f\n  new Circle\n    r\n      int 1\n"
+        );
+    }
+
+    #[test]
+    fn parses_a_field_access_and_a_method_call() {
+        assert_eq!(dump_main("print(c.r);"), "print\n  field r\n    var c\n");
+        assert_eq!(
+            dump_main("print(s.area(1));"),
+            "print\n  method area\n    var s\n    int 1\n"
+        );
+    }
+
+    #[test]
+    fn postfix_chains_as_far_as_it_goes() {
+        // One loop rather than a case per shape, so a combination the grammar
+        // never names still parses.
+        assert_eq!(
+            dump_main("print(a.b[0].c);"),
+            "print\n  field c\n    index\n      field b\n        var a\n      int 0\n"
+        );
+    }
+
+    #[test]
+    fn a_field_and_a_method_call_are_told_apart_by_the_parenthesis() {
+        assert_eq!(dump_main("c.f = 1;"), "assign c.f\n  int 1\n");
+        assert_eq!(dump_main("c.f();"), "method f\n  var c\n");
+    }
+
+    #[test]
+    fn rejects_assigning_to_something_that_is_not_a_place() {
+        let errors = errors_in_main("f() = 1;");
+        assert!(errors[0].message.contains("cannot assign to this"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_a_statement_that_does_nothing() {
+        let errors = errors_in_main("c.r;");
+        assert!(errors[0].message.contains("does nothing"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn reports_an_unclosed_class() {
+        let errors = parse_src("class A {\n  int x;\n").unwrap_err();
+        assert!(errors[0].message.contains("unclosed class"), "{}", errors[0].message);
+        assert!(errors[0].note.is_some());
+    }
+
     // -- arrays ------------------------------------------------------------
 
     #[test]
@@ -1209,15 +1450,15 @@ mod tests {
 
     #[test]
     fn parses_indexing_and_len() {
-        assert_eq!(dump_main("print(xs[0]);"), "print\n  index xs\n    int 0\n");
-        assert_eq!(dump_main("print(len(xs));"), "print\n  len xs\n");
+        assert_eq!(dump_main("print(xs[0]);"), "print\n  index\n    var xs\n    int 0\n");
+        assert_eq!(dump_main("print(len(xs));"), "print\n  len\n    var xs\n");
     }
 
     #[test]
     fn an_index_may_be_any_expression() {
         assert_eq!(
             dump_main("print(xs[i + 1]);"),
-            "print\n  index xs\n    +\n      var i\n      int 1\n"
+            "print\n  index\n    var xs\n    +\n      var i\n      int 1\n"
         );
     }
 

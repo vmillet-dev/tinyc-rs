@@ -28,6 +28,7 @@ pub enum TokenKind {
     KwEnum,
     KwMatch,
     KwLen,
+    KwClass,
 
     // Punctuation.
     LParen,
@@ -48,6 +49,10 @@ pub enum TokenKind {
     FatArrow,
     /// `::`, which qualifies a variant with the enum it belongs to.
     ColonColon,
+    /// `:`, which introduces a base class and separates a field from its value.
+    Colon,
+    /// `.`, which reaches into an object.
+    Dot,
     LBracket,
     RBracket,
 
@@ -104,6 +109,7 @@ impl TokenKind {
             TokenKind::KwEnum => "enum",
             TokenKind::KwMatch => "match",
             TokenKind::KwLen => "len",
+            TokenKind::KwClass => "class",
 
             // Punctuation.
             TokenKind::LParen => "(",
@@ -122,6 +128,8 @@ impl TokenKind {
             TokenKind::Bang => "!",
             TokenKind::FatArrow => "=>",
             TokenKind::ColonColon => "::",
+            TokenKind::Colon => ":",
+            TokenKind::Dot => ".",
             TokenKind::LBracket => "[",
             TokenKind::RBracket => "]",
 

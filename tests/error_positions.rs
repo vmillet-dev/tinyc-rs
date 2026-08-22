@@ -12,7 +12,7 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 8] = [
+const EXAMPLES: [&str; 9] = [
     "arith.tc",
     "spill.tc",
     "reassign.tc",
@@ -21,6 +21,7 @@ const EXAMPLES: [&str; 8] = [
     "functions.tc",
     "enums.tc",
     "arrays.tc",
+    "classes.tc",
 ];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
@@ -203,14 +204,31 @@ fn an_index_the_compiler_can_see_points_at_the_index() {
 }
 
 #[test]
-fn returning_an_array_points_at_the_return_type() {
-    // Not at the `return`: the signature is what promises the impossible.
-    assert_error_at("array_returned.tc", "1:14");
+fn a_length_that_disagrees_points_at_the_literal() {
+    assert_error_at("array_length_mismatch.tc", "2:15");
+}
+
+// -- classes --------------------------------------------------------------
+
+#[test]
+fn a_missing_field_points_at_the_whole_literal() {
+    // No one field is wrong — it is what the literal does not say, so the
+    // caret covers the object that had to be complete.
+    assert_error_at("object_missing_field.tc", "7:14");
 }
 
 #[test]
-fn a_length_that_disagrees_points_at_the_literal() {
-    assert_error_at("array_length_mismatch.tc", "2:15");
+fn a_downcast_points_at_the_argument() {
+    // Widening a subclass to its base is free; the other direction is not
+    // something the compiler can know.
+    assert_error_at("downcast.tc", "16:17");
+}
+
+#[test]
+fn the_hidden_return_address_points_at_the_parameter_that_no_longer_fits() {
+    // Returning an aggregate spends one of the four argument registers on the
+    // address the caller hands in, so a fourth parameter is one too many.
+    assert_error_at("too_many_params_returning.tc", "5:31");
 }
 
 // -- functions ------------------------------------------------------------

@@ -38,7 +38,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArmBody, BinOp, Block as AstBlock, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
+    ArmBody, BinOp, Block as AstBlock, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
     MatchArm, Place, Program as Ast, Stmt, Ty, TypeTable,
 };
 use crate::sema::Types;
@@ -88,12 +88,28 @@ pub enum Instr {
     /// The frame region is reserved once, in the prologue, so this costs a
     /// single `lea` and never allocates.
     Frame { dst: VReg, offset: u32 },
-    /// `dst = base[index]`, in elements rather than bytes.
+    /// `dst = base + offset`: the address of a field.
+    ///
+    /// Told apart from [`Instr::Elem`] because it is a different question. A
+    /// field's place was settled by `sema` and cannot be out of range, so there
+    /// is nothing to check — and the offset is in bytes, not elements.
+    Field { dst: VReg, base: Value, offset: u32 },
+    /// `dst = base + index * scale`, the address of one element.
     ///
     /// `len` travels with it so the backend can bounds check, and *only* so it
     /// can: a constant index was checked at compile time and needs none, which
     /// is the same bargain `DivGuards` strikes for division.
-    Elem { dst: VReg, base: Value, index: Value, len: u32 },
+    ///
+    /// `scale` is eight for everything that fits in a register and the object's
+    /// room for an array of them — which is the one case where the address is
+    /// not a single `lea`, because x86 scales by 1, 2, 4 or 8 and nothing else.
+    Elem { dst: VReg, base: Value, index: Value, len: u32, scale: u32 },
+    /// `*dst = *src` for `bytes` bytes: what copying an aggregate *is*.
+    ///
+    /// An object or an array does not fit in a register, so assigning one is a
+    /// run of moves rather than one. The count is always a multiple of eight
+    /// and known at compile time, so it unrolls.
+    CopyBytes { dst: Value, src: Value, bytes: u32 },
     /// `dst = *addr`
     Load { dst: VReg, addr: Value },
     /// `*addr = value`
@@ -106,8 +122,22 @@ pub enum Instr {
     /// Without one, liveness would start a parameter's interval at its first
     /// use and happily hand its register to something else in the meantime.
     Param { dst: VReg, index: u32 },
+    /// `dst = &vtable(class)`: the address of a class's method table.
+    VTable { dst: VReg, class: ClassId },
     /// `dst = callee(args)`, with `dst` absent when the result is discarded.
     Call { dst: Option<VReg>, callee: FuncId, args: Vec<Value> },
+    /// `dst = receiver.vtable[slot](args)` — a call whose target is decided by
+    /// the object rather than by the program text.
+    ///
+    /// The receiver is named on its own as well as appearing in `args`, because
+    /// where it sits among them moves: a call that returns an aggregate leads
+    /// with the address it fills. Its two roles are separate, so they are said
+    /// separately.
+    ///
+    /// Lowering emits this only when the receiver's static class really has
+    /// subclasses; when it has none there is nothing to decide, and an ordinary
+    /// [`Instr::Call`] goes out instead.
+    CallVirtual { dst: Option<VReg>, slot: u32, receiver: Value, args: Vec<Value> },
     Print { ty: Ty, val: Value },
 }
 
@@ -233,7 +263,8 @@ impl Instr {
             Instr::Const { .. }
             | Instr::StrAddr { .. }
             | Instr::Param { .. }
-            | Instr::Frame { .. } => {}
+            | Instr::Frame { .. }
+            | Instr::VTable { .. } => {}
             Instr::Copy { src, .. } | Instr::Load { addr: src, .. } => reg(src),
             Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => {
                 reg(lhs);
@@ -243,12 +274,21 @@ impl Instr {
                 reg(base);
                 reg(index);
             }
+            Instr::Field { base, .. } => reg(base),
             Instr::Store { addr, value } => {
                 reg(addr);
                 reg(value);
             }
+            Instr::CopyBytes { dst, src, .. } => {
+                reg(dst);
+                reg(src);
+            }
             Instr::Print { val, .. } => reg(val),
             Instr::Call { args, .. } => args.iter().for_each(reg),
+            Instr::CallVirtual { receiver, args, .. } => {
+                reg(receiver);
+                args.iter().for_each(reg);
+            }
         }
     }
 
@@ -261,18 +301,20 @@ impl Instr {
             | Instr::Bin { dst, .. }
             | Instr::Param { dst, .. }
             | Instr::Frame { dst, .. }
+            | Instr::VTable { dst, .. }
             | Instr::Elem { dst, .. }
+            | Instr::Field { dst, .. }
             | Instr::Load { dst, .. }
             | Instr::Cmp { dst, .. } => Some(*dst),
-            Instr::Call { dst, .. } => *dst,
-            Instr::Print { .. } | Instr::Store { .. } => None,
+            Instr::Call { dst, .. } | Instr::CallVirtual { dst, .. } => *dst,
+            Instr::Print { .. } | Instr::Store { .. } | Instr::CopyBytes { .. } => None,
         }
     }
 
     /// Whether this instruction performs a call, and therefore destroys the
     /// caller-saved registers.
     pub fn is_call(&self) -> bool {
-        matches!(self, Instr::Print { .. } | Instr::Call { .. })
+        matches!(self, Instr::Print { .. } | Instr::Call { .. } | Instr::CallVirtual { .. })
     }
 }
 
@@ -328,6 +370,8 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// Interned string literals, each stored without its NUL terminator.
     pub strings: Vec<Vec<u8>>,
+    /// One method table per class, in `ClassId` order.
+    pub vtables: Vec<Vec<FuncId>>,
     /// Every type the program has, carried through so that a type can still be named
     /// and a value of one can still be printed.
     ///
@@ -421,12 +465,18 @@ impl Program {
             Instr::Frame { dst, offset } => {
                 format!("%{} = frame {offset}", function.name_of(*dst))
             }
-            Instr::Elem { dst, base, index, len } => format!(
-                "%{} = elem {}[{}] of {len}",
+            Instr::Field { dst, base, offset } => {
+                format!("%{} = field {} + {offset}", function.name_of(*dst), value(base))
+            }
+            Instr::Elem { dst, base, index, len, scale } => format!(
+                "%{} = elem {}[{}] of {len} by {scale}",
                 function.name_of(*dst),
                 value(base),
                 value(index)
             ),
+            Instr::CopyBytes { dst, src, bytes } => {
+                format!("copy {} bytes to {}, from {}", bytes, value(dst), value(src))
+            }
             Instr::Load { dst, addr } => {
                 format!("%{} = load {}", function.name_of(*dst), value(addr))
             }
@@ -436,6 +486,20 @@ impl Program {
             Instr::Call { dst, callee, args } => {
                 let args: Vec<String> = args.iter().map(value).collect();
                 let call = format!("call {}({})", self.function(*callee).name, args.join(", "));
+                match dst {
+                    Some(dst) => format!("%{} = {call}", function.name_of(*dst)),
+                    None => call,
+                }
+            }
+            Instr::VTable { dst, class } => format!(
+                "%{} = vtable {}",
+                function.name_of(*dst),
+                self.table.class(*class).name
+            ),
+            Instr::CallVirtual { dst, slot, receiver, args } => {
+                let args: Vec<String> = args.iter().map(value).collect();
+                let call =
+                    format!("callv {}[{slot}]({})", value(receiver), args.join(", "));
                 match dst {
                     Some(dst) => format!("%{} = {call}", function.name_of(*dst)),
                     None => call,
@@ -465,9 +529,15 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
     // The first declaration of a name wins, matching the table `sema` built:
     // a duplicate is an error, and the two stages must at least agree on which
     // one they were talking about.
+    // A method's name lives in its class rather than in the program, so two
+    // classes may both have an `area`. Qualifying it here is what keeps the one
+    // flat table of callables — and, further on, keeps their symbols apart.
+    let names: Vec<String> = qualified_names(ast);
+    let func_ids: Vec<FuncId> = (0..ast.functions.len() as u32).map(FuncId).collect();
+
     let mut ids: HashMap<String, FuncId> = HashMap::new();
-    for (index, function) in ast.functions.iter().enumerate() {
-        ids.entry(function.name.clone()).or_insert(FuncId(index as u32));
+    for (index, name) in names.iter().enumerate() {
+        ids.entry(name.clone()).or_insert(FuncId(index as u32));
     }
 
     let mut strings = Strings::default();
@@ -480,17 +550,44 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
             frame_bytes: 0,
+            out_pointer: None,
             name_counts: HashMap::new(),
             types,
             table: types.table(),
+            func_ids: &func_ids,
             strings: &mut strings,
             ids: &ids,
         };
-        functions.push(lowering.run(decl, types.ret_of(index), types.params_of(index)));
+        let mut lowered =
+            lowering.run(decl, types.ret_of(index), types.params_of(index));
+        lowered.name = names[index].clone();
+        functions.push(lowered);
     }
 
-    let functions = prune_unreachable_functions(functions, ids.get(crate::sema::ENTRY_POINT));
-    Program { functions, strings: strings.bytes, table: types.table().clone() }
+    // One vtable per class, holding the implementation each slot resolved to.
+    let vtables: Vec<Vec<FuncId>> = types
+        .table()
+        .classes
+        .iter()
+        .map(|class| class.methods.iter().map(|m| func_ids[m.function]).collect())
+        .collect();
+
+    let (functions, vtables) =
+        prune_unreachable_functions(functions, vtables, ids.get(crate::sema::ENTRY_POINT));
+    Program { functions, strings: strings.bytes, table: types.table().clone(), vtables }
+}
+
+/// The name each of the program's functions is known by once methods and free
+/// functions share one list: `Circle$area` for a method, the plain name
+/// otherwise.
+fn qualified_names(ast: &Ast) -> Vec<String> {
+    let mut names: Vec<String> = ast.functions.iter().map(|f| f.name.clone()).collect();
+    for class in &ast.classes {
+        for &at in &class.methods {
+            names[at] = format!("{}${}", class.name, ast.functions[at].name);
+        }
+    }
+    names
 }
 
 /// The literals every function shares, plus the index that keeps interning them
@@ -506,11 +603,15 @@ struct Strings {
 /// The same walk as [`prune_unreachable`], one level up: the call graph instead
 /// of the control flow graph, rooted at the entry point rather than at block 0.
 /// A helper nobody calls costs a label, a prologue and an epilogue otherwise.
-fn prune_unreachable_functions(functions: Vec<Function>, entry: Option<&FuncId>) -> Vec<Function> {
+fn prune_unreachable_functions(
+    functions: Vec<Function>,
+    vtables: Vec<Vec<FuncId>>,
+    entry: Option<&FuncId>,
+) -> (Vec<Function>, Vec<Vec<FuncId>>) {
     let Some(&entry) = entry else {
         // No entry point: `sema` has already rejected the program, and there is
         // no root to walk from.
-        return functions;
+        return (functions, vtables);
     };
 
     let mut reachable = vec![false; functions.len()];
@@ -522,14 +623,22 @@ fn prune_unreachable_functions(functions: Vec<Function>, entry: Option<&FuncId>)
         }
         for block in &functions[index].blocks {
             for instr in &block.instrs {
-                if let Instr::Call { callee, .. } = instr {
-                    stack.push(*callee);
+                match instr {
+                    Instr::Call { callee, .. } => stack.push(*callee),
+                    // Making an object is what makes its methods callable, and
+                    // the only thing that does: a virtual call names a slot,
+                    // and the objects that could answer it are exactly the ones
+                    // some `New` built.
+                    Instr::VTable { class, .. } => {
+                        stack.extend(&vtables[class.0 as usize]);
+                    }
+                    _ => {}
                 }
             }
         }
     }
 
-    // Old index -> new index, for the calls that name them.
+    // Old index -> new index, for the calls and the tables that name them.
     let mut renumber = vec![FuncId(0); functions.len()];
     let mut next = 0;
     for (index, keep) in reachable.iter().enumerate() {
@@ -539,7 +648,12 @@ fn prune_unreachable_functions(functions: Vec<Function>, entry: Option<&FuncId>)
         }
     }
 
-    functions
+    let vtables = vtables
+        .into_iter()
+        .map(|slots| slots.into_iter().map(|at| renumber[at.0 as usize]).collect())
+        .collect();
+
+    let functions = functions
         .into_iter()
         .zip(&reachable)
         .filter(|(_, keep)| **keep)
@@ -553,7 +667,8 @@ fn prune_unreachable_functions(functions: Vec<Function>, entry: Option<&FuncId>)
             }
             function
         })
-        .collect()
+        .collect();
+    (functions, vtables)
 }
 
 /// Drop the blocks nothing can reach, and renumber the survivors.
@@ -648,10 +763,13 @@ struct Lowering<'a> {
     scopes: Vec<HashMap<String, (VReg, Ty)>>,
     /// The loops enclosing the statement being lowered, innermost last.
     loops: Vec<LoopFrame>,
-    /// Bytes of frame handed out so far, which is the offset the next array
-    /// gets. Never reclaimed: an array's room is reserved for the whole call,
-    /// which costs a few bytes and spares the lowering a lifetime analysis.
+    /// Bytes of frame handed out so far, which is the offset the next aggregate
+    /// gets. Never reclaimed: the room is reserved for the whole call, which
+    /// costs a few bytes and spares the lowering a lifetime analysis.
     frame_bytes: u32,
+    /// Where a `return` copies to, for a function whose answer does not fit in
+    /// a register. `None` for every other function.
+    out_pointer: Option<VReg>,
     /// How many registers have borne each name, so a shadowing declaration in
     /// another scope gets a distinct dump name (`i`, then `i.1`).
     name_counts: HashMap<String, u32>,
@@ -659,6 +777,9 @@ struct Lowering<'a> {
     /// Every type the program has, for turning a variant name into its tag and
     /// an array type into a size.
     table: &'a TypeTable,
+    /// Which lowered function each of the program's functions became, so a
+    /// method's implementation can be named from its class's table.
+    func_ids: &'a [FuncId],
     /// Shared with every other function: the strings all land in one section.
     strings: &'a mut Strings,
     ids: &'a HashMap<String, FuncId>,
@@ -668,14 +789,26 @@ impl Lowering<'_> {
     fn run(mut self, decl: &FnDecl, ret: Option<Ty>, param_types: &[Ty]) -> Function {
         self.new_block(BlockKind::Entry);
 
-        // Parameters first, so each one is defined at the top of the function.
+        // An aggregate does not come back in a register, so the caller reserves
+        // the room and hands its address in ahead of everything else. The
+        // callee fills what the caller already owns, which is why returning one
+        // hands nothing outward and nothing can dangle.
+        let returns_aggregate = ret.is_some_and(|ty| !ty.fits_in_a_register());
+        if returns_aggregate {
+            let dst = self.fresh("out");
+            self.emit(Instr::Param { dst, index: 0 });
+            self.out_pointer = Some(dst);
+        }
+        let first = u32::from(returns_aggregate);
+
+        // Parameters next, so each one is defined at the top of the function.
         //
-        // An array parameter is no different here: what arrived in the register
-        // is its address, and the address is what the register keeps.
+        // An aggregate parameter is no different here: what arrived in the
+        // register is its address, and the address is what the register keeps.
         let mut params = Vec::new();
         for (index, (param, ty)) in decl.params.iter().zip(param_types).enumerate() {
             let dst = self.declare(&param.name, *ty);
-            self.emit(Instr::Param { dst, index: index as u32 });
+            self.emit(Instr::Param { dst, index: index as u32 + first });
             params.push(dst);
         }
 
@@ -803,22 +936,41 @@ impl Lowering<'_> {
 
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Decl { name, init, .. } => {
-                let dst = self.declare(name, self.types.of(init.id));
-                self.expr_into(dst, init);
+            Stmt::Decl { id, name, init, .. } => {
+                // The declared type, not the initialiser's: `Shape s = c;`
+                // makes a `Shape`, and what it holds may be any of them.
+                let ty = self.types.of(*id);
+                let dst = self.declare(name, ty);
+                match ty.fits_in_a_register() {
+                    true => self.expr_into(dst, init),
+                    // An aggregate variable owns its room. An expression that
+                    // reserved some already moves in; anything else names room
+                    // that belongs to something else, and is copied out of it.
+                    false if builds_its_own(init) => self.expr_into(dst, init),
+                    false => {
+                        self.allocate_for(dst, ty);
+                        self.write_through(Value::Reg(dst), init);
+                    }
+                }
             }
             Stmt::Assign { target, value } => match target {
-                // The variable keeps its register; the assignment overwrites it.
                 Place::Var { name, .. } => {
-                    let dst = self.lookup(name);
-                    self.expr_into(dst, value);
+                    let (dst, ty) = self.binding(name);
+                    match ty.fits_in_a_register() {
+                        // The variable keeps its register; the assignment
+                        // overwrites it.
+                        true => self.expr_into(dst, value),
+                        // An aggregate variable keeps its *room*, so the value
+                        // is copied into it rather than the address swapped.
+                        // Anything else would make assignment aliasing.
+                        false => self.write_through(Value::Reg(dst), value),
+                    }
                 }
-                // An element has no register of its own: what the name holds is
-                // the array's address, and the write goes through it.
-                Place::Element { array, index, .. } => {
-                    let addr = self.element_address(array, index);
-                    let value = self.expr(value);
-                    self.emit(Instr::Store { addr: Value::Reg(addr), value });
+                // Everything else names memory rather than a register, so the
+                // write goes through an address.
+                target => {
+                    let addr = self.place_address(target);
+                    self.write_through(Value::Reg(addr), value);
                 }
             },
             Stmt::Print { value, .. } => {
@@ -836,6 +988,15 @@ impl Lowering<'_> {
                 self.loop_with_step(cond, body, Some(step));
                 self.scopes.pop();
             }
+            // An aggregate answer is copied into the room the caller reserved,
+            // and the function then leaves with nothing — there is no address
+            // to hand back, which is exactly why none can dangle.
+            Stmt::Return { value: Some(expr), .. } if self.out_pointer.is_some() => {
+                let out = self.out_pointer.expect("just matched");
+                self.write_through(Value::Reg(out), expr);
+                self.terminate(Terminator::Return(None));
+                self.new_block(BlockKind::Unreachable);
+            }
             Stmt::Return { value, .. } => {
                 let value = value.as_ref().map(|expr| self.expr(expr));
                 self.terminate(Terminator::Return(value));
@@ -847,10 +1008,13 @@ impl Lowering<'_> {
             Stmt::Match(expr) => self.match_lowering(None, expr),
             Stmt::Break { .. } => self.loop_jump(|frame| &mut frame.breaks),
             Stmt::Continue { .. } => self.loop_jump(|frame| &mut frame.continues),
-            Stmt::Call(call) => {
-                let (callee, args) = self.call_parts(call);
-                self.emit(Instr::Call { dst: None, callee, args });
-            }
+            Stmt::Call(call) => match call.kind {
+                ExprKind::MethodCall { .. } => self.method_call(None, call),
+                _ => {
+                    let (callee, args) = self.call_parts(call);
+                    self.emit(Instr::Call { dst: None, callee, args });
+                }
+            },
         }
     }
 
@@ -1082,28 +1246,170 @@ impl Lowering<'_> {
     /// into an offset is an addressing mode on x86, not arithmetic, so it is
     /// not lowered as arithmetic and never picks up the overflow guard that
     /// `Bin` carries.
-    fn element_address(&mut self, array: &str, index: &Expr) -> VReg {
-        let base = self.lookup(array);
-        let len = self.array_len(array);
+    fn element_address(&mut self, array: &Expr, index: &Expr) -> VReg {
+        let (len, scale) = self.shape_of(self.types.of(array.id));
+        let base = self.expr(array);
         let index = self.expr(index);
         let dst = self.fresh_temp();
-        self.emit(Instr::Elem { dst, base: Value::Reg(base), index, len });
+        self.emit(Instr::Elem { dst, base, index, len, scale });
         dst
     }
 
-    /// How long the array a name holds is — a fact about its *type*, so it is
-    /// known here without anything being computed.
-    fn array_len(&self, array: &str) -> u32 {
-        let Ty::Array(id) = self.lookup_type(array) else {
+    /// How long an array type is and how wide each of its elements is — both
+    /// facts about the type, so both known here without anything computed.
+    fn shape_of(&self, ty: Ty) -> (u32, u32) {
+        let Ty::Array(id) = ty else {
             unreachable!("sema rejects indexing anything but an array");
         };
-        self.table.array(id).len
+        let info = self.table.array(id);
+        (info.len, self.table.size_of(info.elem))
     }
 
-    /// Reserve room for an array in the frame and put its address in `dst`.
-    fn allocate_array(&mut self, dst: VReg, len: u32) {
+    /// Room in the frame for a value of `ty`, with its address in `dst`.
+    fn allocate_for(&mut self, dst: VReg, ty: Ty) {
+        let bytes = self.table.size_of(ty);
+        self.allocate(dst, bytes);
+    }
+
+    /// Put `value` where `addr` points, whichever kind of value it is.
+    ///
+    /// A scalar is one store. An aggregate does not fit in a register, so what
+    /// the expression produced is an *address* and the value is copied out of
+    /// it — which is what makes assignment value semantics rather than
+    /// aliasing, and what carries an object's vtable pointer along with it.
+    fn write_through(&mut self, addr: Value, value: &Expr) {
+        let ty = self.types.of(value.id);
+        if ty.fits_in_a_register() {
+            let value = self.expr(value);
+            self.emit(Instr::Store { addr, value });
+            return;
+        }
+        let src = self.expr(value);
+        let bytes = self.table.size_of(ty);
+        self.emit(Instr::CopyBytes { dst: addr, src, bytes });
+    }
+
+    /// The address of `object.field`, which is the object's plus a fixed offset.
+    ///
+    /// The same `Elem` an array index uses, with the offset in place of the
+    /// index — a field's place in an object is settled once, by `sema`, so
+    /// there is nothing to check and nothing to compute.
+    fn field_address(&mut self, object: Value, class: ClassId, name: &str) -> VReg {
+        let offset = self
+            .table
+            .class(class)
+            .field(name)
+            .expect("sema rejects an unknown field")
+            .offset;
+        let dst = self.fresh_temp();
+        self.emit(Instr::Field { dst, base: object, offset });
+        dst
+    }
+
+    /// Lower `receiver.method(args)`.
+    ///
+    /// The receiver is the first argument, and also where the vtable comes
+    /// from. Which of the two calls goes out is settled here: a class nothing
+    /// derives from has one possible implementation, so the indirection would
+    /// decide a question with one answer — whole-program compilation is what
+    /// makes that knowable.
+    fn method_call(&mut self, dst: Option<VReg>, expr: &Expr) {
+        let ExprKind::MethodCall { receiver, name, args, .. } = &expr.kind else {
+            unreachable!("the caller matched a method call");
+        };
+        let Ty::Class(id) = self.types.of(receiver.id) else {
+            unreachable!("sema rejects a method call on anything but an object");
+        };
+
+        let method = self.table.class(id).method(name).expect("sema rejects an unknown method");
+        let (slot, function) = (method.slot as u32, method.function);
+        let sealed = self.table.is_sealed(id);
+
+        // The receiver is the first written argument, so it is evaluated before
+        // the rest.
+        let object = self.expr(receiver);
+        let mut values = vec![object];
+        values.extend(args.iter().map(|arg| self.expr(arg)));
+
+        // An aggregate answer goes in room the caller reserves, whose address
+        // leads the arguments — ahead of the receiver, since the receiver is
+        // an ordinary argument and this is not.
+        let ty = self.types.of(expr.id);
+        let dst = match (dst, ty.fits_in_a_register()) {
+            (Some(dst), false) => {
+                self.allocate_for(dst, ty);
+                values.insert(0, Value::Reg(dst));
+                None
+            }
+            (dst, _) => dst,
+        };
+
+        if sealed {
+            self.emit(Instr::Call { dst, callee: self.func_ids[function], args: values });
+        } else {
+            self.emit(Instr::CallVirtual { dst, slot, receiver: object, args: values });
+        }
+    }
+
+    /// The type a place has, read off the chain of names that leads to it.
+    fn place_type(&self, place: &Place) -> Ty {
+        match place {
+            Place::Var { name, .. } => self.lookup_type(name),
+            Place::Element { base, .. } => match self.place_type(base) {
+                Ty::Array(id) => self.table.array(id).elem,
+                _ => unreachable!("sema rejects indexing anything but an array"),
+            },
+            Place::Field { base, name, .. } => match self.place_type(base) {
+                Ty::Class(id) => {
+                    self.table.class(id).field(name).expect("sema rejects an unknown field").ty
+                }
+                _ => unreachable!("sema rejects a field on anything but an object"),
+            },
+        }
+    }
+
+    /// The address a place names, for a write.
+    ///
+    /// Only a variable has no address — it is a register — and the caller has
+    /// already dealt with that case.
+    fn place_address(&mut self, place: &Place) -> VReg {
+        match place {
+            Place::Var { .. } => unreachable!("a variable is a register, not an address"),
+            Place::Element { base, index, .. } => {
+                let (len, scale) = self.shape_of(self.place_type(base));
+                let object = self.place_value(base);
+                let index = self.expr(index);
+                let dst = self.fresh_temp();
+                self.emit(Instr::Elem { dst, base: object, index, len, scale });
+                dst
+            }
+            Place::Field { base, name, .. } => {
+                let Ty::Class(id) = self.place_type(base) else {
+                    unreachable!("sema rejects a field on anything but an object");
+                };
+                let object = self.place_value(base);
+                self.field_address(object, id, name)
+            }
+        }
+    }
+
+    /// What a place *holds*, which for anything but a variable means reading it.
+    fn place_value(&mut self, place: &Place) -> Value {
+        match place {
+            Place::Var { name, .. } => Value::Reg(self.lookup(name)),
+            other => {
+                let addr = self.place_address(other);
+                let dst = self.fresh_temp();
+                self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
+                Value::Reg(dst)
+            }
+        }
+    }
+
+    /// Reserve `bytes` of frame and put their address in `dst`.
+    fn allocate(&mut self, dst: VReg, bytes: u32) {
         let offset = self.frame_bytes;
-        self.frame_bytes += len * 8;
+        self.frame_bytes += bytes;
         self.emit(Instr::Frame { dst, offset });
     }
 
@@ -1134,26 +1440,69 @@ impl Lowering<'_> {
             // The array's room is reserved first, then filled: an element's
             // value may itself mention the array being built only in ways sema
             // has already ruled out, so the order is not observable.
+            // The object's room is reserved at its hierarchy's size, then its
+            // vtable pointer goes in at offset 0 and its fields after — so it
+            // is a complete object of its class from the first instruction.
+            ExprKind::New { fields, .. } => {
+                let Ty::Class(id) = self.types.of(expr.id) else {
+                    unreachable!("sema gives an object literal its class's type");
+                };
+                let info = self.table.class(id).clone();
+                self.allocate(dst, info.storage);
+
+                // The vtable pointer goes in first, at offset 0. It is what
+                // makes the object *this* class rather than merely its shape,
+                // and it is what travels with a copy.
+                let vptr = self.fresh_temp();
+                self.emit(Instr::VTable { dst: vptr, class: id });
+                self.emit(Instr::Store { addr: Value::Reg(dst), value: Value::Reg(vptr) });
+
+                for init in fields {
+                    let offset = info
+                        .field(&init.name)
+                        .expect("sema rejects an unknown field")
+                        .offset;
+                    let addr = self.fresh_temp();
+                    self.emit(Instr::Field { dst: addr, base: Value::Reg(dst), offset });
+                    self.write_through(Value::Reg(addr), &init.value);
+                }
+            }
+            ExprKind::Field { object, name, .. } => {
+                let Ty::Class(id) = self.types.of(object.id) else {
+                    unreachable!("sema rejects a field on anything but an object");
+                };
+                let object = self.expr(object);
+                let addr = self.field_address(object, id, name);
+                self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
+            }
+            ExprKind::MethodCall { .. } => self.method_call(Some(dst), expr),
             ExprKind::Array { elements, .. } => {
-                self.allocate_array(dst, elements.len() as u32);
+                let ty = self.types.of(expr.id);
+                let (len, scale) = self.shape_of(ty);
+                self.allocate_for(dst, ty);
                 for (index, element) in elements.iter().enumerate() {
-                    let value = self.expr(element);
                     let addr = self.fresh_temp();
                     self.emit(Instr::Elem {
                         dst: addr,
                         base: Value::Reg(dst),
                         index: Value::Const(index as i64),
-                        len: elements.len() as u32,
+                        len,
+                        scale,
                     });
-                    self.emit(Instr::Store { addr: Value::Reg(addr), value });
+                    self.write_through(Value::Reg(addr), element);
                 }
             }
             ExprKind::Index { array, index, .. } => {
                 let addr = self.element_address(array, index);
-                self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
+                // An aggregate element *is* its address; only a value that
+                // fits in a register has to be read out.
+                match self.types.of(expr.id).fits_in_a_register() {
+                    true => self.emit(Instr::Load { dst, addr: Value::Reg(addr) }),
+                    false => self.emit(Instr::Copy { dst, src: Value::Reg(addr) }),
+                }
             }
             ExprKind::Len { array, .. } => {
-                let val = i64::from(self.array_len(array));
+                let val = i64::from(self.shape_of(self.types.of(array.id)).0);
                 self.emit(Instr::Const { dst, val });
             }
             ExprKind::Str(bytes) => {
@@ -1198,8 +1547,18 @@ impl Lowering<'_> {
             ExprKind::Logic { op, lhs, rhs } => self.logic_into(dst, *op, lhs, rhs),
             ExprKind::Match { .. } => self.match_lowering(Some(dst), expr),
             ExprKind::Call { .. } => {
-                let (callee, args) = self.call_parts(expr);
-                self.emit(Instr::Call { dst: Some(dst), callee, args });
+                let (callee, mut args) = self.call_parts(expr);
+                let ty = self.types.of(expr.id);
+                if ty.fits_in_a_register() {
+                    self.emit(Instr::Call { dst: Some(dst), callee, args });
+                    return;
+                }
+                // The room is the caller's, and its address goes in ahead of
+                // the written arguments. `dst` ends up naming it, so what the
+                // caller gets back is room it already owned.
+                self.allocate_for(dst, ty);
+                args.insert(0, Value::Reg(dst));
+                self.emit(Instr::Call { dst: None, callee, args });
             }
             ExprKind::Var(_) => {
                 let src = self.expr(expr);
@@ -1306,9 +1665,14 @@ impl Lowering<'_> {
             ExprKind::Variant { .. } => Value::Const(self.variant_tag(expr)),
             // A length is a fact about a type, so it is a constant here and
             // costs nothing at all — `i < len(xs)` compares against a literal.
-            ExprKind::Len { array, .. } => Value::Const(i64::from(self.array_len(array))),
+            ExprKind::Len { array, .. } => {
+                Value::Const(i64::from(self.shape_of(self.types.of(array.id)).0))
+            }
             ExprKind::Index { array, index, .. } => {
                 let addr = self.element_address(array, index);
+                if !self.types.of(expr.id).fits_in_a_register() {
+                    return Value::Reg(addr);
+                }
                 let dst = self.fresh_temp();
                 self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
                 Value::Reg(dst)
@@ -1375,7 +1739,10 @@ impl Lowering<'_> {
             ExprKind::Str(_)
             | ExprKind::Call { .. }
             | ExprKind::Match { .. }
-            | ExprKind::Array { .. } => {
+            | ExprKind::Array { .. }
+            | ExprKind::New { .. }
+            | ExprKind::Field { .. }
+            | ExprKind::MethodCall { .. } => {
                 let dst = self.fresh_temp();
                 self.expr_into(dst, expr);
                 Value::Reg(dst)
@@ -1392,6 +1759,22 @@ impl Lowering<'_> {
         self.strings.ids.insert(bytes.to_vec(), id);
         id
     }
+}
+
+/// Whether lowering this expression *reserves* the room its value lives in,
+/// rather than naming room something else owns.
+///
+/// The three that do are the two literals and a call, which fills room the
+/// caller reserved for it. Everything else — a variable, a field, an element —
+/// points at somebody's else's, so assigning it means copying.
+fn builds_its_own(expr: &Expr) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::New { .. }
+            | ExprKind::Array { .. }
+            | ExprKind::Call { .. }
+            | ExprKind::MethodCall { .. }
+    )
 }
 
 /// Evaluate `lhs op rhs` now, when both are already known.
@@ -1540,6 +1923,145 @@ mod tests {
         assert_eq!(with_for.dump(), with_while.dump());
     }
 
+    // -- classes -----------------------------------------------------------
+
+    #[test]
+    fn an_object_is_room_a_vtable_pointer_and_its_fields() {
+        let ir = lower_src(
+            "class Circle {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+             fn main() {\n  Circle c = Circle { r: 5 };\n  print(c.r);\n}",
+        );
+        let main = ir.functions.iter().find(|f| f.name == "main").expect("main survives");
+        let text: Vec<String> =
+            main.blocks[0].instrs.iter().map(|i| ir.instr_text(main, i)).collect();
+        assert_eq!(
+            text,
+            vec![
+                "%c = frame 0",
+                "%t1 = vtable Circle",
+                "store %c, %t1",
+                "%t2 = field %c + 8",
+                "store %t2, 5",
+                "%t4 = field %c + 8",
+                "%t3 = load %t4",
+                "print int %t3",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_field_of_the_base_comes_before_one_of_the_subclass() {
+        // The prefix rule, which is what makes an upcast free.
+        let ir = lower_src(
+            "class Base {\n  int a;\n}\nclass Derived : Base {\n  int b;\n}\n\
+             fn main() {\n  Derived d = Derived { a: 1, b: 2 };\n  print(d.a + d.b);\n}",
+        );
+        let offsets: Vec<u32> =
+            ir.table.class(ClassId(1)).fields.iter().map(|f| f.offset).collect();
+        // The vtable pointer takes offset 0.
+        assert_eq!(offsets, vec![8, 16]);
+    }
+
+    #[test]
+    fn a_call_on_a_class_with_subclasses_goes_through_the_vtable() {
+        let ir = lower_src(
+            "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+             class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+             fn report(Shape s) {\n  print(s.area());\n}\n\
+             fn main() {\n  report(Circle { r: 1 });\n}",
+        );
+        let report = ir.functions.iter().find(|f| f.name == "report").expect("report survives");
+        assert!(
+            report.blocks[0].instrs.iter().any(|i| matches!(i, Instr::CallVirtual { slot: 0, .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_call_on_a_class_with_none_is_settled_at_compile_time() {
+        // Whole-program compilation is what makes this knowable: nothing can
+        // derive from `Point` afterwards, so there is one answer and no reason
+        // to ask at run time.
+        let ir = lower_src(
+            "class Point {\n  int x;\n  fn get(self) -> int { return self.x; }\n}\n\
+             fn main() {\n  Point p = Point { x: 1 };\n  print(p.get());\n}",
+        );
+        let main = ir.functions.iter().find(|f| f.name == "main").expect("main survives");
+        assert!(
+            !main.blocks[0].instrs.iter().any(|i| matches!(i, Instr::CallVirtual { .. })),
+            "{}",
+            ir.dump()
+        );
+        assert!(
+            main.blocks[0].instrs.iter().any(|i| matches!(i, Instr::Call { .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_subclass_vtable_is_its_base_with_the_overrides_replaced() {
+        let ir = lower_src(
+            "class Shape {\n  fn area(self) -> int { return 0; }\n  \
+             fn name(self) -> string { return \"shape\"; }\n}\n\
+             class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+             fn main() {\n  Circle c = Circle { r: 1 };\n  print(c.area());\n}",
+        );
+        // Same two slots in the same order; only the first was overridden.
+        let shape = ir.table.class(ClassId(0));
+        let circle = ir.table.class(ClassId(1));
+        let names: Vec<&str> = circle.methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["area", "name"]);
+        assert_eq!(circle.methods[0].slot, shape.methods[0].slot);
+        assert_ne!(circle.methods[0].function, shape.methods[0].function);
+        assert_eq!(circle.methods[1].function, shape.methods[1].function);
+    }
+
+    #[test]
+    fn storage_is_the_biggest_in_the_hierarchy() {
+        // What will let a value of a base class hold any of its subclasses.
+        let ir = lower_src(
+            "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+             class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+             class Rect : Shape {\n  int w;\n  int h;\n  \
+             fn area(self) -> int { return self.w; }\n}\n\
+             fn main() {\n  Rect r = Rect { w: 1, h: 2 };\n  print(r.area());\n}",
+        );
+        // `Shape` is 8 on its own; the biggest thing that *is* one is `Rect`.
+        assert_eq!(ir.table.class(ClassId(0)).size, 8);
+        assert_eq!(ir.table.class(ClassId(0)).storage, 24);
+        assert_eq!(ir.table.class(ClassId(2)).storage, 24);
+    }
+
+    #[test]
+    fn a_method_is_named_after_its_class() {
+        // Two classes may both have a `go`, so the flat list of callables has
+        // to keep them apart — and so do their symbols.
+        let ir = lower_src(
+            "class A {\n  fn go(self) -> int { return 1; }\n}\n\
+             class B {\n  fn go(self) -> int { return 2; }\n}\n\
+             fn main() {\n  A a = A { };\n  B b = B { };\n  print(a.go() + b.go());\n}",
+        );
+        let names: Vec<&str> = ir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"A$go"), "{names:?}");
+        assert!(names.contains(&"B$go"), "{names:?}");
+    }
+
+    #[test]
+    fn a_class_nothing_builds_keeps_none_of_its_methods() {
+        // Making an object is what makes its methods callable, and the only
+        // thing that does.
+        let ir = lower_src(
+            "class Used {\n  fn f(self) -> int { return 1; }\n}\n\
+             class Unused {\n  fn f(self) -> int { return 2; }\n}\n\
+             fn main() {\n  Used u = Used { };\n  print(u.f());\n}",
+        );
+        let names: Vec<&str> = ir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"Used$f"), "{names:?}");
+        assert!(!names.contains(&"Unused$f"), "{names:?}");
+    }
+
     // -- arrays ------------------------------------------------------------
 
     #[test]
@@ -1550,13 +2072,13 @@ mod tests {
             concat!(
                 "entry0:\n",
                 "  0  %xs = frame 0\n",
-                "  1  %t1 = elem %xs[0] of 3\n",
+                "  1  %t1 = elem %xs[0] of 3 by 8\n",
                 "  2  store %t1, 10\n",
-                "  3  %t2 = elem %xs[1] of 3\n",
+                "  3  %t2 = elem %xs[1] of 3 by 8\n",
                 "  4  store %t2, 20\n",
-                "  5  %t3 = elem %xs[2] of 3\n",
+                "  5  %t3 = elem %xs[2] of 3 by 8\n",
                 "  6  store %t3, 30\n",
-                "  7  %t4 = elem %xs[0] of 3\n",
+                "  7  %t4 = elem %xs[0] of 3 by 8\n",
                 "  8  %t5 = load %t4\n",
                 "  9  print int %t5\n",
                 " 10  return\n",

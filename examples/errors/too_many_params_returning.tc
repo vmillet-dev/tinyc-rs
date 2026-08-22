@@ -1,0 +1,11 @@
+class Point {
+  int x;
+}
+
+fn build(int a, int b, int c, int d) -> Point {
+  return Point { x: a + b + c + d };
+}
+
+fn main() {
+  build(1, 2, 3, 4);
+}

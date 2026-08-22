@@ -22,8 +22,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    ArmBody, ArrayId, ArrayInfo, BinOp, Block, EnumId, EnumInfo, Expr, ExprKind, FnDecl, MatchArm,
-    NodeId, Place, Program, Stmt, Ty, TypeRef, TypeTable,
+    ArmBody, ArrayId, ArrayInfo, BinOp, Block, ClassId, ClassInfo, EnumId, EnumInfo, Expr,
+    ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Program, Stmt, Ty,
+    TypeRef,
+    TypeTable,
 };
 use crate::diag::{Diagnostic, Result, Span};
 
@@ -79,6 +81,12 @@ struct Declared {
     enum_spans: Vec<Span>,
     enums_by_name: HashMap<String, EnumId>,
     arrays_by_shape: HashMap<(Ty, u32), ArrayId>,
+    classes_by_name: HashMap<String, ClassId>,
+    /// Where each class was declared.
+    class_spans: Vec<Span>,
+    /// Which class each of the program's functions is a method of, so a method
+    /// can be told from a free function and given its receiver's type.
+    method_of: HashMap<usize, ClassId>,
 }
 
 impl Declared {
@@ -88,6 +96,14 @@ impl Declared {
 
     fn info(&self, id: EnumId) -> &EnumInfo {
         self.table.enum_info(id)
+    }
+
+    fn class_id(&self, name: &str) -> Option<ClassId> {
+        self.classes_by_name.get(name).copied()
+    }
+
+    fn class(&self, id: ClassId) -> &ClassInfo {
+        self.table.class(id)
     }
 
     /// The type of an array of `len` `elem`s, made if this is the first time
@@ -113,6 +129,9 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
         enum_spans: Vec::new(),
         enums_by_name: HashMap::new(),
         arrays_by_shape: HashMap::new(),
+        classes_by_name: HashMap::new(),
+        class_spans: Vec::new(),
+        method_of: HashMap::new(),
     };
 
     for declaration in &program.enums {
@@ -166,6 +185,250 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
     enums
 }
 
+/// Bytes an object spends on its vtable pointer, which sits at offset 0.
+const VPTR_SIZE: u32 = 8;
+
+/// Pass 0b: resolve base classes, lay every object out, and settle the vtables.
+///
+/// Names are registered first so that a field may mention any class and a base
+/// may be declared after its subclass. What has to happen in order is *layout*:
+/// a class's fields follow its base's, so a base is laid out before anything
+/// that extends it.
+fn collect_classes(program: &Program, declared: &mut Declared, errors: &mut Vec<Diagnostic>) {
+    // Every name first, with a placeholder layout, so the rest can refer to it.
+    for class in &program.classes {
+        if let Some(&previous) = declared.classes_by_name.get(&class.name) {
+            let previous = declared.class_spans[previous.0 as usize];
+            errors.push(
+                Diagnostic::new(format!("`{}` is already declared", class.name), class.name_span)
+                    .with_label("declared a second time here")
+                    .with_note("previous declaration", Some(previous)),
+            );
+            continue;
+        }
+        let id = ClassId(declared.table.classes.len() as u32);
+        declared.classes_by_name.insert(class.name.clone(), id);
+        declared.class_spans.push(class.name_span);
+        declared.table.classes.push(ClassInfo {
+            name: class.name.clone(),
+            base: None,
+            fields: Vec::new(),
+            methods: Vec::new(),
+            size: VPTR_SIZE,
+            storage: VPTR_SIZE,
+        });
+        for &at in &class.methods {
+            declared.method_of.insert(at, id);
+        }
+    }
+
+    // Bases, with the one shape that would make everything below loop forever
+    // ruled out first.
+    let declarations = order_of_declarations(program, declared);
+    for &(id, class) in &declarations {
+        let Some((name, span)) = &class.base else { continue };
+        let Some(base) = declared.class_id(name) else {
+            errors.push(
+                Diagnostic::new(format!("unknown class `{name}`"), *span)
+                    .with_label("a base class has to be declared somewhere in this file"),
+            );
+            continue;
+        };
+        if base == id || inherits_through(declared, base, id) {
+            errors.push(
+                Diagnostic::new(format!("`{}` inherits from itself", class.name), *span)
+                    .with_label("a class cannot be its own ancestor, directly or otherwise"),
+            );
+            continue;
+        }
+        declared.table.classes[id.0 as usize].base = Some(base);
+    }
+
+    // Layout, bases first. Every value in TinyC is eight bytes wide, so a
+    // field's place is its position — the same arithmetic an array index does.
+    for id in layout_order(declared) {
+        let class = &program.classes[declarations_index(program, declared, id)];
+        let base = declared.table.classes[id.0 as usize].base;
+
+        let mut fields = match base {
+            Some(base) => declared.class(base).fields.clone(),
+            None => Vec::new(),
+        };
+        let mut offset = fields.last().map_or(VPTR_SIZE, |f| f.offset + 8);
+
+        for field in &class.fields {
+            let ty = resolve_type(declared, &field.ty, errors).unwrap_or(Ty::Int);
+            if !ty.fits_in_a_register() {
+                errors.push(
+                    Diagnostic::new(
+                        format!("a field cannot be {}", ty.with_article(&declared.table)),
+                        field.ty.span,
+                    )
+                    .with_label("every field of an object is one value")
+                    .with_note("arrays and objects do not nest yet", None),
+                );
+                continue;
+            }
+            if fields.iter().any(|f| f.name == field.name) {
+                errors.push(
+                    Diagnostic::new(
+                        format!("`{}` already has a field `{}`", class.name, field.name),
+                        field.name_span,
+                    )
+                    .with_label("a field may only be named once, base classes included"),
+                );
+                continue;
+            }
+            fields.push(FieldInfo { name: field.name.clone(), ty, offset });
+            offset += 8;
+        }
+
+        let info = &mut declared.table.classes[id.0 as usize];
+        info.fields = fields;
+        info.size = offset;
+    }
+
+    // Storage is the biggest size in the *hierarchy*, and the same for every
+    // class in it. That is what lets a value of a base class hold any of its
+    // subclasses without being sliced — and, just as importantly, what keeps
+    // copying `storage` bytes out of the smallest of them in bounds.
+    let ids: Vec<ClassId> = (0..declared.table.classes.len() as u32).map(ClassId).collect();
+    for &id in &ids {
+        let root = declared.table.root_of(id);
+        let storage = ids
+            .iter()
+            .filter(|&&other| declared.table.root_of(other) == root)
+            .map(|&other| declared.class(other).size)
+            .max()
+            .unwrap_or(VPTR_SIZE);
+        declared.table.classes[id.0 as usize].storage = storage;
+    }
+}
+
+/// Pass 1b: settle every class's vtable, now that signatures exist.
+///
+/// A method inherited from the base keeps its slot and its implementation; one
+/// that overrides keeps the slot and replaces the implementation; a new one
+/// takes the next slot. That is the whole of single inheritance — and the
+/// reason a subclass's table can be read as its base's.
+fn collect_methods(
+    program: &Program,
+    declared: &mut Declared,
+    signatures: &HashMap<usize, Signature>,
+    errors: &mut Vec<Diagnostic>,
+) {
+    for id in layout_order(declared) {
+        let class = &program.classes[declarations_index(program, declared, id)];
+        let base = declared.class(id).base;
+
+        let mut methods = match base {
+            Some(base) => declared.class(base).methods.clone(),
+            None => Vec::new(),
+        };
+
+        for &at in &class.methods {
+            let declaration = &program.functions[at];
+            let Some(signature) = signatures.get(&at) else { continue };
+
+            let Some(existing) = methods.iter().position(|m| m.name == declaration.name) else {
+                let slot = methods.len();
+                methods.push(MethodInfo {
+                    name: declaration.name.clone(),
+                    function: at,
+                    params: signature.params.clone(),
+                    ret: signature.ret,
+                    slot,
+                });
+                continue;
+            };
+
+            // An override has to be usable wherever the base's method was, so
+            // it has to agree with it — otherwise a call through the base
+            // would pass the wrong arguments or read the wrong result.
+            let inherited = &methods[existing];
+            let agrees = inherited.params.len() == signature.params.len()
+                && inherited.params[1..] == signature.params[1..]
+                && inherited.ret == signature.ret;
+            if !agrees {
+                errors.push(
+                    Diagnostic::new(
+                        format!(
+                            "`{}` does not match the `{}` it overrides",
+                            declaration.name, declaration.name
+                        ),
+                        declaration.name_span,
+                    )
+                    .with_label("an override has to take and return what the base's does")
+                    .with_note(
+                        "a call through the base class cannot know which one it reached",
+                        None,
+                    ),
+                );
+            }
+            methods[existing].function = at;
+        }
+
+        declared.table.classes[id.0 as usize].methods = methods;
+    }
+}
+
+/// Whether `from` reaches `target` by following base classes, used to catch a
+/// cycle before anything walks one.
+fn inherits_through(declared: &Declared, from: ClassId, target: ClassId) -> bool {
+    let mut at = Some(from);
+    // The chain cannot be longer than the number of classes without repeating.
+    for _ in 0..=declared.table.classes.len() {
+        match at {
+            Some(id) if id == target => return true,
+            Some(id) => at = declared.class(id).base,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// Pair each registered class with the declaration it came from.
+fn order_of_declarations<'a>(
+    program: &'a Program,
+    declared: &Declared,
+) -> Vec<(ClassId, &'a crate::ast::ClassDecl)> {
+    program
+        .classes
+        .iter()
+        .filter_map(|class| declared.class_id(&class.name).map(|id| (id, class)))
+        // A duplicate name resolves to the first declaration; laying it out
+        // twice would be wrong, so only the first is kept.
+        .fold(Vec::new(), |mut kept, entry| {
+            if !kept.iter().any(|(id, _)| *id == entry.0) {
+                kept.push(entry);
+            }
+            kept
+        })
+}
+
+fn declarations_index(program: &Program, declared: &Declared, id: ClassId) -> usize {
+    program
+        .classes
+        .iter()
+        .position(|class| declared.class_id(&class.name) == Some(id))
+        .expect("every id came from a declaration")
+}
+
+/// Class ids with every base before anything that extends it.
+fn layout_order(declared: &Declared) -> Vec<ClassId> {
+    let mut order: Vec<ClassId> = (0..declared.table.classes.len() as u32).map(ClassId).collect();
+    order.sort_by_key(|&id| {
+        let mut depth = 0;
+        let mut at = declared.class(id).base;
+        while let Some(base) = at {
+            depth += 1;
+            at = declared.class(base).base;
+        }
+        depth
+    });
+    order
+}
+
 /// Turn a written type into the type it names.
 ///
 /// `None` means the name does not name a type at all — reported here, so a
@@ -175,14 +438,18 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
         "int" => Some(Ty::Int),
         "string" => Some(Ty::Str),
         "bool" => Some(Ty::Bool),
-        name => declared.enum_id(name).map(Ty::Enum).or_else(|| {
-            errors.push(
-                Diagnostic::new(format!("unknown type `{name}`"), ty.span)
-                    .with_label("no built-in type and no enum goes by this name")
-                    .with_note("the built-in types are `int`, `string` and `bool`", None),
-            );
-            None
-        }),
+        name => declared
+            .enum_id(name)
+            .map(Ty::Enum)
+            .or_else(|| declared.class_id(name).map(Ty::Class))
+            .or_else(|| {
+                errors.push(
+                    Diagnostic::new(format!("unknown type `{name}`"), ty.span)
+                        .with_label("no built-in type, enum or class goes by this name")
+                        .with_note("the built-in types are `int`, `string` and `bool`", None),
+                );
+                None
+            }),
     }?;
 
     let Some((len, len_span)) = ty.array_len else { return Some(element) };
@@ -247,15 +514,28 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
 
     // Pass 0: the declared types, before anything can mention one.
     let mut declared = collect_enums(program, &mut errors);
+    collect_classes(program, &mut declared, &mut errors);
 
-    // Pass 1: every signature, before any body.
-    let signatures = collect_signatures(program, &mut declared, max_params, &mut errors);
+    // Pass 1: every signature, before any body. A method's goes in its class
+    // rather than in the program's namespace.
+    let mut method_signatures: HashMap<usize, Signature> = HashMap::new();
+    let signatures =
+        collect_signatures(program, &mut declared, max_params, &mut method_signatures, &mut errors);
+    collect_methods(program, &mut declared, &method_signatures, &mut errors);
     check_entry_point(program, &signatures, &declared, &mut errors);
 
     // Pass 2: the bodies, each with the whole table visible.
-    let fn_ret = program.functions.iter().map(|f| signatures[&f.name].ret).collect();
-    let fn_params =
-        program.functions.iter().map(|f| signatures[&f.name].params.clone()).collect();
+    let signature_of = |at: usize, name: &String| -> Signature {
+        method_signatures.get(&at).cloned().unwrap_or_else(|| signatures[name].clone())
+    };
+    let fn_ret =
+        program.functions.iter().enumerate().map(|(at, f)| signature_of(at, &f.name).ret).collect();
+    let fn_params = program
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(at, f)| signature_of(at, &f.name).params)
+        .collect();
     let mut checker = Checker {
         // `Int` is the recovery type: an expression that failed to check is
         // treated as an int so a single mistake does not cascade.
@@ -269,8 +549,8 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
         declared,
         errors,
     };
-    for function in &program.functions {
-        FnChecker::new(&mut checker, function).run(function);
+    for (at, function) in program.functions.iter().enumerate() {
+        FnChecker::new(&mut checker, at, function).run(function);
     }
 
     // The table is finished only now: a body may have written an array type
@@ -295,35 +575,55 @@ fn collect_signatures(
     program: &Program,
     declared: &mut Declared,
     max_params: usize,
+    method_signatures: &mut HashMap<usize, Signature>,
     errors: &mut Vec<Diagnostic>,
 ) -> HashMap<String, Signature> {
     let mut signatures: HashMap<String, Signature> = HashMap::new();
 
-    for function in &program.functions {
-        if function.params.len() > max_params {
+    for (at, function) in program.functions.iter().enumerate() {
+        // A function returning an aggregate spends one register on the hidden
+        // address the caller hands in, so it has one fewer to give parameters.
+        let returns_aggregate = function.ret.as_ref().is_some_and(|ty| {
+            resolve_type(declared, ty, &mut Vec::new()).is_some_and(|ty| !ty.fits_in_a_register())
+        });
+        let room = max_params - usize::from(returns_aggregate);
+        if function.params.len() > room {
             // Point at the first parameter that does not fit.
-            let offending = &function.params[max_params];
+            let offending = &function.params[room];
+            let from = offending.ty.as_ref().map_or(offending.name_span, |ty| ty.span);
             errors.push(
                 Diagnostic::new(
                     format!(
-                        "`{}` takes {} parameters, but at most {max_params} are supported",
+                        "`{}` takes {} parameters, but at most {room} are supported",
                         function.name,
                         function.params.len()
                     ),
-                    offending.ty.span.to(offending.name_span),
+                    from.to(offending.name_span),
                 )
-                .with_label(format!("parameter {} is one too many", max_params + 1))
+                .with_label(format!("parameter {} is one too many", room + 1))
                 .with_note(
-                    format!(
-                        "the first {max_params} arguments travel in registers; passing more \
-                         would need stack arguments"
-                    ),
+                    match returns_aggregate {
+                        true => format!(
+                            "one of the {max_params} argument registers carries the address this \
+                             function returns into, leaving {room}"
+                        ),
+                        false => format!(
+                            "the first {max_params} arguments travel in registers; passing more \
+                             would need stack arguments"
+                        ),
+                    },
                     None,
                 ),
             );
         }
 
-        if let Some(previous) = signatures.get(&function.name) {
+        // A method's name lives in its class, not in the program, so two
+        // classes may both have an `area` and neither collides with a free
+        // function. Only free functions go in this table.
+        let owner = declared.method_of.get(&at).copied();
+        if owner.is_none()
+            && let Some(previous) = signatures.get(&function.name)
+        {
             let previous = previous.name_span;
             errors.push(
                 Diagnostic::new(
@@ -341,34 +641,48 @@ fn collect_signatures(
         let params = function
             .params
             .iter()
-            .map(|p| resolve_type(declared, &p.ty, errors).unwrap_or(Ty::Int))
+            .enumerate()
+            .map(|(index, p)| match &p.ty {
+                Some(ty) => resolve_type(declared, ty, errors).unwrap_or(Ty::Int),
+                // `self` has the class's type, and only where there is one to
+                // have — and only first, where a receiver goes.
+                None => match owner {
+                    Some(id) if index == 0 => Ty::Class(id),
+                    Some(_) => {
+                        errors.push(
+                            Diagnostic::new("`self` must come first", p.name_span)
+                                .with_label("a receiver is a method's first parameter"),
+                        );
+                        Ty::Int
+                    }
+                    None => {
+                        errors.push(
+                            Diagnostic::new("`self` outside a class", p.name_span)
+                                .with_label("only a method has a receiver")
+                                .with_note(
+                                    "a function inside a `class` block is a method; this one is not",
+                                    None,
+                                ),
+                        );
+                        Ty::Int
+                    }
+                },
+            })
             .collect();
-        let ret = function.ret.as_ref().map(|ty| {
-            let resolved = resolve_type(declared, ty, errors).unwrap_or(Ty::Int);
-            // An array lives in the frame of the function that declared it, so
-            // returning one would hand back an address to room that is about to
-            // be reused. Refusing outright is what makes passing one *safe*:
-            // an array reference can be borrowed but never kept.
-            if !resolved.fits_in_a_register() {
-                errors.push(
-                    Diagnostic::new(
-                        format!("`{}` cannot return an array", function.name),
-                        ty.span,
-                    )
-                    .with_label("an array lives in the frame of the function that made it")
-                    .with_note(
-                        "pass one in to be filled instead; that address cannot outlive its array",
-                        None,
-                    ),
-                );
-            }
-            resolved
-        });
+        // An aggregate does not come back in a register: the caller reserves
+        // the room and hands its address in, so the callee copies into what the
+        // caller already owns. Nothing escapes, and the hidden argument costs
+        // one of the registers the count below is about.
+        let ret = function
+            .ret
+            .as_ref()
+            .map(|ty| resolve_type(declared, ty, errors).unwrap_or(Ty::Int));
 
-        signatures.insert(
-            function.name.clone(),
-            Signature { params, ret, name_span: function.name_span },
-        );
+        let signature = Signature { params, ret, name_span: function.name_span };
+        match owner {
+            Some(_) => method_signatures.insert(at, signature),
+            None => signatures.insert(function.name.clone(), signature),
+        };
     }
 
     signatures
@@ -405,7 +719,11 @@ fn check_entry_point(
         errors.push(
             Diagnostic::new(
                 format!("`{ENTRY_POINT}` must not take parameters"),
-                first.ty.span.to(decl.params[decl.params.len() - 1].name_span),
+                first
+                    .ty
+                    .as_ref()
+                    .map_or(first.name_span, |ty| ty.span)
+                    .to(decl.params[decl.params.len() - 1].name_span),
             )
             .with_label("the runtime calls it with no arguments"),
         );
@@ -525,6 +843,9 @@ struct Checker<'a> {
 /// created and dropped with the body they describe.
 struct FnChecker<'a, 'c> {
     shared: &'c mut Checker<'a>,
+    /// Where this function sits in the program, which is how its signature is
+    /// found whether it is a method or not.
+    at: usize,
     /// Return type of this function, and where it was written.
     ret: Option<Ty>,
     ret_span: Span,
@@ -541,12 +862,16 @@ struct FnChecker<'a, 'c> {
 }
 
 impl<'a, 'c> FnChecker<'a, 'c> {
-    fn new(shared: &'c mut Checker<'a>, function: &FnDecl) -> FnChecker<'a, 'c> {
+    /// `at` is the function's place in the program, which is how a method is
+    /// reached: its signature lives in its class rather than in the program's
+    /// namespace, and only the position identifies it either way.
+    fn new(shared: &'c mut Checker<'a>, at: usize, function: &FnDecl) -> FnChecker<'a, 'c> {
         // Pass 1 resolved this already; re-resolving would report an unknown
         // return type a second time.
-        let ret = shared.signatures[&function.name].ret;
+        let ret = shared.types.fn_ret[at];
         FnChecker {
             shared,
+            at,
             ret,
             ret_span: function.ret_span,
             scopes: Vec::new(),
@@ -628,7 +953,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         // name at the top level of the body is a redeclaration, not a shadow.
         self.scopes.push(HashMap::new());
         // Pass 1 resolved these too, and reported any that named nothing.
-        let params = self.shared.signatures[&function.name].params.clone();
+        let params = self.shared.types.fn_params[self.at].clone();
         for (param, ty) in function.params.iter().zip(params) {
             self.declare(&param.name, ty, param.name_span, "a parameter");
         }
@@ -678,10 +1003,11 @@ impl<'a, 'c> FnChecker<'a, 'c> {
 
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Decl { ty, name, name_span, init } => {
+            Stmt::Decl { id, ty, name, name_span, init } => {
                 let declared = self.resolve(ty);
+                self.record(*id, declared);
                 let actual = self.expr(init);
-                if actual != declared {
+                if !self.coerces(actual, declared) {
                     self.error(
                         Diagnostic::new(
                             format!(
@@ -751,8 +1077,14 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             // returns nothing is exactly as welcome as one that returns a value.
             // The type still goes in the table: every expression node has an
             // entry, and a hole here would be a trap for whoever reads one next.
+            // Either kind of call may be written for its effect, and both
+            // accept a callee that produces nothing.
             Stmt::Call(call) => {
-                let ty = self.call(call, true).unwrap_or(Ty::Int);
+                let ty = match call.kind {
+                    ExprKind::MethodCall { .. } => self.method_call(call, true),
+                    _ => self.call(call, true),
+                };
+                let ty = ty.unwrap_or(Ty::Int);
                 self.record(call.id, ty);
             }
         }
@@ -909,17 +1241,17 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         self.match_value(span, arms, as_statement)
     }
 
-    /// Check `x = value` and `xs[i] = value`.
+    /// Check `x = value`, `xs[i] = value` and `p.f = value`.
     ///
-    /// The two differ only in what type the target has: a variable's own, or
-    /// the element type of the array it names. Everything else — that the name
-    /// exists, that the value agrees — is the same question asked once.
+    /// The three differ only in what type the target has, which is what
+    /// [`Self::place_type`] works out. Everything after that — the name exists,
+    /// the value agrees — is the same question asked once.
     fn assign(&mut self, target: &Place, value: &Expr) {
-        // The target is looked up *before* the value is checked, so that
+        // The root is looked up *before* the value is checked, so that
         // `y = y + 1` reports the assignment rather than the use inside it.
-        let (name, name_span) = (target.name().to_string(), target.name_span());
-        let declared = self.lookup(&name);
-        if declared.is_none() {
+        let (name, name_span) = target.root();
+        let (name, root) = (name.to_string(), self.lookup(name));
+        if root.is_none() {
             let reported = name.clone();
             self.report_undeclared(&name, || {
                 Diagnostic::new(format!("undeclared variable `{reported}`"), name_span)
@@ -930,35 +1262,29 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     )
             });
         }
-
-        // What the assignment must produce: the whole variable's type, or one
-        // element of it.
-        let expected = match target {
-            Place::Var { .. } => declared,
-            Place::Element { index, .. } => {
-                let element = declared.and_then(|(ty, span)| {
-                    self.element_type(ty, span, &name, name_span).map(|elem| (elem, span))
-                });
-                self.index(declared.map(|(ty, _)| ty), index);
-                element
-            }
+        let Some((_, declared_span)) = root else {
+            self.expr(value);
+            return;
         };
 
+        let expected = self.place_type(target);
         let actual = self.expr(value);
         // A variable keeps the type it was declared with. An undeclared one has
         // no type to disagree with, and was reported above.
-        if let Some((expected, declared_span)) = expected
-            && actual != expected
+        if let Some(expected) = expected
+            && !self.coerces(actual, expected)
         {
+            let noun = match target {
+                Place::Var { .. } => "variable",
+                Place::Element { .. } => "element",
+                Place::Field { .. } => "field",
+            };
             self.error(
                 Diagnostic::new(
                     format!(
-                        "cannot assign {} value to {}",
+                        "cannot assign {} value to {} {noun}",
                         self.ty_article(actual),
-                        match target {
-                            Place::Var { .. } => format!("{} variable", self.ty_article(expected)),
-                            Place::Element { .. } => format!("{} element", self.ty_article(expected)),
-                        }
+                        self.ty_article(expected)
                     ),
                     value.span,
                 )
@@ -970,6 +1296,93 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 .with_note(format!("`{name}` was declared here"), Some(declared_span)),
             );
         }
+    }
+
+    /// The type a place names, or `None` when the chain to it does not hold up.
+    ///
+    /// Reached by walking outward from the variable at the root, so an index or
+    /// a field is checked against what actually precedes it rather than against
+    /// what the whole chain was hoped to be.
+    fn place_type(&mut self, place: &Place) -> Option<Ty> {
+        match place {
+            Place::Var { name, .. } => self.lookup(name).map(|(ty, _)| ty),
+            Place::Element { base, index, .. } => {
+                let of = self.place_type(base)?;
+                let (name, at) = base.root();
+                let (name, at) = (name.to_string(), at);
+                let element = self.element_type(of, at, &name, base.span());
+                self.index(Some(of), index);
+                element
+            }
+            Place::Field { base, name, name_span } => {
+                let of = self.place_type(base)?;
+                self.field_type(of, name, *name_span)
+            }
+        }
+    }
+
+    /// Whether a value of `from` may be used where `to` is wanted — equality,
+    /// widened by the one rule that lets a subclass stand for its base.
+    fn coerces(&self, from: Ty, to: Ty) -> bool {
+        self.shared.declared.table.coerces(from, to)
+    }
+
+    /// The one type two values can *both* be seen as, if there is one.
+    ///
+    /// Equality answers it for everything but classes, where the answer is
+    /// their nearest common ancestor: a `Circle` and a `Rect` are both a
+    /// `Shape`. This is what lets several things be collected together without
+    /// the first one deciding for the rest.
+    ///
+    /// Deliberately not applied to arrays, which stay invariant — a
+    /// `Circle[3]` is not a `Shape[3]`, because writing a `Rect` through the
+    /// second would put one in the first.
+    fn join(&self, a: Ty, b: Ty) -> Option<Ty> {
+        if a == b {
+            return Some(a);
+        }
+        let (Ty::Class(x), Ty::Class(y)) = (a, b) else { return None };
+        let table = &self.shared.declared.table;
+        let mut at = Some(x);
+        while let Some(id) = at {
+            if table.descends_from(y, id) {
+                return Some(Ty::Class(id));
+            }
+            at = table.class(id).base;
+        }
+        None
+    }
+
+    /// The type of `object.name`, or `None` when there is no such field —
+    /// reported here.
+    fn field_type(&mut self, object: Ty, name: &str, at: Span) -> Option<Ty> {
+        let Ty::Class(id) = object else {
+            self.error(
+                Diagnostic::new(
+                    format!("cannot read a field of {}", self.ty_article(object)),
+                    at,
+                )
+                .with_label("only an object has fields"),
+            );
+            return None;
+        };
+
+        let class = self.shared.declared.class(id);
+        if let Some(field) = class.field(name) {
+            return Some(field.ty);
+        }
+        let known: Vec<&str> = class.fields.iter().map(|f| f.name.as_str()).collect();
+        let note = match known.is_empty() {
+            true => format!("`{}` has no fields", class.name),
+            false => format!("`{}` has {}", class.name, list(&known)),
+        };
+        let class = class.name.clone();
+        self.error(
+            Diagnostic::new(format!("`{class}` has no field `{name}`"), at)
+                .with_label("not one of its fields")
+                .with_note(note, None),
+        );
+        None
     }
 
     /// Check `[1, 2, 3]` and answer the array type it has.
@@ -987,16 +1400,18 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             return Ty::Int;
         }
 
-        // The first element sets the type, and is where a disagreement points
-        // back to — the same rule a `match`'s arms follow.
-        let first = self.expr(&elements[0]);
+        // The elements settle the type between them rather than the first one
+        // deciding for the rest: several classes of one hierarchy join at their
+        // common ancestor, which is what makes a mixed array possible at all.
+        let mut first = self.expr(&elements[0]);
         for element in &elements[1..] {
             let ty = self.expr(element);
-            if ty != first {
-                self.error(
+            match self.join(first, ty) {
+                Some(joined) => first = joined,
+                None => self.error(
                     Diagnostic::new(
                         format!(
-                            "this element is {}, but the first is {}",
+                            "this element is {}, but the ones before it are {}",
                             self.ty_article(ty),
                             self.ty_article(first)
                         ),
@@ -1008,11 +1423,14 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         self.ty_name(ty)
                     ))
                     .with_note("every element of an array has to agree", Some(elements[0].span)),
-                );
+                ),
             }
         }
 
-        if !first.fits_in_a_register() {
+        // An object element is fine — it takes its hierarchy's room, and the
+        // index arithmetic scales by that instead of by eight. An array element
+        // is not: nothing yet says how long the inner one is.
+        if matches!(first, Ty::Array(_)) {
             // Pointed at the whole literal rather than at one element: what
             // follows is a declaration complaining that the type it got is not
             // the type it wanted, and the two sort together with the real
@@ -1022,7 +1440,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     format!("cannot make an array of {}", self.ty_article(first)),
                     span,
                 )
-                .with_label("an array's elements are single values")
+                .with_label("an array's elements may not themselves be arrays")
                 .with_note("arrays do not nest yet", None),
             );
             return Ty::Int;
@@ -1038,24 +1456,207 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         self.shared.declared.array_of(first, elements.len() as u32)
     }
 
-    /// The element type of what a name holds, or `None` when it is not an array
-    /// — reported here, because indexing something that is not one is the
-    /// mistake worth naming.
+    /// The element type of an array, or `None` when it is not one — reported
+    /// here, because indexing something without elements is the mistake worth
+    /// naming.
     fn element_type(&mut self, ty: Ty, declared_span: Span, name: &str, at: Span) -> Option<Ty> {
         match ty {
             Ty::Array(id) => Some(self.shared.declared.table.array(id).elem),
             other => {
-                self.error(
-                    Diagnostic::new(
-                        format!("cannot index {}", self.ty_article(other)),
-                        at,
-                    )
-                    .with_label("only an array has elements")
-                    .with_note(format!("`{name}` was declared here"), Some(declared_span)),
-                );
+                let mut diagnostic =
+                    Diagnostic::new(format!("cannot index {}", self.ty_article(other)), at)
+                        .with_label("only an array has elements");
+                if !name.is_empty() {
+                    diagnostic = diagnostic
+                        .with_note(format!("`{name}` was declared here"), Some(declared_span));
+                }
+                self.error(diagnostic);
                 None
             }
         }
+    }
+
+    /// Check `Circle { r: 5 }` and answer the class's type.
+    ///
+    /// Every field must be named exactly once, so there is no partial object
+    /// and no default: a value of a class type is complete from the moment it
+    /// exists, which is what removes the question `null` would answer.
+    fn object_literal(
+        &mut self,
+        class: &str,
+        class_span: Span,
+        fields: &[FieldInit],
+        span: Span,
+    ) -> Ty {
+        let Some(id) = self.shared.declared.class_id(class) else {
+            self.error(
+                Diagnostic::new(format!("unknown class `{class}`"), class_span)
+                    .with_label("no class goes by this name"),
+            );
+            for field in fields {
+                self.expr(&field.value);
+            }
+            return Ty::Int;
+        };
+
+        let declared = self.shared.declared.class(id).fields.clone();
+        let mut given: Vec<Option<Span>> = vec![None; declared.len()];
+        // A field that named nothing leaves a hole that is not the program's
+        // real mistake — `Circle { q: 1 }` is a misspelt `r`, not a forgotten
+        // one — and the derived complaint sorts ahead of the true one.
+        let mut readable = true;
+
+        for field in fields {
+            let actual = self.expr(&field.value);
+            let Some(at) = declared.iter().position(|f| f.name == field.name) else {
+                readable = false;
+                let known: Vec<&str> = declared.iter().map(|f| f.name.as_str()).collect();
+                let note = match known.is_empty() {
+                    true => format!("`{class}` has no fields"),
+                    false => format!("`{class}` has {}", list(&known)),
+                };
+                self.error(
+                    Diagnostic::new(format!("`{class}` has no field `{}`", field.name), field.name_span)
+                        .with_label("not one of its fields")
+                        .with_note(note, None),
+                );
+                continue;
+            };
+
+            if let Some(previous) = given[at] {
+                self.error(
+                    Diagnostic::new(format!("`{}` is given twice", field.name), field.name_span)
+                        .with_label("a field takes one value")
+                        .with_note("given here", Some(previous)),
+                );
+                continue;
+            }
+            given[at] = Some(field.name_span);
+
+            let expected = declared[at].ty;
+            if !self.coerces(actual, expected) {
+                self.error(
+                    Diagnostic::new(
+                        format!(
+                            "cannot give {} value to {} field",
+                            self.ty_article(actual),
+                            self.ty_article(expected)
+                        ),
+                        field.value.span,
+                    )
+                    .with_label(format!(
+                        "expected {}, found {}",
+                        self.ty_name(expected),
+                        self.ty_name(actual)
+                    )),
+                );
+            }
+        }
+
+        let missing: Vec<&str> = declared
+            .iter()
+            .zip(&given)
+            .filter(|(_, seen)| seen.is_none())
+            .map(|(field, _)| field.name.as_str())
+            .collect();
+        if !missing.is_empty() && readable {
+            self.error(
+                Diagnostic::new(format!("this `{class}` is missing a field"), span)
+                    .with_label(format!("{} not given", missing_verb(&missing)))
+                    .with_note(
+                        "an object is complete or it does not exist; there is no default value",
+                        None,
+                    ),
+            );
+        }
+        Ty::Class(id)
+    }
+
+    /// Check `receiver.method(args)` and answer the type it produces.
+    ///
+    /// `as_statement` says whether producing nothing is acceptable here, the
+    /// same question [`Self::call`] asks of a `void` function.
+    fn method_call(&mut self, expr: &Expr, as_statement: bool) -> Option<Ty> {
+        let ExprKind::MethodCall { receiver, name, name_span, args } = &expr.kind else {
+            unreachable!("the caller matched a method call");
+        };
+
+        let of = self.expr(receiver);
+        // Arguments are checked whatever the receiver turns out to be, so their
+        // own mistakes are reported either way.
+        let actual: Vec<Ty> = args.iter().map(|arg| self.expr(arg)).collect();
+
+        let Ty::Class(id) = of else {
+            self.error(
+                Diagnostic::new(
+                    format!("cannot call a method on {}", self.ty_article(of)),
+                    *name_span,
+                )
+                .with_label("only an object has methods"),
+            );
+            return Some(Ty::Int);
+        };
+
+        let class = self.shared.declared.class(id);
+        let Some(method) = class.method(name) else {
+            let known: Vec<&str> = class.methods.iter().map(|m| m.name.as_str()).collect();
+            let note = match known.is_empty() {
+                true => format!("`{}` has no methods", class.name),
+                false => format!("`{}` has {}", class.name, list(&known)),
+            };
+            let class = class.name.clone();
+            self.error(
+                Diagnostic::new(format!("`{class}` has no method `{name}`"), *name_span)
+                    .with_label("not one of its methods")
+                    .with_note(note, None),
+            );
+            return Some(Ty::Int);
+        };
+
+        // The receiver is parameter zero, so the written arguments line up with
+        // everything after it.
+        let (expected, ret) = (method.params[1..].to_vec(), method.ret);
+        if expected.len() != args.len() {
+            self.error(
+                Diagnostic::new(
+                    format!(
+                        "`{name}` takes {}, but {} supplied",
+                        plural(expected.len(), "argument"),
+                        plural(args.len(), "was")
+                    ),
+                    expr.span,
+                )
+                .with_label(format!("expected {} here", plural(expected.len(), "argument"))),
+            );
+        } else {
+            for ((want, found), arg) in expected.iter().zip(&actual).zip(args) {
+                if !self.coerces(*found, *want) {
+                    self.error(
+                        Diagnostic::new(
+                            format!(
+                                "cannot pass {} value where {} is expected",
+                                self.ty_article(*found),
+                                self.ty_article(*want)
+                            ),
+                            arg.span,
+                        )
+                        .with_label(format!(
+                            "expected {}, found {}",
+                            self.ty_name(*want),
+                            self.ty_name(*found)
+                        )),
+                    );
+                }
+            }
+        }
+
+        if ret.is_none() && !as_statement {
+            self.error(
+                Diagnostic::new(format!("`{name}` returns nothing"), expr.span)
+                    .with_label("so this call produces no value to use"),
+            );
+        }
+        ret
     }
 
     /// Check an index expression: it must be an `int`, and when it is a
@@ -1273,7 +1874,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         match (self.ret, value) {
             (Some(expected), Some(expr)) => {
                 let actual = self.expr(expr);
-                if actual != expected {
+                if !self.coerces(actual, expected) {
                     self.error(
                         Diagnostic::new(
                             format!(
@@ -1353,7 +1954,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             );
         } else {
             for ((expected, found), arg) in params.iter().zip(&actual).zip(args) {
-                if expected != found {
+                if !self.coerces(*found, *expected) {
                     self.error(
                         Diagnostic::new(
                             format!(
@@ -1527,44 +2128,35 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 self.variant(enum_name, *enum_span, variant, *variant_span)
             }
             ExprKind::Array { elements, span } => self.array_literal(elements, *span),
-            ExprKind::Index { array, name_span, index } => {
-                let declared = self.lookup(array);
-                if declared.is_none() {
-                    let (name, at) = (array.clone(), *name_span);
-                    self.report_undeclared(&name, || {
-                        Diagnostic::new(format!("undeclared variable `{name}`"), at)
-                            .with_label("not declared anywhere above this point")
-                    });
-                }
-                let element = declared.and_then(|(ty, span)| {
-                    self.element_type(ty, span, array, *name_span)
-                });
-                self.index(declared.map(|(ty, _)| ty), index);
+            ExprKind::Index { array, index } => {
+                let of = self.expr(array);
+                let element = self.element_type(of, array.span, "", array.span);
+                self.index(Some(of), index);
                 element.unwrap_or(Ty::Int)
             }
-            ExprKind::Len { array, name_span } => {
+            ExprKind::Len { array, span } => {
                 // The answer is a fact about the *type*, so the only thing to
-                // check is that the name has one with a length.
-                match self.lookup(array) {
-                    Some((Ty::Array(_), _)) => {}
-                    Some((other, declared_span)) => self.error(
+                // check is that what was given has one with a length.
+                let of = self.expr(array);
+                if !matches!(of, Ty::Array(_)) {
+                    self.error(
                         Diagnostic::new(
-                            format!("`len` needs an array, but `{array}` is {}", self.ty_article(other)),
-                            *name_span,
+                            format!("`len` needs an array, but this is {}", self.ty_article(of)),
+                            *span,
                         )
-                        .with_label("only an array has a length")
-                        .with_note(format!("`{array}` was declared here"), Some(declared_span)),
-                    ),
-                    None => {
-                        let (name, at) = (array.clone(), *name_span);
-                        self.report_undeclared(&name, || {
-                            Diagnostic::new(format!("undeclared variable `{name}`"), at)
-                                .with_label("not declared anywhere above this point")
-                        });
-                    }
+                        .with_label("only an array has a length"),
+                    );
                 }
                 Ty::Int
             }
+            ExprKind::New { class, class_span, fields, span } => {
+                self.object_literal(class, *class_span, fields, *span)
+            }
+            ExprKind::Field { object, name, name_span } => {
+                let of = self.expr(object);
+                self.field_type(of, name, *name_span).unwrap_or(Ty::Int)
+            }
+            ExprKind::MethodCall { .. } => self.method_call(expr, false).unwrap_or(Ty::Int),
             // A call in expression position must produce a value; `Int` is the
             // recovery type when it does not.
             ExprKind::Call { .. } => self.call(expr, false).unwrap_or(Ty::Int),
@@ -1979,6 +2571,229 @@ mod tests {
         assert_eq!(errors_in_main("print(a);\nprint(b);").len(), 2);
     }
 
+    // -- classes -----------------------------------------------------------
+
+    /// A `Shape`/`Circle` hierarchy and a `main`, so the tests about classes
+    /// stay about classes.
+    fn check_shapes(body: &str) -> Result<Types> {
+        check_src(&format!(
+            "class Shape {{\n  fn area(self) -> int {{ return 0; }}\n}}\n\
+             class Circle : Shape {{\n  int r;\n  \
+             fn area(self) -> int {{ return 3 * self.r * self.r; }}\n}}\n\
+             fn main() {{\n{body}\n}}\n"
+        ))
+    }
+
+    fn shape_errors(body: &str) -> Vec<Diagnostic> {
+        check_shapes(body).unwrap_err()
+    }
+
+    #[test]
+    fn accepts_a_class_built_read_and_dispatched_on() {
+        assert!(
+            check_src(
+                "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+                 class Circle : Shape {\n  int r;\n  \
+                 fn area(self) -> int { return 3 * self.r * self.r; }\n}\n\
+                 fn report(Shape s) {\n  print(s.area());\n}\n\
+                 fn main() {\n  Circle c = Circle { r: 5 };\n  report(c);\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_subclass_may_stand_for_its_base_but_not_the_other_way() {
+        // The one widening in the language, and it only goes one way: every
+        // `Circle` is a `Shape`, and no `Shape` is known to be a `Circle`.
+        assert!(check_shapes("Circle c = Circle { r: 1 };\nShape s = c;").is_ok());
+        let errors = check_src(
+            "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+             class Circle : Shape {\n  int r;\n  \
+             fn area(self) -> int { return self.r; }\n}\n\
+             fn take(Circle c) {\n}\n\
+             fn main() {\n  Shape s = Circle { r: 1 };\n  take(s);\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("cannot pass"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_field_is_read_and_written_through_the_object() {
+        assert!(
+            check_shapes("Circle c = Circle { r: 1 };\nc.r = 2;\nprint(c.r);").is_ok()
+        );
+        assert!(shape_errors("Circle c = Circle { r: 1 };\nc.r = true;")[0]
+            .message
+            .contains("cannot assign"));
+    }
+
+    #[test]
+    fn rejects_an_unknown_field_or_method_and_lists_the_real_ones() {
+        let errors = shape_errors("Circle c = Circle { r: 1 };\nprint(c.nope);");
+        assert!(errors[0].message.contains("has no field `nope`"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().unwrap().0.contains("`r`"), "{errors:#?}");
+
+        let errors = shape_errors("Circle c = Circle { r: 1 };\nc.zap();");
+        assert!(errors[0].message.contains("has no method `zap`"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().unwrap().0.contains("`area`"), "{errors:#?}");
+    }
+
+    #[test]
+    fn an_object_is_complete_or_it_does_not_exist() {
+        // No default and no partial object, which is what removes the question
+        // `null` would have answered.
+        let errors = shape_errors("Circle c = Circle { };");
+        assert!(errors[0].message.contains("missing a field"), "{}", errors[0].message);
+        assert!(shape_errors("Circle c = Circle { r: 1, r: 2 };")[0]
+            .message
+            .contains("is given twice"));
+        assert!(shape_errors("Circle c = Circle { q: 1 };")[0].message.contains("has no field `q`"));
+    }
+
+    #[test]
+    fn an_inherited_field_is_named_in_the_literal_too() {
+        assert!(
+            check_src(
+                "class Base {\n  int a;\n}\nclass Derived : Base {\n  int b;\n}\n\
+                 fn main() {\n  Derived d = Derived { a: 1, b: 2 };\n  print(d.a + d.b);\n}"
+            )
+            .is_ok()
+        );
+        let errors = check_src(
+            "class Base {\n  int a;\n}\nclass Derived : Base {\n  int b;\n}\n\
+             fn main() {\n  Derived d = Derived { b: 2 };\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("missing a field"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_base_class_is_laid_out_before_what_extends_it() {
+        // Which is what makes the upcast free, and what a subclass's field
+        // offsets depend on — so a derived class declared *before* its base
+        // still has to come out right.
+        assert!(
+            check_src(
+                "class Derived : Base {\n  int b;\n}\nclass Base {\n  int a;\n}\n\
+                 fn main() {\n  Derived d = Derived { a: 1, b: 2 };\n  print(d.a);\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_a_class_that_is_its_own_ancestor() {
+        for src in [
+            "class A : A {\n}\nfn main() {\n}",
+            "class A : B {\n}\nclass B : A {\n}\nfn main() {\n}",
+        ] {
+            let errors = check_src(src).unwrap_err();
+            assert!(errors[0].message.contains("inherits from itself"), "{src}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_base_and_a_duplicate_class() {
+        assert!(
+            check_src("class A : Nope {\n}\nfn main() {\n}").unwrap_err()[0]
+                .message
+                .contains("unknown class `Nope`")
+        );
+        let errors = check_src("class A {\n}\nclass A {\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("already declared"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().unwrap().1.is_some());
+    }
+
+    #[test]
+    fn a_field_may_not_be_named_twice_base_included() {
+        let errors = check_src("class A {\n  int x;\n  int x;\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("already has a field"), "{}", errors[0].message);
+        let errors =
+            check_src("class A {\n  int x;\n}\nclass B : A {\n  int x;\n}\nfn main() {\n}")
+                .unwrap_err();
+        assert!(errors[0].message.contains("already has a field"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn an_override_has_to_match_what_it_overrides() {
+        let errors = check_src(
+            "class A {\n  fn f(self) -> int { return 1; }\n}\n\
+             class B : A {\n  fn f(self) -> string { return \"x\"; }\n}\nfn main() {\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("does not match"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn two_classes_may_both_have_a_method_of_the_same_name() {
+        // A method's name lives in its class, not in the program.
+        assert!(
+            check_src(
+                "class A {\n  fn go(self) -> int { return 1; }\n}\n\
+                 class B {\n  fn go(self) -> int { return 2; }\n}\n\
+                 fn go() -> int {\n  return 3;\n}\n\
+                 fn main() {\n  A a = A { };\n  print(a.go() + go());\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_self_where_there_is_no_receiver() {
+        let errors = check_src("fn f(self) {\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("`self` outside a class"), "{}", errors[0].message);
+        let errors =
+            check_src("class A {\n  fn f(int n, self) {\n  }\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("`self` must come first"), "{}", errors[0].message);
+    }
+
+    // -- what objects are not allowed to do --------------------------------
+
+    #[test]
+    fn an_object_may_be_returned_and_may_be_any_of_its_hierarchy() {
+        assert!(
+            check_src(
+                "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+                 class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+                 fn make(int n) -> Shape {\n  return Circle { r: n };\n}\n\
+                 fn main() {\n  Shape s = make(3);\n  print(s.area());\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_printing_and_comparing_an_object() {
+        assert!(shape_errors("Circle c = Circle { r: 1 };\nprint(c);")[0]
+            .message
+            .contains("cannot print"));
+        assert!(shape_errors("Circle c = Circle { r: 1 };\nprint(c == c);")[0]
+            .message
+            .contains("cannot be compared"));
+    }
+
+    #[test]
+    fn a_field_cannot_be_an_aggregate_yet() {
+        for src in [
+            "class A {\n  int[2] xs;\n}\nfn main() {\n}",
+            "class B {\n  int x;\n}\nclass A {\n  B b;\n}\nfn main() {\n}",
+        ] {
+            let errors = check_src(src).unwrap_err();
+            assert!(errors[0].message.contains("a field cannot be"), "{src}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn rejects_a_field_or_method_on_something_that_is_not_an_object() {
+        assert!(errors_in_main("int n = 1;\nprint(n.x);")[0]
+            .message
+            .contains("cannot read a field"));
+        assert!(errors_in_main("int n = 1;\nn.f();")[0]
+            .message
+            .contains("cannot call a method"));
+    }
+
     // -- arrays ------------------------------------------------------------
 
     #[test]
@@ -2009,8 +2824,38 @@ mod tests {
     #[test]
     fn every_element_of_a_literal_has_to_agree() {
         let errors = errors_in_main("int[3] xs = [1, true, 3];");
-        assert!(errors[0].message.contains("but the first is"), "{}", errors[0].message);
+        assert!(errors[0].message.contains("but the ones before it are"), "{}", errors[0].message);
         assert!(errors[0].note.as_ref().unwrap().1.is_some(), "and points at the first");
+    }
+
+    #[test]
+    fn elements_of_one_hierarchy_settle_on_their_common_ancestor() {
+        // The first element does not decide for the rest, which is what makes
+        // a mixed collection possible at all.
+        assert!(
+            check_src(
+                "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+                 class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+                 class Rect : Shape {\n  int w;\n  fn area(self) -> int { return self.w; }\n}\n\
+                 fn main() {\n  \
+                 Shape[2] all = [Circle { r: 1 }, Rect { w: 2 }];\n  print(all[0].area());\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn arrays_stay_invariant_even_though_their_elements_widen() {
+        // A `Circle[2]` is not a `Shape[2]`: writing a `Rect` through the
+        // second would put one in the first.
+        let errors = check_src(
+            "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+             class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+             fn take(Shape[2] s) {\n}\n\
+             fn main() {\n  Circle[2] cs = [Circle { r: 1 }, Circle { r: 2 }];\n  take(cs);\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("cannot pass"), "{}", errors[0].message);
     }
 
     #[test]
@@ -2032,13 +2877,36 @@ mod tests {
     // -- what arrays are not allowed to do ---------------------------------
 
     #[test]
-    fn rejects_returning_an_array() {
-        // The whole reason passing one is safe: an address that cannot be kept
-        // cannot outlive what it points at.
-        let errors =
-            check_src("fn make() -> int[2] {\n  int[2] xs = [1, 2];\n  return xs;\n}\nfn main() {\n}")
-                .unwrap_err();
-        assert!(errors[0].message.contains("cannot return an array"), "{}", errors[0].message);
+    fn an_aggregate_may_be_returned_because_the_caller_owns_the_room() {
+        // Nothing is handed outward: the caller reserves the room and passes
+        // its address in, so the callee copies into what already belongs to it.
+        assert!(
+            check_src(
+                "fn make() -> int[2] {\n  int[2] xs = [1, 2];\n  return xs;\n}\n\
+                 fn main() {\n  int[2] ys = make();\n  print(ys[0]);\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_hidden_address_costs_one_of_the_argument_registers() {
+        // Four parameters is fine for a function that returns a value, and one
+        // too many for a function that returns room.
+        assert!(
+            check_src("fn f(int a, int b, int c, int d) -> int {\n  return a;\n}\nfn main() {\n}")
+                .is_ok()
+        );
+        let errors = check_src(
+            "fn f(int a, int b, int c, int d) -> int[2] {\n  int[2] xs = [1, 2];\n  \
+             return xs;\n}\nfn main() {\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("at most 3 are supported"), "{}", errors[0].message);
+        assert!(
+            errors[0].note.as_ref().unwrap().0.contains("carries the address"),
+            "{errors:#?}"
+        );
     }
 
     #[test]

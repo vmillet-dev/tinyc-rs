@@ -1,0 +1,17 @@
+class Shape {
+  fn area(self) -> int { return 0; }
+}
+
+class Circle : Shape {
+  int r;
+  fn area(self) -> int { return self.r; }
+}
+
+fn precise(Circle c) -> int {
+  return c.r;
+}
+
+fn main() {
+  Shape s = Circle { r: 1 };
+  print(precise(s));
+}

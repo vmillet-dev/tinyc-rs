@@ -27,7 +27,7 @@ use tinyc::codegen::Target;
 
 /// Programs that must keep printing exactly what `examples/expected/<name>.txt`
 /// says, and the source of truth for what a working TinyC program looks like.
-const EXAMPLES: [&str; 9] = [
+const EXAMPLES: [&str; 10] = [
     "hello.tc",
     "arith.tc",
     "spill.tc",
@@ -37,6 +37,7 @@ const EXAMPLES: [&str; 9] = [
     "functions.tc",
     "enums.tc",
     "arrays.tc",
+    "classes.tc",
 ];
 
 #[test]
@@ -254,6 +255,117 @@ fn short_circuits_and_loop_jumps_do_what_they_promise() {
         std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
 
         let run = tools.build_and_run(&source, &format!("logic{index}"));
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
+}
+
+/// Objects: the layout, the dispatch, and the upcast that makes them useful.
+///
+/// Getting a field offset or a vtable slot wrong produces a plausible number
+/// rather than a crash, so running the thing is the only check that catches it.
+#[test]
+fn objects_dispatch_on_what_they_are() {
+    let Some(tools) = Tools::find() else { return };
+
+    let prelude = "class Shape {\n  fn area(self) -> int { return 0; }\n  \
+                   fn name(self) -> string { return \"shape\"; }\n}\n\
+                   class Circle : Shape {\n  int r;\n  \
+                   fn area(self) -> int { return 3 * self.r * self.r; }\n}\n\
+                   class Rect : Shape {\n  int w;\n  int h;\n  \
+                   fn area(self) -> int { return self.w * self.h; }\n  \
+                   fn name(self) -> string { return \"rect\"; }\n}\n\
+                   fn report(Shape s) -> int {\n  return s.area();\n}\n\
+                   fn label(Shape s) -> string {\n  return s.name();\n}\n";
+    let cases: [(&str, &str); 8] = [
+        // The request's own example.
+        ("Circle c = Circle { r: 5 };\nprint(report(c));", "75"),
+        // A second subclass through the same parameter, so the dispatch really
+        // depends on the object and not on where it was written.
+        ("Rect r = Rect { w: 4, h: 6 };\nprint(report(r));", "24"),
+        // A method the subclass does *not* override still reaches the base's.
+        ("Circle c = Circle { r: 1 };\nprint(label(c));", "shape"),
+        ("Rect r = Rect { w: 1, h: 1 };\nprint(label(r));", "rect"),
+        // Fields, read and written through the object.
+        ("Rect r = Rect { w: 4, h: 6 };\nr.w = 10;\nprint(r.area());", "60"),
+        // A field declared by the base and one by the subclass do not overlap.
+        ("Rect r = Rect { h: 7, w: 3 };\nprint(r.w * 100 + r.h);", "307"),
+        // Two objects at once, so their frame regions must stay apart.
+        (
+            "Circle a = Circle { r: 2 };\nRect b = Rect { w: 5, h: 5 };\n\
+             a.r = 3;\nprint(a.area() + b.area());",
+            "52",
+        ),
+        // A direct call on a sealed class: `Rect` has no subclasses, so this is
+        // the devirtualised path rather than the vtable one.
+        ("Rect r = Rect { w: 3, h: 3 };\nprint(r.area());", "9"),
+    ];
+
+    for (index, (body, expected)) in cases.iter().enumerate() {
+        let source = tools.scratch.join(format!("object{index}.tc"));
+        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
+
+        let run = tools.build_and_run(&source, &format!("object{index}"));
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
+}
+
+/// The three things a polymorphic value could not be until aggregates gained
+/// value semantics: a local, a return, and an element.
+///
+/// Each rests on the same fact — every object of a hierarchy is given the
+/// hierarchy's room — so a copy carries the vtable pointer with it and nothing
+/// is sliced. Getting that wrong shows up as the *base* class's answer, which
+/// is a plausible number rather than a crash.
+#[test]
+fn a_polymorphic_value_keeps_what_it_is_when_it_is_copied() {
+    let Some(tools) = Tools::find() else { return };
+
+    let prelude = "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+                   class Circle : Shape {\n  int r;\n  \
+                   fn area(self) -> int { return 3 * self.r * self.r; }\n}\n\
+                   class Rect : Shape {\n  int w;\n  int h;\n  \
+                   fn area(self) -> int { return self.w * self.h; }\n}\n\
+                   fn pick(int n) -> Shape {\n  if (n == 0) {\n    return Circle { r: 5 };\n  }\n  \
+                   return Rect { w: 4, h: 6 };\n}\n";
+    let cases: [(&str, &str); 8] = [
+        // A local of the base class, holding a subclass. A slice would answer 0.
+        ("Shape s = Circle { r: 2 };\nprint(s.area());", "12"),
+        ("Shape s = Rect { w: 3, h: 5 };\nprint(s.area());", "15"),
+        // A copy, not an alias: changing the source must not change the copy.
+        (
+            "Circle c = Circle { r: 3 };\nShape t = c;\nc.r = 100;\nprint(t.area());",
+            "27",
+        ),
+        // The same for assignment rather than declaration.
+        (
+            "Shape s = Circle { r: 1 };\nCircle c = Circle { r: 4 };\ns = c;\nc.r = 100;\n\
+             print(s.area());",
+            "48",
+        ),
+        // A returned object, both branches, through the caller's own room.
+        ("print(pick(0).area());", "75"),
+        ("print(pick(1).area());", "24"),
+        // A returned object outliving the call that made it, which is the whole
+        // point of copying into the caller's room.
+        ("Shape s = pick(0);\nprint(s.area());", "75"),
+        // A heterogeneous collection: three objects of different sizes, each in
+        // a slot the size of the biggest.
+        (
+            "Shape[3] all = [Circle { r: 1 }, Rect { w: 2, h: 3 }, Circle { r: 2 }];\n\
+             int total = 0;\n\
+             for (int i = 0; i < len(all); i = i + 1) {\n  total = total + all[i].area();\n}\n\
+             print(total);",
+            "21",
+        ),
+    ];
+
+    for (index, (body, expected)) in cases.iter().enumerate() {
+        let source = tools.scratch.join(format!("poly{index}.tc"));
+        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
+
+        let run = tools.build_and_run(&source, &format!("poly{index}"));
         assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
     }

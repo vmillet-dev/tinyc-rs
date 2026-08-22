@@ -108,17 +108,19 @@ from the same library — see
 ## The language
 
 ```
-program := (enum_decl | fn_decl)*
+program := (enum_decl | class_decl | fn_decl)*
 enum    := "enum" IDENT "{" IDENT ("," IDENT)* "}"
+class   := "class" IDENT (":" IDENT)? "{" (field | fn_decl)* "}"
+field   := type IDENT ";"
 fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 params  := param ("," param)*
-param   := type IDENT
+param   := type IDENT | "self"
 type    := ("int" | "string" | "bool" | IDENT) ("[" INT "]")?
 stmt    := decl | assign | print | if | while | for | match | return
          | break | continue | call ";"
 decl    := type IDENT "=" expr ";"
 assign  := place "=" expr ";"
-place   := IDENT ("[" expr "]")?
+place   := IDENT (("[" expr "]") | ("." IDENT))*
 print   := "print" "(" expr ")" ";"
 if      := "if" "(" expr ")" block ("else" (block | if))?
 while   := "while" "(" expr ")" block
@@ -133,12 +135,14 @@ cmp     := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 sum     := term (("+" | "-") term)*
 term    := unary (("*" | "/" | "%") unary)*
 unary   := ("-" | "!") unary | primary
-primary := INT | STRING | BOOL | IDENT | variant | call | match | array
-         | index | len | "(" expr ")"
+primary := atom postfix*
+atom    := INT | STRING | BOOL | IDENT | variant | call | match | array
+         | object | len | "(" expr ")"
+postfix := "[" expr "]" | "." IDENT | "." IDENT "(" args? ")"
 variant := IDENT "::" IDENT
 array   := "[" (expr ("," expr)*)? "]"
-index   := IDENT "[" expr "]"
-len     := "len" "(" IDENT ")"
+object  := IDENT "{" (IDENT ":" expr ("," IDENT ":" expr)*)? "}"
+len     := "len" "(" expr ")"
 call    := IDENT "(" (expr ("," expr)*)? ")"
 match   := "match" "(" expr ")" "{" arm* "}"
 arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
@@ -146,7 +150,8 @@ arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
 
 `int` is a 64-bit signed integer, `string` is a pointer to static bytes, `bool`
 is `true` or `false`, an `enum` declares a type of its own with a fixed set of
-values, and `int[3]` is a fixed-length array of them. Arithmetic is `int`-only,
+values, a `class` declares one with fields and methods, and `int[3]` is a
+fixed-length array of them. Arithmetic is `int`-only,
 `&&`, `||` and `!` are `bool`-only, `//` starts a comment, and a variable keeps
 the type it was declared with — assigning a `string` to an `int` is an error.
 
@@ -158,8 +163,8 @@ than wrapping — see
 
 ### Functions
 
-A program is a list of enums and functions, with no top-level statements;
-execution starts at `main`,
+A program is a list of enums, classes and functions, with no top-level
+statements; execution starts at `main`,
 which takes no parameters and returns nothing
 ([`examples/functions.tc`](examples/functions.tc)):
 
@@ -224,6 +229,127 @@ entry0:
   3  return %t2
 ```
 
+### Classes
+
+A `class` bundles fields with the methods that work on them, and a subclass may
+stand for its base ([`examples/classes.tc`](examples/classes.tc)):
+
+```c
+class Shape {
+  fn area(self) -> int { return 0; }
+}
+
+class Circle : Shape {
+  int r;
+  fn area(self) -> int { return 3 * self.r * self.r; }
+}
+
+fn report(Shape s) {
+  print(s.area());     // 75 when handed a Circle
+}
+```
+
+**The layout is the whole design.** An object is a vtable pointer at offset 0,
+then the base's fields, then the subclass's own:
+
+```
+Circle:  [ vtable ][ (Shape has none) ][ r ]
+           0         8                   8
+```
+
+A subclass's fields are its base's plus more, at the same offsets — so a
+`Circle` **is** a `Shape` at the same address, and the upcast in `report(c)`
+costs not one instruction. The other direction is a type error: no `Shape` is
+known to be a `Circle`.
+
+Every value in TinyC is eight bytes, so a field's offset is its position and a
+field access is one `lea` with nothing to check. That is the same arithmetic an
+array index does, minus the bounds check — a field's place was settled at
+compile time and cannot be out of range.
+
+#### Dispatch decided by the object, and by the compiler when it can
+
+`s.area()` reads the object's table and calls through it:
+
+```nasm
+mov  r10, rbx        ; the receiver
+mov  r10, [r10]      ; its vtable
+mov  rcx, rbx        ; ... which is also argument zero
+call [r10+0]
+```
+
+A subclass's table is its base's with the overridden slots replaced, so slot 0
+means `area` for every `Shape` there will ever be. Nothing installs it at
+startup: the entries are known at compile time.
+
+But **a class nothing derives from is called directly.** TinyC compiles the
+whole program at once, so "nothing derives from `Point`" is a fact rather than a
+hope, and the indirection would be deciding a question with one answer. A
+separately compiled language cannot do this: someone might extend the class in
+another translation unit.
+
+#### Value semantics, and the size a hierarchy reserves
+
+Every object of a hierarchy is given room for the **biggest class in it** —
+`storage` in `ClassInfo`, alongside its own `size`, and the same number for
+every class in the hierarchy. Whole-program compilation is again what makes it
+knowable: nothing can derive from a class after the fact.
+
+That one decision is what lets a polymorphic value be a local, a return and an
+element:
+
+```c
+Shape held = c;        // room for the biggest Shape; the Circle is copied in
+c.r = 100;
+print(held.area());    // 75, not 30000 — a copy, not an alias
+```
+
+The copy carries the vtable pointer, so the value keeps answering as a `Circle`.
+**There is no slicing**, unlike C++'s value semantics — and no reference type,
+no `null` and no lifetimes either, because nothing is shared in the first place.
+
+Giving every class in a hierarchy the *same* number matters as much as the
+number itself: a smaller one for `Circle` would mean copying `storage(Shape)`
+bytes out of a `Circle`-sized object could read past the end of it.
+
+An array of them scales by that width rather than by eight, which is the one
+case where an element's address is not a single `lea` — x86 scales by 1, 2, 4
+or 8 and nothing else, so an `imul` goes in front.
+
+#### Returning one
+
+An aggregate does not come back in a register. **The caller reserves the room
+and passes its address in ahead of the written arguments**; the callee copies
+into what the caller already owns, and returns nothing at all:
+
+```
+fn make() -> Shape:
+entry0:
+  0  %out = param 0            ; the caller's room
+  ...
+  4  copy 24 bytes to %out, from %t2
+  5  return                    ; nothing is handed outward
+```
+
+So returning is as safe as passing, and for the same reason: no address ever
+travels outward, so none can dangle. The cost is one of the four argument
+registers, which `sema` accounts for — a function returning an aggregate takes
+at most three parameters, and says so when it takes four.
+
+#### What objects still may not do
+
+* **An object is complete or it does not exist.** Every field is named in the
+  literal, inherited ones included; there is no default and no partial object,
+  which is what removes the question `null` would have answered.
+* **No printing and no comparing.** `print` takes one value, and comparing
+  addresses would quietly answer a different question.
+* **A field may not be an array or another object**, which keeps every offset a
+  multiple of eight.
+* **Arrays stay invariant.** A `Circle[2]` is not a `Shape[2]`, because writing
+  a `Rect` through the second would put one in the first. What *is* allowed is
+  building a `Shape[2]` directly: an array literal takes the nearest common
+  ancestor of its elements rather than letting the first one decide.
+
 ### Arrays
 
 The **length is part of the type**, so `int[3]` and `int[4]` are different types
@@ -263,19 +389,13 @@ lea  r12, [rbx+rdi*8]
 `len(xs)` is a fact about the type, so it folds to a literal: the loop above
 compares against `5`, and nothing computes it.
 
-**Arrays may be passed to a function but never returned from one.** That pair of
-rules is what makes passing one by address *safe* rather than a way to make a
-dangling pointer. An array lives in the frame of the function that declared it,
-so returning one would hand back room about to be reused — and since there is no
-pointer type, no globals, and no nesting, an address a callee receives has
-nowhere to be kept. It cannot outlive what it points at.
-
-```
-error: `make` cannot return an array
-1 | fn make() -> int[3] {
-  |              ^^^^^^ an array lives in the frame of the function that made it
-  = note: pass one in to be filled instead; that address cannot outlive its array
-```
+**An array is passed by address and returned by copy.** A parameter borrows the
+caller's own array — there is no pointer type, no globals and no nesting, so an
+address a callee receives has nowhere to be kept, and cannot outlive what it
+points at. Returning one is the mirror image: the caller reserves the room and
+passes its address in, so the callee fills what already belongs to it. Nothing
+ever travels outward, which is the whole safety story in one sentence. See
+[Returning one](#returning-one), which arrays and objects share.
 
 The rest of the rules fall out of the same reasoning: an array literal's length
 is its element count and the declaration must agree with it; every element must

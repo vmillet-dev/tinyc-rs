@@ -51,7 +51,7 @@
 //! calls. Nothing this module generates is called `main`, so it is safe to leave
 //! alone.
 
-use crate::ast::{BinOp, CmpOp, EnumId, Ty};
+use crate::ast::{BinOp, ClassId, CmpOp, EnumId, Ty};
 use crate::codegen::{Allocation, Backend, Location, PhysReg, RegisterFile};
 use crate::ir::{Block, Function, Instr, Program, Terminator, VReg, Value};
 
@@ -286,13 +286,20 @@ struct Used {
     /// names emitted. An enum used only in a `match` needs none: matching is
     /// arithmetic on the tag, and never asks what the tag is called.
     enums: Vec<bool>,
+    /// Which classes are ever instantiated, and so need their method table
+    /// emitted. A class nothing builds has no objects to dispatch on.
+    vtables: Vec<bool>,
     aborts: bool,
 }
 
 impl Used {
     fn of(program: &Program) -> Used {
-        let mut used =
-            Used { formats: [false; 3], enums: vec![false; program.table.enums.len()], aborts: false };
+        let mut used = Used {
+            formats: [false; 3],
+            enums: vec![false; program.table.enums.len()],
+            vtables: vec![false; program.vtables.len()],
+            aborts: false,
+        };
         for instr in program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instrs) {
             match instr {
                 Instr::Print { ty, .. } => {
@@ -301,6 +308,7 @@ impl Used {
                         used.enums[id.0 as usize] = true;
                     }
                 }
+                Instr::VTable { class, .. } => used.vtables[class.0 as usize] = true,
                 other => used.aborts |= may_abort(other),
             }
         }
@@ -320,9 +328,14 @@ impl Used {
 fn format_index(ty: Ty) -> usize {
     match ty {
         Ty::Int => 0,
-        Ty::Str | Ty::Enum(_) | Ty::Array(_) => 1,
+        Ty::Str | Ty::Enum(_) | Ty::Array(_) | Ty::Class(_) => 1,
         Ty::Bool => 2,
     }
+}
+
+/// The label of a class's method table.
+fn vtable_label(class: ClassId) -> String {
+    format!("vtable{}", class.0)
 }
 
 /// The label of the table that maps an enum's tags to its variants' names.
@@ -403,6 +416,25 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
         asm.asm(&format!("{FMT_BOOL}: db \"%s\", 10, 0"));
         asm.asm(&format!("{BOOL_TRUE}: db \"true\", 0"));
         asm.asm(&format!("{BOOL_FALSE}: db \"false\", 0"));
+    }
+    // One method table per class that a `New` builds. Its entries are settled
+    // at compile time — a subclass's table is its base's with the overridden
+    // slots replaced — so dispatch is a load and an indirect call, and there is
+    // nothing to install at startup.
+    for (index, slots) in program.vtables.iter().enumerate() {
+        if !used.vtables[index] {
+            continue;
+        }
+        let entries: Vec<String> = slots
+            .iter()
+            .map(|&at| symbol(&program.function(at).name))
+            .collect();
+        let label = vtable_label(ClassId(index as u32));
+        match entries.is_empty() {
+            // NASM needs something to put there, and nothing will read it.
+            true => asm.asm(&format!("{label}: dq 0    ; {} has no methods", label)),
+            false => asm.asm(&format!("{label}: dq {}", entries.join(", "))),
+        }
     }
     // One table per printed enum: the variant names, and the array of pointers
     // a tag indexes. A tag can only have come from a variant of this very enum,
@@ -806,29 +838,61 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 self.asm.asm(&format!("lea  {work}, [rsp+{at}]"));
                 self.store_back(*dst, &work);
             }
+            // A field's place was settled at compile time, so this is a `lea`
+            // and nothing else — no check, because there is no question.
+            Instr::Field { dst, base, offset } => {
+                let base = self.in_register(base, SCRATCH0);
+                let work = self.work_reg(*dst, false);
+                self.asm.asm(&format!("lea  {work}, [{base}+{offset}]"));
+                self.store_back(*dst, &work);
+            }
             // `base + index * 8` is an addressing mode, so an element's address
             // is one instruction and not arithmetic — which is also why it
             // carries none of the overflow guards `Bin` does.
-            Instr::Elem { dst, base, index, len } => {
+            Instr::Elem { dst, base, index, len, scale } => {
                 let base = self.in_register(base, SCRATCH0);
                 if let Value::Const(at) = index {
                     // `sema` proved this one is in range, so it needs no check
                     // and its offset folds into the addressing mode.
                     let work = self.work_reg(*dst, false);
-                    self.asm.asm(&format!("lea  {work}, [{base}+{}]", at * 8));
+                    self.asm.asm(&format!("lea  {work}, [{base}+{}]", at * i64::from(*scale)));
                     self.store_back(*dst, &work);
+                    return;
+                }
+
+                let index = self.in_register(index, SCRATCH1);
+                // One *unsigned* comparison rules out both ends: a negative
+                // index read as unsigned is enormous, so it fails the same
+                // test that catches one past the end.
+                self.asm.asm(&format!("cmp  {index}, {len}"));
+                self.asm.asm(&format!("jae  {ABORT_BOUNDS}"));
+
+                // `lea` reads its operands before it writes, so the result may
+                // land on the base's own register.
+                let work = self.work_reg(*dst, false);
+                if matches!(scale, 1 | 2 | 4 | 8) {
+                    self.asm.asm(&format!("lea  {work}, [{base}+{index}*{scale}]"));
                 } else {
-                    let index = self.in_register(index, SCRATCH1);
-                    // One *unsigned* comparison rules out both ends: a negative
-                    // index read as unsigned is enormous, so it fails the same
-                    // test that catches one past the end.
-                    self.asm.asm(&format!("cmp  {index}, {len}"));
-                    self.asm.asm(&format!("jae  {ABORT_BOUNDS}"));
-                    // `lea` reads its operands before it writes, so the result
-                    // may land on the base's own register.
-                    let work = self.work_reg(*dst, false);
-                    self.asm.asm(&format!("lea  {work}, [{base}+{index}*8]"));
-                    self.store_back(*dst, &work);
+                    // An array of objects scales by the hierarchy's room, which
+                    // is the one width x86's addressing modes cannot express.
+                    //
+                    // The product goes to a scratch register and never to the
+                    // index's own: that one may be a variable's home, and a
+                    // loop counter multiplied by the element size is no longer
+                    // a loop counter.
+                    self.asm.asm(&format!("imul {SCRATCH1}, {index}, {scale}"));
+                    self.asm.asm(&format!("lea  {work}, [{base}+{SCRATCH1}]"));
+                }
+                self.store_back(*dst, &work);
+            }
+            // Eight bytes at a time, unrolled: the count is a multiple of eight
+            // and known here, and an object is small.
+            Instr::CopyBytes { dst, src, bytes } => {
+                let source = self.in_register(src, SCRATCH1);
+                let target = self.in_register(dst, SCRATCH0);
+                for at in (0..*bytes).step_by(8) {
+                    self.asm.asm(&format!("mov  {RAX}, [{source}+{at}]"));
+                    self.asm.asm(&format!("mov  [{target}+{at}], {RAX}"));
                 }
             }
             Instr::Load { dst, addr } => {
@@ -848,6 +912,13 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 };
                 self.asm.asm(&format!("mov  qword [{addr}], {source}"));
             }
+            // The address of a class's method table, which an object carries at
+            // offset 0 and a virtual call reads back.
+            Instr::VTable { dst, class } => {
+                let work = self.work_reg(*dst, false);
+                self.asm.asm(&format!("lea  {work}, [{}]", vtable_label(*class)));
+                self.store_back(*dst, &work);
+            }
             // No source of these moves can be an argument register, because the
             // allocator is never given one — see the module docs.
             Instr::Call { dst, callee, args } => {
@@ -857,11 +928,21 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 }
                 let callee = symbol(&self.program.function(*callee).name);
                 self.asm.asm(&format!("call {callee}"));
-                if let Some(dst) = dst {
-                    let work = self.work_reg(*dst, false);
-                    self.asm.mov(&work, RAX);
-                    self.store_back(*dst, &work);
+                self.take_result(*dst);
+            }
+            // The receiver is argument zero *and* where the target comes from,
+            // so its vtable is read before the argument registers are set up —
+            // after that its own register may already have been overwritten.
+            Instr::CallVirtual { dst, slot, receiver, args } => {
+                let receiver = self.value(receiver);
+                self.asm.mov(SCRATCH0, &receiver);
+                self.asm.asm(&format!("mov  {SCRATCH0}, [{SCRATCH0}]"));
+                for (index, arg) in args.iter().enumerate() {
+                    let src = self.value(arg);
+                    self.asm.mov(ARG_REGS[index], &src);
                 }
+                self.asm.asm(&format!("call [{SCRATCH0}+{}]", slot * 8));
+                self.take_result(*dst);
             }
             Instr::Print { ty, val } => {
                 // Load the value first: the format string is a constant, so it
@@ -888,7 +969,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 }
                 let format = match ty {
                     Ty::Int => FMT_INT,
-                    Ty::Str | Ty::Enum(_) | Ty::Array(_) => FMT_STR,
+                    Ty::Str | Ty::Enum(_) | Ty::Array(_) | Ty::Class(_) => FMT_STR,
                     Ty::Bool => FMT_BOOL,
                 };
                 self.asm.asm(&format!("lea  {RCX}, [{format}]"));
@@ -988,6 +1069,15 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             }
             Value::Const(c) => (c.to_string(), true),
             other => (self.value(other), false),
+        }
+    }
+
+    /// Move a call's answer out of `rax`, when the caller wanted one.
+    fn take_result(&mut self, dst: Option<VReg>) {
+        if let Some(dst) = dst {
+            let work = self.work_reg(dst, false);
+            self.asm.mov(&work, RAX);
+            self.store_back(dst, &work);
         }
     }
 
@@ -1380,6 +1470,53 @@ mod tests {
         assert!(asm.contains(".step"), "{asm}");
         assert!(asm.contains(".done"), "{asm}");
         assert!(asm.contains("jmp  .loop1"), "{asm}");
+    }
+
+    #[test]
+    fn a_virtual_call_reads_the_object_then_jumps_through_its_table() {
+        let asm = compile_src(
+            "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+             class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+             fn report(Shape s) {\n  print(s.area());\n}\n\
+             fn main() {\n  report(Circle { r: 1 });\n}",
+        );
+        // The table is settled at compile time; nothing installs it at startup.
+        assert!(asm.contains("vtable1: dq tc$Circle$area"), "{asm}");
+        // The vtable comes out of the object before the argument registers are
+        // set up, since one of them is about to hold the receiver.
+        assert!(asm.contains(&format!("mov  {SCRATCH0}, [{SCRATCH0}]")), "{asm}");
+        assert!(asm.contains(&format!("call [{SCRATCH0}+0]")), "{asm}");
+    }
+
+    #[test]
+    fn a_call_on_a_sealed_class_is_a_direct_one() {
+        let asm = compile_src(
+            "class Point {\n  int x;\n  fn get(self) -> int { return self.x; }\n}\n\
+             fn main() {\n  Point p = Point { x: 1 };\n  print(p.get());\n}",
+        );
+        assert!(asm.contains("call tc$Point$get"), "{asm}");
+        assert!(!asm.contains("call ["), "{asm}");
+    }
+
+    #[test]
+    fn a_field_address_is_a_lea_with_no_check() {
+        // Its place was settled by `sema`, so there is no question to ask.
+        let asm = compile_src(
+            "class Point {\n  int x;\n  int y;\n}\n\
+             fn main() {\n  Point p = Point { x: 1, y: 2 };\n  print(p.y);\n}",
+        );
+        assert!(asm.contains("+16]"), "{asm}");
+        assert!(!asm.contains(ABORT_BOUNDS), "{asm}");
+    }
+
+    #[test]
+    fn a_class_nothing_builds_gets_no_table() {
+        let asm = compile_src(
+            "class Used {\n  fn f(self) -> int { return 1; }\n}\n\
+             class Unused {\n  fn f(self) -> int { return 2; }\n}\n\
+             fn main() {\n  Used u = Used { };\n  print(u.f());\n}",
+        );
+        assert!(!asm.contains("vtable1"), "{asm}");
     }
 
     #[test]

@@ -69,13 +69,13 @@ impl<'a> Lexer<'a> {
                         _ => TokenKind::Eq,
                     }
                 }
-                ':' => self.only_doubled(':', TokenKind::ColonColon, start)?,
+                ':' => self.one_or_two(':', TokenKind::ColonColon, TokenKind::Colon),
+                '.' => self.single(TokenKind::Dot),
                 '<' => self.one_or_two('=', TokenKind::Le, TokenKind::Lt),
                 '>' => self.one_or_two('=', TokenKind::Ge, TokenKind::Gt),
                 '!' => self.one_or_two('=', TokenKind::BangEq, TokenKind::Bang),
-                // These exist only doubled: TinyC has no bitwise `&` or `|`, and
-                // nothing at all for a single `:`, for the lone character to
-                // mean instead.
+                // These two exist only doubled: TinyC has no bitwise `&` or `|`
+                // for the lone character to mean instead.
                 '&' => self.only_doubled('&', TokenKind::AmpAmp, start)?,
                 '|' => self.only_doubled('|', TokenKind::PipePipe, start)?,
                 '+' => self.single(TokenKind::Plus),
@@ -185,6 +185,7 @@ impl<'a> Lexer<'a> {
             "enum" => TokenKind::KwEnum,
             "match" => TokenKind::KwMatch,
             "len" => TokenKind::KwLen,
+            "class" => TokenKind::KwClass,
             name => TokenKind::Ident(name.to_string()),
         }
     }
@@ -431,12 +432,40 @@ mod tests {
     }
 
     #[test]
-    fn a_single_colon_is_an_error() {
-        // TinyC has no `:` of its own, so the only thing it can have meant is
-        // the qualifier.
-        let error = error("Color:Red");
-        assert!(error.message.contains("unexpected character `:`"), "{}", error.message);
-        assert!(error.label.as_deref().unwrap().contains("::"), "{:?}", error.label);
+    fn a_colon_is_doubled_only_when_it_really_is() {
+        // A single `:` introduces a base class and separates a field from its
+        // value, so the qualifier has to win only when the second one is there.
+        assert_eq!(
+            kinds("Circle : Shape"),
+            vec![
+                TokenKind::Ident("Circle".into()),
+                TokenKind::Colon,
+                TokenKind::Ident("Shape".into()),
+                TokenKind::Eof,
+            ]
+        );
+        assert_eq!(
+            kinds("a::b"),
+            vec![
+                TokenKind::Ident("a".into()),
+                TokenKind::ColonColon,
+                TokenKind::Ident("b".into()),
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn lexes_a_field_access() {
+        assert_eq!(
+            kinds("self.r"),
+            vec![
+                TokenKind::Ident("self".into()),
+                TokenKind::Dot,
+                TokenKind::Ident("r".into()),
+                TokenKind::Eof,
+            ]
+        );
     }
 
     #[test]

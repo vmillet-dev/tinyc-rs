@@ -1,0 +1,107 @@
+// Classes: data with behaviour, and one dispatch decided by the object.
+//
+// An object is a vtable pointer at offset 0 and its fields after — the base's
+// first, then the subclass's. That prefix rule is the whole design: a `Circle`
+// *is* a `Shape` at the same address, so passing one where the other is wanted
+// costs nothing at all.
+
+class Shape {
+  fn area(self) -> int {
+    return 0;
+  }
+  fn name(self) -> string {
+    return "shape";
+  }
+}
+
+class Circle : Shape {
+  int r;
+  // An override keeps its base's slot in the table, so a call through `Shape`
+  // reaches this one.
+  fn area(self) -> int {
+    return 3 * self.r * self.r;
+  }
+}
+
+class Rect : Shape {
+  int w;
+  int h;
+  fn area(self) -> int {
+    return self.w * self.h;
+  }
+  fn name(self) -> string {
+    return "rect";
+  }
+}
+
+// `Sealed` has no subclasses, and whole-program compilation is what makes that
+// knowable — so a call on one is settled at compile time rather than through a
+// table. Nothing can derive from it afterwards.
+class Sealed {
+  int n;
+  fn twice(self) -> int {
+    return self.n * 2;
+  }
+}
+
+// `s` is an address borrowed from the caller. There is no way to keep it —
+// objects are not returned, not stored in anything, and do not nest — so it
+// cannot outlive the object it points at.
+fn report(Shape s) {
+  print(s.name());
+  print(s.area());
+}
+
+// Returning one is safe for the same reason passing one is: nothing is handed
+// outward. The caller reserves the room, and this copies into it.
+fn shaped(int n) -> Shape {
+  if (n == 0) {
+    return Circle { r: 5 };
+  }
+  return Rect { w: 4, h: 6 };
+}
+
+fn main() {
+  Circle c = Circle { r: 5 };
+  Rect r = Rect { w: 4, h: 6 };
+
+  report(c);             // shape, 75 — Circle does not override `name`
+  report(r);             // rect, 24
+
+  // The same call written on the exact type, which needs no table.
+  Sealed s = Sealed { n: 21 };
+  print(s.twice());      // 42
+
+  // Fields are read and written through the object, and a field the base
+  // declared does not collide with one the subclass did.
+  r.w = 10;
+  print(r.area());       // 60
+  print(r.w + r.h);      // 16
+
+  // A subclass may stand for its base wherever one is wanted. The other
+  // direction is a type error: no `Shape` is known to be a `Circle`.
+  //
+  // A variable of the base class gets room for the *biggest* class in the
+  // hierarchy, so the assignment copies the whole `Circle` — vtable pointer
+  // included. Nothing is sliced, and this is a copy rather than an alias.
+  Shape held = c;
+  c.r = 100;
+  print(held.area());    // 75, not 30000
+
+  // An object may be returned: the caller reserves the room and passes its
+  // address in, so the callee fills what the caller already owns.
+  print(shaped(0).area());   // 75
+  print(shaped(1).area());   // 24
+
+  // ... and it outlives the call that made it, because the room was never the
+  // callee's to begin with.
+  Shape kept = shaped(0);
+  print(kept.area());        // 75
+
+  // A collection of different classes: every slot is the hierarchy's size, and
+  // each holds a whole object rather than a reference to one.
+  Shape[3] all = [Circle { r: 1 }, Rect { w: 2, h: 3 }, Circle { r: 2 }];
+  for (int i = 0; i < len(all); i = i + 1) {
+    print(all[i].area());    // 3, 6, 12
+  }
+}

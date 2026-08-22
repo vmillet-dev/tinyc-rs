@@ -1,0 +1,9 @@
+class Circle {
+  int r;
+  int stroke;
+}
+
+fn main() {
+  Circle c = Circle { r: 5 };
+  print(c.r);
+}
