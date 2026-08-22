@@ -3,12 +3,14 @@
 //! Straightforward recursive descent. The grammar is:
 //!
 //! ```text
-//! program := fn_decl*
+//! program := (enum_decl | fn_decl)*
+//! enum    := "enum" IDENT "{" IDENT ("," IDENT)* "}"
 //! fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 //! params  := param ("," param)*
 //! param   := type IDENT
-//! type    := "int" | "string" | "bool"
-//! stmt    := decl | assign | print | if | while | for | return | break | continue
+//! type    := "int" | "string" | "bool" | IDENT
+//! stmt    := decl | assign | print | if | while | for | match | return
+//!          | break | continue
 //! decl    := type IDENT "=" expr ";"
 //! assign  := IDENT "=" expr ";"
 //! print   := "print" "(" expr ")" ";"
@@ -25,12 +27,20 @@
 //! sum     := term (("+" | "-") term)*
 //! term    := unary (("*" | "/" | "%") unary)*
 //! unary   := ("-" | "!") unary | primary
-//! primary := INT | STRING | BOOL | IDENT | call | "(" expr ")"
+//! primary := INT | STRING | BOOL | IDENT | variant | call | match
+//!          | "(" expr ")"
+//! variant := IDENT "::" IDENT
 //! call    := IDENT "(" (expr ("," expr)*)? ")"
+//! match   := "match" "(" expr ")" "{" arm* "}"
+//! arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
 //! ```
+//!
+//! A `match` is a primary expression, and a statement only in the way a call is
+//! one — `stmt` reaches it through the same node.
 
 use crate::ast::{
-    BinOp, Block, CmpOp, Expr, ExprKind, FnDecl, LogicOp, NodeId, Param, Program, Stmt, Ty,
+    ArmBody, BinOp, Block, CmpOp, EnumDecl, Expr, ExprKind, FnDecl, LogicOp, MatchArm, NodeId,
+    Param, Program, Stmt, TypeRef, Variant,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
@@ -64,11 +74,14 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn run(mut self) -> PResult<Program> {
-        let mut functions = Vec::new();
+        let (mut enums, mut functions) = (Vec::new(), Vec::new());
         while !matches!(self.peek().kind, TokenKind::Eof) {
-            functions.push(self.fn_decl()?);
+            match self.peek().kind {
+                TokenKind::KwEnum => enums.push(self.enum_decl()?),
+                _ => functions.push(self.fn_decl()?),
+            }
         }
-        Ok(Program { functions, node_count: self.next_id as usize })
+        Ok(Program { enums, functions, node_count: self.next_id as usize })
     }
 
     fn peek(&self) -> &'a Token {
@@ -140,35 +153,74 @@ impl<'a> Parser<'a> {
         parsed
     }
 
-    /// The type a type keyword names, without consuming it. Answering `None`
-    /// rather than erroring is what lets a caller use this to *decide*: `stmt`
-    /// asks "does a declaration start here?", `fn_decl` asks "is there a return
-    /// type?".
-    fn type_token(&self) -> Option<Ty> {
+    /// Consume a type. `what` names the thing that needed it, so one helper can
+    /// produce "a parameter needs a type here" and "a return type needs a type
+    /// here".
+    ///
+    /// A bare identifier is accepted as a type: it may name an enum, and the
+    /// parser has no way of knowing. What it produces is therefore a
+    /// [`TypeRef`] — a name — and [`crate::sema`] is what decides whether such a
+    /// type exists.
+    fn expect_type(&mut self, what: &str) -> PResult<TypeRef> {
+        let token = self.peek();
+        let name = match &token.kind {
+            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwBool => {
+                token.kind.text().to_string()
+            }
+            TokenKind::Ident(name) => name.clone(),
+            _ => {
+                return Err(Diagnostic::new(
+                    format!("expected a type, found {}", token.kind.describe()),
+                    token.span,
+                )
+                .with_label(format!("{what} needs a type here"))
+                .with_note("the types are `int`, `string`, `bool` and any declared enum", None));
+            }
+        };
+        Ok(TypeRef { name, span: self.bump().span })
+    }
+
+    /// Whether a declaration starts at the current token.
+    ///
+    /// A type keyword settles it outright. An identifier does not: `Color c` is
+    /// a declaration, but `c = 1` and `c(1)` are not — so the deciding token is
+    /// the *second* one, and only a name can follow a type.
+    fn starts_declaration(&self) -> bool {
         match self.peek().kind {
-            TokenKind::KwInt => Some(Ty::Int),
-            TokenKind::KwString => Some(Ty::Str),
-            TokenKind::KwBool => Some(Ty::Bool),
-            _ => None,
+            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwBool => true,
+            TokenKind::Ident(_) => matches!(self.peek_at(1).kind, TokenKind::Ident(_)),
+            _ => false,
         }
     }
 
-    /// Consume a type keyword. `what` names the thing that needed it, so one
-    /// helper can produce "a parameter needs a type here" and "a return type
-    /// needs a type here".
-    fn expect_type(&mut self, what: &str) -> PResult<(Ty, Span)> {
-        match self.type_token() {
-            Some(ty) => Ok((ty, self.bump().span)),
-            None => {
-                let found = self.peek();
-                Err(Diagnostic::new(
-                    format!("expected a type, found {}", found.kind.describe()),
-                    found.span,
-                )
-                .with_label(format!("{what} needs a type here"))
-                .with_note("the types are `int`, `string` and `bool`", None))
+    /// `enum Color { Red, Green, Blue }`
+    fn enum_decl(&mut self) -> PResult<EnumDecl> {
+        self.bump(); // `enum`
+        let (name, name_span) = self.expect_ident("an enum name")?;
+        let open = self.expect(TokenKind::LBrace)?.span;
+
+        let mut variants = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RBrace) {
+            loop {
+                let (name, name_span) = self.expect_ident("a variant name")?;
+                variants.push(Variant { name, name_span });
+                // As in a parameter list, a comma promises another one.
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
             }
         }
+
+        if !self.eat(&TokenKind::RBrace) {
+            let found = self.peek();
+            return Err(Diagnostic::new(
+                format!("expected `}}`, found {}", found.kind.describe()),
+                found.span,
+            )
+            .with_label("a variant list ends here")
+            .with_note("to close this `{`", Some(open)));
+        }
+        Ok(EnumDecl { name, name_span, variants })
     }
 
     /// Consume an identifier and hand back its text and span.
@@ -196,8 +248,8 @@ impl<'a> Parser<'a> {
                 format!("expected a function, found {}", found.kind.describe()),
                 found.span,
             )
-            .with_label("only functions may appear at the top level")
-            .with_note("a program is a list of functions, and starts at `main`", None));
+            .with_label("only enums and functions may appear at the top level")
+            .with_note("a program is a list of declarations, and starts at `main`", None));
         }
         self.bump(); // `fn`
 
@@ -209,7 +261,8 @@ impl<'a> Parser<'a> {
         // No `->` means the function returns nothing. Diagnostics about that
         // point at the `)`, since there is no return type to underline.
         let (ret, ret_span) = if self.eat(&TokenKind::Arrow) {
-            let (ty, span) = self.expect_type("a return type")?;
+            let ty = self.expect_type("a return type")?;
+            let span = ty.span;
             (Some(ty), span)
         } else {
             (None, close)
@@ -231,9 +284,9 @@ impl<'a> Parser<'a> {
         }
 
         loop {
-            let (ty, ty_span) = self.expect_type("a parameter")?;
+            let ty = self.expect_type("a parameter")?;
             let (name, name_span) = self.expect_ident("a parameter name")?;
-            params.push(Param { ty, ty_span, name, name_span });
+            params.push(Param { ty, name, name_span });
 
             // A comma promises another parameter, so the loop goes round again
             // and `(int a,)` fails on the `)` instead of being accepted.
@@ -292,19 +345,24 @@ impl<'a> Parser<'a> {
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
+        // A declaration may begin with a plain identifier now that a type can
+        // be an enum's name, so this is asked before the keywords are matched.
+        if self.starts_declaration() {
+            return self.decl();
+        }
         match self.peek().kind {
-            TokenKind::KwInt => self.decl(Ty::Int),
-            TokenKind::KwString => self.decl(Ty::Str),
-            TokenKind::KwBool => self.decl(Ty::Bool),
             TokenKind::KwPrint => self.print_stmt(),
             TokenKind::KwIf => self.if_stmt(),
             TokenKind::KwWhile => self.while_stmt(),
             TokenKind::KwFor => self.for_stmt(),
+            // A match written for its effect. Like a call statement, it is the
+            // same node as the expression — only what surrounds it differs.
+            TokenKind::KwMatch => Ok(Stmt::Match(self.match_expr()?)),
             TokenKind::KwReturn => self.return_stmt(),
             TokenKind::KwBreak => self.loop_jump(|span| Stmt::Break { span }),
             TokenKind::KwContinue => self.loop_jump(|span| Stmt::Continue { span }),
-            // `f(...)` and `x = ...` both start with a name, so this is the one
-            // place the parser needs to look one token further ahead.
+            // `f(...)` and `x = ...` both start with a name, which is why the
+            // second token decides here too.
             TokenKind::Ident(_) if matches!(self.peek_at(1).kind, TokenKind::LParen) => {
                 self.call_stmt()
             }
@@ -316,10 +374,76 @@ impl<'a> Parser<'a> {
                     found.span,
                 )
                 .with_label(
-                    "statements start with a type, `print`, `if`, `while`, `for` or a variable name",
+                    "statements start with a type, `print`, `if`, `while`, `for`, `match` or a variable name",
                 ))
             }
         }
+    }
+
+    /// `match (value) { Color::Red => "warm", Color::Green => { ... } }`
+    ///
+    /// The arms are not judged here beyond their shape: whether they cover the
+    /// scrutinee's variants, whether the scrutinee even has any, and whether
+    /// what the arms produce agrees, are all questions for the stage that knows
+    /// what the names mean.
+    fn match_expr(&mut self) -> PResult<Expr> {
+        let keyword = self.bump().span; // `match`
+        let scrutinee = self.condition()?;
+        let open = self.expect(TokenKind::LBrace)?.span;
+
+        let mut arms = Vec::new();
+        loop {
+            match self.peek().kind {
+                TokenKind::RBrace => {
+                    let close = self.bump().span;
+                    return Ok(Expr {
+                        id: self.node_id(),
+                        span: keyword.to(close),
+                        kind: ExprKind::Match {
+                            keyword,
+                            scrutinee: Box::new(scrutinee),
+                            arms,
+                        },
+                    });
+                }
+                TokenKind::Eof => {
+                    let found = self.peek();
+                    return Err(Diagnostic::new("unclosed match", found.span)
+                        .with_label("expected `}` before the end of the file")
+                        .with_note("to close this `{`", Some(open)));
+                }
+                _ => arms.push(self.match_arm()?),
+            }
+        }
+    }
+
+    /// `Color::Red => "warm",` or `Color::Red => { ... }`
+    ///
+    /// The token after `=>` decides between the two, with no lookahead beyond
+    /// it: a `{` can only open a block, because TinyC has no other use for one
+    /// in expression position.
+    fn match_arm(&mut self) -> PResult<MatchArm> {
+        let (enum_name, enum_span) = self.expect_ident("an enum name")?;
+        self.expect(TokenKind::ColonColon)?;
+        let (variant, variant_span) = self.expect_ident("a variant name")?;
+        self.expect(TokenKind::FatArrow)?;
+
+        let body = if matches!(self.peek().kind, TokenKind::LBrace) {
+            let block = self.block()?;
+            // A block ends itself, so a comma after one is optional — as it is
+            // after an `if`'s block.
+            self.eat(&TokenKind::Comma);
+            ArmBody::Block(block)
+        } else {
+            let value = self.expr()?;
+            // An expression does not, so the next arm needs announcing unless
+            // this was the last.
+            if !matches!(self.peek().kind, TokenKind::RBrace) {
+                self.expect(TokenKind::Comma)?;
+            }
+            ArmBody::Value(value)
+        };
+        Ok(MatchArm { enum_name, enum_span, variant, variant_span, body })
     }
 
     /// `{ stmt* }`
@@ -386,19 +510,17 @@ impl<'a> Parser<'a> {
         let open = self.expect(TokenKind::LParen)?.span;
 
         // The initialiser is a full statement, so it consumes its own `;`.
-        let init = match self.peek().kind {
-            TokenKind::KwInt => self.decl(Ty::Int)?,
-            TokenKind::KwString => self.decl(Ty::Str)?,
-            TokenKind::KwBool => self.decl(Ty::Bool)?,
-            TokenKind::Ident(_) => self.assign()?,
-            _ => {
-                let found = self.peek();
-                return Err(Diagnostic::new(
-                    format!("expected a declaration or assignment, found {}", found.kind.describe()),
-                    found.span,
-                )
-                .with_label("the first part of a `for` initialises a variable"));
-            }
+        let init = if self.starts_declaration() {
+            self.decl()?
+        } else if matches!(self.peek().kind, TokenKind::Ident(_)) {
+            self.assign()?
+        } else {
+            let found = self.peek();
+            return Err(Diagnostic::new(
+                format!("expected a declaration or assignment, found {}", found.kind.describe()),
+                found.span,
+            )
+            .with_label("the first part of a `for` initialises a variable"));
         };
 
         let cond = self.expr()?;
@@ -412,8 +534,8 @@ impl<'a> Parser<'a> {
         Ok(Stmt::For { init: Box::new(init), cond, step: Box::new(step), body })
     }
 
-    fn decl(&mut self, ty: Ty) -> PResult<Stmt> {
-        let ty_span = self.bump().span;
+    fn decl(&mut self) -> PResult<Stmt> {
+        let ty = self.expect_type("a declaration")?;
 
         let name_token = self.peek();
         let TokenKind::Ident(name) = &name_token.kind else {
@@ -429,7 +551,7 @@ impl<'a> Parser<'a> {
         self.expect(TokenKind::Eq)?;
         let init = self.expr()?;
         self.expect(TokenKind::Semi)?;
-        Ok(Stmt::Decl { ty, ty_span, name, name_span, init })
+        Ok(Stmt::Decl { ty, name, name_span, init })
     }
 
     fn assign(&mut self) -> PResult<Stmt> {
@@ -589,9 +711,26 @@ impl<'a> Parser<'a> {
             // arm leaves through its own `return` rather than the shared
             // `bump` at the bottom.
             TokenKind::Ident(name) => {
+                let name = name.clone();
                 self.bump();
+                // `Color::Red`. A variant is always written qualified, so no
+                // lookahead beyond the `::` is needed to tell one from a
+                // variable — and no enum may quietly shadow a name.
+                if self.eat(&TokenKind::ColonColon) {
+                    let (variant, variant_span) = self.expect_ident("a variant name")?;
+                    return Ok(Expr {
+                        id: self.node_id(),
+                        span: span.to(variant_span),
+                        kind: ExprKind::Variant {
+                            enum_name: name,
+                            enum_span: span,
+                            variant,
+                            variant_span,
+                        },
+                    });
+                }
                 if !matches!(self.peek().kind, TokenKind::LParen) {
-                    let kind = ExprKind::Var(name.clone());
+                    let kind = ExprKind::Var(name);
                     return Ok(Expr { id: self.node_id(), span, kind });
                 }
                 let open = self.bump().span;
@@ -603,6 +742,9 @@ impl<'a> Parser<'a> {
                     kind: ExprKind::Call { name: name.clone(), name_span: span, args },
                 });
             }
+            // A match is an ordinary primary expression: it binds as tightly as
+            // a literal, so `match (c) { ... } == x` compares the two.
+            TokenKind::KwMatch => return self.match_expr(),
             // Parentheses only group: the expression between them keeps its own
             // node id, so [`crate::sema`]'s table gains no unused entry, and
             // only its span widens to cover the brackets a diagnostic should
@@ -941,6 +1083,158 @@ mod tests {
         assert!(errors[0].note.is_some());
     }
 
+    // -- enums and match ---------------------------------------------------
+
+    #[test]
+    fn parses_an_enum_declaration() {
+        let program = parse_src("enum Color { Red, Green, Blue }\nfn main() {\n}\n").unwrap();
+        assert_eq!(ast::dump(&program), "enum Color { Red, Green, Blue }\nfn main()\n");
+    }
+
+    #[test]
+    fn an_enum_may_have_one_variant() {
+        let program = parse_src("enum Unit { Only }\nfn main() {\n}\n").unwrap();
+        assert_eq!(program.enums[0].variants.len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_trailing_comma_in_a_variant_list() {
+        // As in a parameter list, a comma promises another one.
+        let errors = parse_src("enum Color { Red, }\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("expected a variant name"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn reports_an_unclosed_variant_list_against_its_brace() {
+        let errors = parse_src("enum Color { Red Green }\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("expected `}`"), "{}", errors[0].message);
+        assert!(errors[0].note.is_some());
+    }
+
+    #[test]
+    fn parses_a_variant_expression() {
+        assert_eq!(dump_main("print(Color::Red);"), "print\n  variant Color::Red\n");
+    }
+
+    #[test]
+    fn a_name_is_a_variable_a_call_or_a_variant_by_what_follows_it() {
+        // The three shapes that start with an identifier, told apart by the
+        // very next token and nothing else.
+        assert_eq!(dump_main("print(c);"), "print\n  var c\n");
+        assert_eq!(dump_main("print(c());"), "print\n  call c\n");
+        assert_eq!(dump_main("print(c::d);"), "print\n  variant c::d\n");
+    }
+
+    #[test]
+    fn parses_a_declaration_whose_type_is_a_name() {
+        // `Color c = ...` and `c = ...` both start with an identifier, so the
+        // *second* token is what decides.
+        assert_eq!(
+            dump_main("Color c = Color::Red;"),
+            "decl Color c\n  variant Color::Red\n"
+        );
+        assert_eq!(dump_main("c = 1;"), "assign c\n  int 1\n");
+    }
+
+    #[test]
+    fn parses_a_match_of_blocks() {
+        assert_eq!(
+            dump_main("match (c) {\n  Color::Red => { print(1); }\n  Color::Blue => { print(2); }\n}"),
+            concat!(
+                "match\n",
+                "  var c\n",
+                "  Color::Red\n",
+                "    print\n",
+                "      int 1\n",
+                "  Color::Blue\n",
+                "    print\n",
+                "      int 2\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_parser_accepts_a_match_it_cannot_judge() {
+        // Whether the arms cover the enum, or whether these names mean
+        // anything, is not a syntactic question.
+        assert!(parse_src("fn main() {\n  match (c) {\n  }\n}").is_ok());
+        assert!(
+            parse_src("fn main() {\n  match (c) {\n    A::B => {}\n    A::B => {}\n  }\n}").is_ok()
+        );
+    }
+
+    #[test]
+    fn a_match_arm_needs_a_qualified_pattern() {
+        for (body, expected) in [
+            ("match (c) {\n  Red => 1\n}", "expected `::`"),
+            ("match (c) {\n  Color::Red 1\n}", "expected `=>`"),
+        ] {
+            let errors = errors_in_main(body);
+            assert!(errors[0].message.contains(expected), "{body}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn a_value_arm_announces_the_next_one_with_a_comma() {
+        // An expression does not end itself, so without the comma the parser
+        // would keep reading `1 Color::Blue` as one expression.
+        let errors = errors_in_main("match (c) {\n  Color::Red => 1\n  Color::Blue => 2,\n}");
+        assert!(errors[0].message.contains("expected `,`"), "{}", errors[0].message);
+        // The last arm needs none, since `}` ends it.
+        assert!(parse_src("fn main() {\n  match (c) {\n    A::B => 1\n  }\n}").is_ok());
+    }
+
+    #[test]
+    fn a_block_arm_needs_no_comma_but_may_have_one() {
+        for body in [
+            "match (c) {\n  A::X => { }\n  A::Y => { }\n}",
+            "match (c) {\n  A::X => { },\n  A::Y => { },\n}",
+        ] {
+            assert!(parse_src(&format!("fn main() {{\n{body}\n}}")).is_ok(), "{body}");
+        }
+    }
+
+    #[test]
+    fn the_token_after_the_arrow_picks_the_arm_shape() {
+        // A `{` can only open a block; anything else begins an expression.
+        assert_eq!(
+            dump_main("match (c) {\n  A::X => 1,\n  A::Y => { print(2); }\n}"),
+            concat!(
+                "match\n",
+                "  var c\n",
+                "  A::X\n",
+                "    int 1\n",
+                "  A::Y\n",
+                "    print\n",
+                "      int 2\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_match_is_an_expression_anywhere_one_fits() {
+        assert_eq!(
+            dump_main("int n = match (c) {\n  A::X => 1,\n};"),
+            "decl int n\n  match\n    var c\n    A::X\n      int 1\n"
+        );
+        // And binds as tightly as a literal, so this compares the two.
+        assert!(parse_src("fn main() {\n  print(match (c) { A::X => 1 } == 2);\n}").is_ok());
+    }
+
+    #[test]
+    fn reports_an_unclosed_match() {
+        let errors = parse_src("fn main() {\n  match (c) {\n    A::B => { }\n}\n").unwrap_err();
+        assert!(errors[0].message.contains("unclosed"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn an_enum_may_be_declared_between_functions() {
+        let program =
+            parse_src("fn a() {\n}\nenum E { X }\nfn main() {\n}\n").unwrap();
+        assert_eq!(program.enums.len(), 1);
+        assert_eq!(program.functions.len(), 2);
+    }
+
     // -- functions ---------------------------------------------------------
 
     #[test]
@@ -957,7 +1251,7 @@ mod tests {
         let program = parse_src("fn main() {\n}\n").unwrap();
         let main = &program.functions[0];
         assert!(main.params.is_empty());
-        assert_eq!(main.ret, None);
+        assert!(main.ret.is_none());
         assert_eq!(ast::dump(&program), "fn main()\n");
     }
 

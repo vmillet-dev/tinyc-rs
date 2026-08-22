@@ -1,0 +1,87 @@
+// Enums and exhaustive matching.
+//
+// A variant carries no payload, so a value of an enum *is* its variant's index.
+// That makes an enum cost the backend nothing: it moves and compares like an
+// int. What it buys is a type the compiler can count, and therefore check.
+
+enum Colour { Red, Green, Blue }
+
+// Two enums may use the same variant name: a variant is always written
+// qualified, so `Colour::Red` and `Signal::Red` never have to be told apart.
+enum Signal { Red, Amber, Green }
+
+// A match is an expression, so mapping a variant to a value takes no `return`
+// per arm and the whole thing is typed at once.
+fn temperature(Colour c) -> string {
+  return match (c) {
+    Colour::Red => "warm",
+    Colour::Green => "cool",
+    Colour::Blue => "cold",
+  };
+}
+
+// An arm may be a block instead, for when it has work to do. A block never
+// *produces* a value — `return` keeps its one meaning of leaving the function —
+// so in value position a block arm has to be one control never falls out of.
+fn wait(Signal s) -> bool {
+  return match (s) {
+    Signal::Red => true,
+    Signal::Amber => { print("slow down"); return true; }
+    Signal::Green => false,
+  };
+}
+
+// A match covers every variant, so the compiler knows this returns on every
+// path even with no trailing `return`.
+fn urgency(Signal s) -> int {
+  match (s) {
+    Signal::Red => { return 2; }
+    Signal::Amber => { return 1; }
+    Signal::Green => { return 0; }
+  }
+}
+
+fn main() {
+  Colour c = Colour::Blue;
+  print(c);                  // Blue — printing names the variant
+  print(temperature(c));     // cold
+
+  // Enums answer `==` and `!=`, because that is a question about which variant
+  // it is. They deliberately answer nothing about order: the declaration puts
+  // them in a sequence, but the program never said that sequence meant anything.
+  print(c == Colour::Blue);  // true
+  print(c != Colour::Red);   // true
+
+  // Used as a value anywhere one is wanted, not just after `return`.
+  string word = match (c) {
+    Colour::Red => "hot",
+    Colour::Green => "mild",
+    Colour::Blue => "chilly",
+  };
+  print(word);               // chilly
+
+  // Written as a statement, its arms run for effect and must all be blocks.
+  Signal s = Signal::Amber;
+  match (s) {
+    Signal::Red => { print("stop"); }
+    Signal::Amber => {
+      print("slow");
+      print(wait(s));        // slow down, then true
+      print(urgency(s));     // 1
+    }
+    Signal::Green => { print("go"); }
+  }
+
+  // Matching in a loop, with the loop jumps working inside an arm.
+  for (int i = 0; i < 3; i = i + 1) {
+    Signal current = Signal::Green;
+    if (i == 1) {
+      current = Signal::Red;
+    }
+    match (current) {
+      Signal::Red => { continue; }
+      Signal::Amber => { break; }
+      Signal::Green => { print(i); }   // 0, 2
+    }
+  }
+}

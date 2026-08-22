@@ -1,0 +1,5 @@
+enum Colour { Red, Green, Blue }
+
+fn main() {
+  print(Colour::Red < Colour::Blue);
+}

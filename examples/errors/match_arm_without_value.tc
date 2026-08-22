@@ -1,0 +1,13 @@
+enum Colour { Red, Green, Blue }
+
+fn describe(Colour c) -> string {
+  return match (c) {
+    Colour::Red => "warm",
+    Colour::Green => { print("thinking"); }
+    Colour::Blue => "cold",
+  };
+}
+
+fn main() {
+  print(describe(Colour::Red));
+}

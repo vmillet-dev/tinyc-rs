@@ -25,6 +25,8 @@ pub enum TokenKind {
     KwReturn,
     KwBreak,
     KwContinue,
+    KwEnum,
+    KwMatch,
 
     // Punctuation.
     LParen,
@@ -41,6 +43,10 @@ pub enum TokenKind {
     Comma,
     Arrow,
     Bang,
+    /// `=>`, between a `match` arm's pattern and its block.
+    FatArrow,
+    /// `::`, which qualifies a variant with the enum it belongs to.
+    ColonColon,
 
     // Comparison.
     EqEq,
@@ -92,6 +98,8 @@ impl TokenKind {
             TokenKind::KwReturn => "return",
             TokenKind::KwBreak => "break",
             TokenKind::KwContinue => "continue",
+            TokenKind::KwEnum => "enum",
+            TokenKind::KwMatch => "match",
 
             // Punctuation.
             TokenKind::LParen => "(",
@@ -108,6 +116,8 @@ impl TokenKind {
             TokenKind::Comma => ",",
             TokenKind::Arrow => "->",
             TokenKind::Bang => "!",
+            TokenKind::FatArrow => "=>",
+            TokenKind::ColonColon => "::",
 
             // Comparison.
             TokenKind::EqEq => "==",

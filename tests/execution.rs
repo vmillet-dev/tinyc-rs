@@ -27,7 +27,7 @@ use tinyc::codegen::Target;
 
 /// Programs that must keep printing exactly what `examples/expected/<name>.txt`
 /// says, and the source of truth for what a working TinyC program looks like.
-const EXAMPLES: [&str; 7] = [
+const EXAMPLES: [&str; 8] = [
     "hello.tc",
     "arith.tc",
     "spill.tc",
@@ -35,6 +35,7 @@ const EXAMPLES: [&str; 7] = [
     "bool.tc",
     "control_flow.tc",
     "functions.tc",
+    "enums.tc",
 ];
 
 #[test]
@@ -252,6 +253,52 @@ fn short_circuits_and_loop_jumps_do_what_they_promise() {
         std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
 
         let run = tools.build_and_run(&source, &format!("logic{index}"));
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
+}
+
+/// A `match` used as a value, where getting the control flow wrong shows up as
+/// a wrong answer rather than a crash.
+#[test]
+fn a_match_expression_yields_the_arm_that_ran() {
+    let Some(tools) = Tools::find() else { return };
+
+    // A helper whose arms mix the two shapes, so the diverging one is exercised
+    // where it belongs: leaving the function rather than reaching the join.
+    let prelude = "enum Colour { Red, Green, Blue }\n\
+                   fn pick(Colour c) -> int {\n  return match (c) {\n    Colour::Red => 1,\n    \
+                   Colour::Green => { return 42; }\n    Colour::Blue => 3,\n  };\n}\n";
+    let cases: [(&str, &str); 6] = [
+        // Each arm in turn, so a chain that fell through would be caught.
+        ("int n = match (Colour::Red) { Colour::Red => 1, Colour::Green => 2, Colour::Blue => 3, };\nprint(n);", "1"),
+        ("int n = match (Colour::Green) { Colour::Red => 1, Colour::Green => 2, Colour::Blue => 3, };\nprint(n);", "2"),
+        // The last arm is the one no test guards, so it is the one a wrong
+        // chain would reach by accident.
+        ("int n = match (Colour::Blue) { Colour::Red => 1, Colour::Green => 2, Colour::Blue => 3, };\nprint(n);", "3"),
+        // A block arm that leaves the function: the join is never reached, so
+        // the answer is the arm's own `return` and not one of the values.
+        ("print(pick(Colour::Green));", "42"),
+        // A block arm that leaves a *loop*. If it fell through into the join
+        // instead, `n` would be overwritten with whatever the join held.
+        (
+            "int n = 7;\nwhile (true) {\n  n = match (Colour::Green) {\n    Colour::Red => 1,\n    \
+             Colour::Green => { break; }\n    Colour::Blue => 3,\n  };\n}\nprint(n);",
+            "7",
+        ),
+        // An arm's value may itself be computed, and lands in the same register.
+        (
+            "int k = 10;\nint n = match (Colour::Blue) {\n  Colour::Red => k + 1,\n  \
+             Colour::Green => k * 2,\n  Colour::Blue => k - 4,\n};\nprint(n);",
+            "6",
+        ),
+    ];
+
+    for (index, (body, expected)) in cases.iter().enumerate() {
+        let source = tools.scratch.join(format!("matchval{index}.tc"));
+        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
+
+        let run = tools.build_and_run(&source, &format!("matchval{index}"));
         assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
     }

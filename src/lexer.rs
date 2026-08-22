@@ -57,12 +57,23 @@ impl<'a> Lexer<'a> {
                 '}' => self.single(TokenKind::RBrace),
                 ';' => self.single(TokenKind::Semi),
                 // Two-character operators are recognised before their prefixes.
-                '=' => self.one_or_two('=', TokenKind::EqEq, TokenKind::Eq),
+                // `=` is the one with two of them, so it does not fit
+                // [`Self::one_or_two`].
+                '=' => {
+                    self.bump();
+                    match self.peek() {
+                        Some('=') => self.single(TokenKind::EqEq),
+                        Some('>') => self.single(TokenKind::FatArrow),
+                        _ => TokenKind::Eq,
+                    }
+                }
+                ':' => self.only_doubled(':', TokenKind::ColonColon, start)?,
                 '<' => self.one_or_two('=', TokenKind::Le, TokenKind::Lt),
                 '>' => self.one_or_two('=', TokenKind::Ge, TokenKind::Gt),
                 '!' => self.one_or_two('=', TokenKind::BangEq, TokenKind::Bang),
-                // These two exist only doubled: TinyC has no bitwise `&` or `|`
-                // for the lone character to mean instead.
+                // These exist only doubled: TinyC has no bitwise `&` or `|`, and
+                // nothing at all for a single `:`, for the lone character to
+                // mean instead.
                 '&' => self.only_doubled('&', TokenKind::AmpAmp, start)?,
                 '|' => self.only_doubled('|', TokenKind::PipePipe, start)?,
                 '+' => self.single(TokenKind::Plus),
@@ -169,6 +180,8 @@ impl<'a> Lexer<'a> {
             "return" => TokenKind::KwReturn,
             "break" => TokenKind::KwBreak,
             "continue" => TokenKind::KwContinue,
+            "enum" => TokenKind::KwEnum,
+            "match" => TokenKind::KwMatch,
             name => TokenKind::Ident(name.to_string()),
         }
     }
@@ -393,6 +406,37 @@ mod tests {
     }
 
     #[test]
+    fn lexes_the_enum_and_match_punctuation() {
+        assert_eq!(
+            kinds("Color::Red => "),
+            vec![
+                TokenKind::Ident("Color".into()),
+                TokenKind::ColonColon,
+                TokenKind::Ident("Red".into()),
+                TokenKind::FatArrow,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_equals_has_three_spellings_and_the_longest_wins() {
+        assert_eq!(
+            kinds("== => ="),
+            vec![TokenKind::EqEq, TokenKind::FatArrow, TokenKind::Eq, TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_single_colon_is_an_error() {
+        // TinyC has no `:` of its own, so the only thing it can have meant is
+        // the qualifier.
+        let error = error("Color:Red");
+        assert!(error.message.contains("unexpected character `:`"), "{}", error.message);
+        assert!(error.label.as_deref().unwrap().contains("::"), "{:?}", error.label);
+    }
+
+    #[test]
     fn a_doubled_operator_is_one_token_not_two() {
         // `&&&` is `&&` followed by a lone `&`, which stops the lexer.
         assert_eq!(kinds("&&"), vec![TokenKind::AmpAmp, TokenKind::Eof]);
@@ -490,7 +534,7 @@ mod tests {
     #[test]
     fn lexes_every_keyword() {
         assert_eq!(
-            kinds("int string bool print if else while for fn return break continue"),
+            kinds("int string bool print if else while for fn return break continue enum match"),
             vec![
                 TokenKind::KwInt,
                 TokenKind::KwString,
@@ -504,6 +548,8 @@ mod tests {
                 TokenKind::KwReturn,
                 TokenKind::KwBreak,
                 TokenKind::KwContinue,
+                TokenKind::KwEnum,
+                TokenKind::KwMatch,
                 TokenKind::Eof,
             ]
         );
@@ -531,9 +577,10 @@ mod tests {
     fn a_keyword_is_never_recognised_as_a_prefix() {
         // Each of these starts with a keyword's spelling but is longer, so the
         // match on the whole identifier has to fall through to `Ident`.
-        for name in
-            ["fnx", "returns", "printer", "intx", "forth", "elsewhere", "boolean", "breaks", "continued"]
-        {
+        for name in [
+            "fnx", "returns", "printer", "intx", "forth", "elsewhere", "boolean", "breaks",
+            "continued", "enums", "matches",
+        ] {
             assert_eq!(
                 kinds(name),
                 vec![TokenKind::Ident(name.into()), TokenKind::Eof],

@@ -1,0 +1,11 @@
+enum Colour { Red, Green, Blue }
+
+fn name(Colour c) -> string {
+  match (c) {
+    Colour::Red => { return "red"; }
+  }
+}
+
+fn main() {
+  print(name(Colour::Red));
+}

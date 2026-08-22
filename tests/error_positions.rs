@@ -12,8 +12,15 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 6] =
-    ["arith.tc", "spill.tc", "reassign.tc", "bool.tc", "control_flow.tc", "functions.tc"];
+const EXAMPLES: [&str; 7] = [
+    "arith.tc",
+    "spill.tc",
+    "reassign.tc",
+    "bool.tc",
+    "control_flow.tc",
+    "functions.tc",
+    "enums.tc",
+];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
 fn error_positions(file: &str) -> Vec<String> {
@@ -146,6 +153,45 @@ fn redeclaration_points_at_both_declarations() {
     };
     let (_, note_span) = errors[0].note.clone().expect("a note pointing at the first declaration");
     assert_eq!(source.line_col(note_span.unwrap().offset), (2, 7));
+}
+
+// -- enums ----------------------------------------------------------------
+
+#[test]
+fn a_non_exhaustive_match_points_at_the_keyword() {
+    // Not at any one arm: the mistake is what the arms do not say between them,
+    // so the caret goes on the statement that had to be complete.
+    assert_error_at("non_exhaustive_match.tc", "4:3");
+}
+
+#[test]
+fn an_unknown_variant_points_at_the_variant_not_the_enum() {
+    assert_error_at("unknown_variant.tc", "4:22");
+}
+
+#[test]
+fn ordering_two_enum_values_points_at_the_whole_comparison() {
+    assert_error_at("enum_ordering.tc", "4:9");
+}
+
+#[test]
+fn arms_that_disagree_point_at_the_second_one_and_note_the_first() {
+    assert_error_at("match_arms_disagree.tc", "6:22");
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/errors/match_arms_disagree.tc");
+    let source = SourceFile::new("match_arms_disagree.tc", std::fs::read_to_string(path).unwrap());
+    let Err(errors) = tinyc::compile(source.text(), Target::X86_64Windows) else {
+        panic!("match_arms_disagree.tc was expected to fail");
+    };
+    let (_, note_span) = errors[0].note.clone().expect("a note pointing at the arm that set the type");
+    assert_eq!(source.line_col(note_span.unwrap().offset), (5, 20));
+}
+
+#[test]
+fn an_arm_with_no_value_points_at_its_pattern() {
+    // The block itself is not wrong — it is wrong *for this match*, so the
+    // caret goes on the arm rather than inside it.
+    assert_error_at("match_arm_without_value.tc", "6:13");
 }
 
 // -- functions ------------------------------------------------------------

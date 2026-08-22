@@ -2,10 +2,36 @@
 
 use crate::diag::Span;
 
-/// The types of TinyC v0.
+/// Index of an enum in [`Program::enums`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EnumId(pub u32);
+
+/// What every stage after the parser needs to know about a declared enum: what
+/// it is called, and what its variants are called *in order*.
+///
+/// The order is the whole representation — a variant's tag is its position — so
+/// this is also the table the runtime prints a value's name from.
+#[derive(Clone, Debug)]
+pub struct EnumInfo {
+    pub name: String,
+    pub variants: Vec<String>,
+}
+
+impl EnumInfo {
+    /// The tag a variant is represented by, which is where it was written.
+    pub fn tag(&self, variant: &str) -> Option<i64> {
+        self.variants.iter().position(|v| v == variant).map(|at| at as i64)
+    }
+}
+
+/// The types of TinyC.
 ///
 /// Every variant is a type a *value* can have, which is why there is no `Void`:
 /// a function that returns nothing has no return type at all. See [`FnDecl::ret`].
+///
+/// [`Ty::Enum`] holds an *index* rather than a name, which is what keeps `Ty`
+/// `Copy` and its equality an integer comparison. The price is that a `Ty`
+/// cannot name itself — see [`Ty::name`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ty {
     /// 64-bit signed integer.
@@ -14,25 +40,63 @@ pub enum Ty {
     Str,
     /// `true` or `false`.
     Bool,
+    /// One of the variants of a declared enum, held as its index.
+    Enum(EnumId),
 }
 
 impl Ty {
-    pub fn name(self) -> &'static str {
+    /// This type's name, given the enum names of the program it belongs to,
+    /// indexed by [`EnumId`].
+    ///
+    /// The table has to be handed in because an enum's name comes from the
+    /// source rather than from this enum, and [`Ty`] is deliberately too small
+    /// to carry one.
+    pub fn name(self, enums: &[EnumInfo]) -> &str {
         match self {
             Ty::Int => "int",
             Ty::Str => "string",
             Ty::Bool => "bool",
+            Ty::Enum(id) => &enums[id.0 as usize].name,
         }
     }
 
     /// The quoted type name with its indefinite article, for prose in messages.
-    pub fn with_article(self) -> &'static str {
+    pub fn with_article(self, enums: &[EnumInfo]) -> String {
         match self {
-            Ty::Int => "an `int`",
-            Ty::Str => "a `string`",
-            Ty::Bool => "a `bool`",
+            Ty::Int => "an `int`".to_string(),
+            Ty::Str => "a `string`".to_string(),
+            Ty::Bool => "a `bool`".to_string(),
+            Ty::Enum(id) => format!("a `{}`", enums[id.0 as usize].name),
         }
     }
+
+    /// Whether values of this type can be ordered, and so compared with `<` and
+    /// its relatives rather than only with `==`.
+    ///
+    /// An enum's variants have an order in the declaration, but it is not one
+    /// the program said anything about, so TinyC declines to invent it.
+    pub fn is_ordered(self) -> bool {
+        matches!(self, Ty::Int)
+    }
+
+    /// Whether two values of this type can be compared for equality at all.
+    /// Strings cannot: it would need a runtime routine, and comparing the
+    /// pointers would quietly answer a different question.
+    pub fn has_equality(self) -> bool {
+        !matches!(self, Ty::Str)
+    }
+}
+
+/// A type as it was written, before anything knows what it names.
+///
+/// The parser cannot produce a [`Ty`]: `Color c = ...` and `int c = ...` are the
+/// same shape, and only [`crate::sema`] knows whether `Color` was declared. So
+/// syntax carries the name and the span, and resolution happens once, in the
+/// stage that has the table.
+#[derive(Clone, Debug)]
+pub struct TypeRef {
+    pub name: String,
+    pub span: Span,
 }
 
 /// Index of an expression node, used by [`crate::sema`] to record its type
@@ -225,6 +289,31 @@ pub enum ExprKind {
     /// `lhs && rhs` or `lhs || rhs`. `rhs` is evaluated only when `lhs` did not
     /// already decide the answer, which is why this is not a [`Self::Bin`].
     Logic { op: LogicOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    /// A variant of an enum, `Color::Red`.
+    ///
+    /// Always written qualified, so that two enums may use the same variant
+    /// name and so that a variant never has to be told apart from a variable.
+    /// Both halves keep a span: the enum name is what "no enum called `Color`"
+    /// underlines, the variant what "`Color` has no variant `Purple`" does.
+    Variant { enum_name: String, enum_span: Span, variant: String, variant_span: Span },
+    /// `match (value) { Colour::Red => "warm", ... }`.
+    ///
+    /// A match is an expression, and a statement only in the way a call is one:
+    /// [`Stmt::Match`] wraps this node when it is written for its effect rather
+    /// than for its value.
+    ///
+    /// Every variant of the scrutinee's enum must have an arm, and no variant
+    /// may have two. There is deliberately no catch-all pattern: the whole
+    /// value of the check is that adding a variant makes every `match` that
+    /// does not handle it stop compiling, and a `_` would silently swallow it.
+    Match {
+        /// Span of the `match` keyword, which is what "this match does not
+        /// cover ..." underlines — the mistake is the arms taken together, not
+        /// any one of them.
+        keyword: Span,
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+    },
     /// A call, `add(1, 2)`. The enclosing [`Expr::span`] covers the whole call;
     /// `name_span` covers just the callee, which is what "unknown function"
     /// underlines. Each argument keeps its own span, so an argument of the
@@ -243,8 +332,7 @@ pub struct Block {
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Decl {
-        ty: Ty,
-        ty_span: Span,
+        ty: TypeRef,
         name: String,
         name_span: Span,
         init: Expr,
@@ -288,6 +376,14 @@ pub enum Stmt {
         span: Span,
         value: Option<Expr>,
     },
+    /// A `match` evaluated for its effect rather than its value.
+    ///
+    /// The second expression statement in the language, and it exists for the
+    /// same reason the first does: [`Stmt::Call`] is what lets a function
+    /// returning nothing be called at all, and this is what lets a match whose
+    /// arms only *do* things be written at all. The parser only ever puts an
+    /// [`ExprKind::Match`] here.
+    Match(Expr),
     /// `break;` — leave the innermost enclosing loop.
     ///
     /// The parser accepts it anywhere, exactly as it does `return`; whether
@@ -298,10 +394,62 @@ pub enum Stmt {
     Continue { span: Span },
     /// A call evaluated for its effect, `greet("hi");`.
     ///
-    /// TinyC has no general expression statements — this is the only one,
-    /// because a function returning nothing could not be called otherwise. The
-    /// parser only ever puts an [`ExprKind::Call`] here.
+    /// TinyC has no general expression statements — this is one of two, the
+    /// other being [`Stmt::Match`], and it exists because a function returning
+    /// nothing could not be called otherwise. The parser only ever puts an
+    /// [`ExprKind::Call`] here.
     Call(Expr),
+}
+
+/// What an arm does once its pattern matches.
+///
+/// The two spellings answer two different needs, and the token after `=>`
+/// settles which is meant: a `{` opens a block, anything else begins an
+/// expression.
+#[derive(Clone, Debug)]
+pub enum ArmBody {
+    /// `Colour::Red => "warm"` — the arm's value, and the match's.
+    Value(Expr),
+    /// `Colour::Red => { print("hi"); return "warm"; }` — statements run for
+    /// their effect.
+    ///
+    /// A block never *produces* a value: `return` keeps its one meaning of
+    /// leaving the function, rather than gaining a second one inside a match.
+    /// So where a match is used as an expression, a block arm has to be one
+    /// that never reaches the end — see `sema`'s divergence check.
+    Block(Block),
+}
+
+/// One arm of a `match`: a qualified variant and what it does.
+///
+/// The pattern is spelled exactly as the expression would be, `Color::Red`, and
+/// carries the same two spans for the same two diagnostics.
+#[derive(Clone, Debug)]
+pub struct MatchArm {
+    pub enum_name: String,
+    pub enum_span: Span,
+    pub variant: String,
+    pub variant_span: Span,
+    pub body: ArmBody,
+}
+
+/// One variant of an enum declaration.
+#[derive(Clone, Debug)]
+pub struct Variant {
+    pub name: String,
+    pub name_span: Span,
+}
+
+/// `enum Color { Red, Green, Blue }`.
+///
+/// A variant carries no payload, so a value of the type is its variant's index
+/// and nothing more — which is why enums cost the backend nothing but a table
+/// of names to print.
+#[derive(Clone, Debug)]
+pub struct EnumDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub variants: Vec<Variant>,
 }
 
 /// One parameter in a signature: `int a`.
@@ -311,8 +459,7 @@ pub enum Stmt {
 /// parameters collide.
 #[derive(Clone, Debug)]
 pub struct Param {
-    pub ty: Ty,
-    pub ty_span: Span,
+    pub ty: TypeRef,
     pub name: String,
     pub name_span: Span,
 }
@@ -330,7 +477,7 @@ pub struct FnDecl {
     /// Void is the *absence* of a type rather than a `Ty` variant, so every
     /// `match` on [`Ty`] elsewhere in the compiler stays about types that
     /// values really have.
-    pub ret: Option<Ty>,
+    pub ret: Option<TypeRef>,
     /// Where a diagnostic about the return type points: the type itself in
     /// `-> int`, or the closing `)` when the signature declares none. Always
     /// present, so "this function returns nothing" has something to underline.
@@ -340,6 +487,8 @@ pub struct FnDecl {
 
 #[derive(Clone, Debug)]
 pub struct Program {
+    /// Declared enums, in source order; an [`EnumId`] indexes this.
+    pub enums: Vec<EnumDecl>,
     pub functions: Vec<FnDecl>,
     /// Number of [`NodeId`]s handed out, i.e. the size of the type table.
     ///
@@ -351,6 +500,10 @@ pub struct Program {
 /// Render the tree for `--emit ast`.
 pub fn dump(program: &Program) -> String {
     let mut out = String::new();
+    for declaration in &program.enums {
+        let variants: Vec<&str> = declaration.variants.iter().map(|v| v.name.as_str()).collect();
+        out.push_str(&format!("enum {} {{ {} }}\n", declaration.name, variants.join(", ")));
+    }
     for function in &program.functions {
         dump_fn(&mut out, function);
     }
@@ -359,9 +512,9 @@ pub fn dump(program: &Program) -> String {
 
 fn dump_fn(out: &mut String, function: &FnDecl) {
     let params: Vec<String> =
-        function.params.iter().map(|p| format!("{} {}", p.ty.name(), p.name)).collect();
-    let ret = match function.ret {
-        Some(ty) => format!(" -> {}", ty.name()),
+        function.params.iter().map(|p| format!("{} {}", p.ty.name, p.name)).collect();
+    let ret = match &function.ret {
+        Some(ty) => format!(" -> {}", ty.name),
         None => String::new(),
     };
     out.push_str(&format!("fn {}({}){}\n", function.name, params.join(", "), ret));
@@ -372,7 +525,7 @@ fn dump_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
     let pad = "  ".repeat(depth);
     match stmt {
         Stmt::Decl { ty, name, init, .. } => {
-            out.push_str(&format!("{pad}decl {} {name}\n", ty.name()));
+            out.push_str(&format!("{pad}decl {} {name}\n", ty.name));
             dump_expr(out, init, depth + 1);
         }
         Stmt::Assign { name, value, .. } => {
@@ -411,6 +564,7 @@ fn dump_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
                 dump_expr(out, expr, depth + 1);
             }
         }
+        Stmt::Match(expr) => dump_expr(out, expr, depth),
         Stmt::Break { .. } => out.push_str(&format!("{pad}break\n")),
         Stmt::Continue { .. } => out.push_str(&format!("{pad}continue\n")),
         Stmt::Call(call) => dump_expr(out, call, depth),
@@ -432,6 +586,9 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
         }
         ExprKind::Bool(v) => out.push_str(&format!("{pad}bool {v}\n")),
         ExprKind::Var(name) => out.push_str(&format!("{pad}var {name}\n")),
+        ExprKind::Variant { enum_name, variant, .. } => {
+            out.push_str(&format!("{pad}variant {enum_name}::{variant}\n"))
+        }
         ExprKind::Neg(operand) => {
             out.push_str(&format!("{pad}neg\n"));
             dump_expr(out, operand, depth + 1);
@@ -454,6 +611,17 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
             out.push_str(&format!("{pad}{}\n", op.symbol()));
             dump_expr(out, lhs, depth + 1);
             dump_expr(out, rhs, depth + 1);
+        }
+        ExprKind::Match { scrutinee, arms, .. } => {
+            out.push_str(&format!("{pad}match\n"));
+            dump_expr(out, scrutinee, depth + 1);
+            for arm in arms {
+                out.push_str(&format!("{pad}  {}::{}\n", arm.enum_name, arm.variant));
+                match &arm.body {
+                    ArmBody::Value(value) => dump_expr(out, value, depth + 2),
+                    ArmBody::Block(block) => dump_block(out, block, depth + 2),
+                }
+            }
         }
         ExprKind::Call { name, args, .. } => {
             out.push_str(&format!("{pad}call {name}\n"));

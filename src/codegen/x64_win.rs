@@ -51,7 +51,7 @@
 //! calls. Nothing this module generates is called `main`, so it is safe to leave
 //! alone.
 
-use crate::ast::{BinOp, CmpOp, Ty};
+use crate::ast::{BinOp, CmpOp, EnumId, Ty};
 use crate::codegen::{Allocation, Backend, Location, PhysReg, RegisterFile};
 use crate::ir::{Block, Function, Instr, Program, Terminator, VReg, Value};
 
@@ -276,15 +276,25 @@ impl Backend for X64Windows {
 /// declared or emitted. Answered in one sweep rather than one per question.
 struct Used {
     formats: [bool; 3],
+    /// Which enums have a value printed, and so need their table of variant
+    /// names emitted. An enum used only in a `match` needs none: matching is
+    /// arithmetic on the tag, and never asks what the tag is called.
+    enums: Vec<bool>,
     aborts: bool,
 }
 
 impl Used {
     fn of(program: &Program) -> Used {
-        let mut used = Used { formats: [false; 3], aborts: false };
+        let mut used =
+            Used { formats: [false; 3], enums: vec![false; program.enums.len()], aborts: false };
         for instr in program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instrs) {
             match instr {
-                Instr::Print { ty, .. } => used.formats[format_index(*ty)] = true,
+                Instr::Print { ty, .. } => {
+                    used.formats[format_index(*ty)] = true;
+                    if let Ty::Enum(id) = ty {
+                        used.enums[id.0 as usize] = true;
+                    }
+                }
                 other => used.aborts |= may_abort(other),
             }
         }
@@ -296,12 +306,27 @@ impl Used {
     }
 }
 
+/// Which format string a type is printed with.
+///
+/// An enum shares the string one: printing a value of one means printing the
+/// name of its variant, so what reaches `printf` is a pointer to bytes exactly
+/// as a `string` is.
 fn format_index(ty: Ty) -> usize {
     match ty {
         Ty::Int => 0,
-        Ty::Str => 1,
+        Ty::Str | Ty::Enum(_) => 1,
         Ty::Bool => 2,
     }
+}
+
+/// The label of the table that maps an enum's tags to its variants' names.
+fn enum_table(id: EnumId) -> String {
+    format!("enum{}_names", id.0)
+}
+
+/// The label of one variant's name within that table.
+fn enum_variant_text(id: EnumId, tag: usize) -> String {
+    format!("enum{}_v{tag}", id.0)
 }
 
 // -- output ----------------------------------------------------------------
@@ -372,6 +397,25 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
         asm.asm(&format!("{FMT_BOOL}: db \"%s\", 10, 0"));
         asm.asm(&format!("{BOOL_TRUE}: db \"true\", 0"));
         asm.asm(&format!("{BOOL_FALSE}: db \"false\", 0"));
+    }
+    // One table per printed enum: the variant names, and the array of pointers
+    // a tag indexes. A tag can only have come from a variant of this very enum,
+    // so the index is in range by construction and needs no check.
+    for (index, info) in program.enums.iter().enumerate() {
+        if !used.enums[index] {
+            continue;
+        }
+        let id = EnumId(index as u32);
+        for (tag, variant) in info.variants.iter().enumerate() {
+            asm.asm(&format!(
+                "{}: db {}, 0",
+                enum_variant_text(id, tag),
+                bytes_of(variant)
+            ));
+        }
+        let entries: Vec<String> =
+            (0..info.variants.len()).map(|tag| enum_variant_text(id, tag)).collect();
+        asm.asm(&format!("{}: dq {}", enum_table(id), entries.join(", ")));
     }
     if used.aborts {
         // No NUL: `_write` is given a length, not a C string.
@@ -769,11 +813,20 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                         self.asm.asm(&format!("test {SCRATCH0}, {SCRATCH0}"));
                         self.asm.asm(&format!("cmovnz {RDX}, {SCRATCH1}"));
                     }
+                    // The same lookup one step further: a bool picks between
+                    // two names, an enum indexes a table of however many it has.
+                    // The tag came from a variant of this enum and nothing else
+                    // can produce one, so the index cannot be out of range.
+                    Ty::Enum(id) => {
+                        self.asm.mov(SCRATCH0, &value);
+                        self.asm.asm(&format!("lea  {SCRATCH1}, [{}]", enum_table(*id)));
+                        self.asm.asm(&format!("mov  {RDX}, [{SCRATCH1}+{SCRATCH0}*8]"));
+                    }
                     _ => self.asm.mov(RDX, &value),
                 }
                 let format = match ty {
                     Ty::Int => FMT_INT,
-                    Ty::Str => FMT_STR,
+                    Ty::Str | Ty::Enum(_) => FMT_STR,
                     Ty::Bool => FMT_BOOL,
                 };
                 self.asm.asm(&format!("lea  {RCX}, [{format}]"));
@@ -1245,6 +1298,44 @@ mod tests {
         assert!(asm.contains(".step"), "{asm}");
         assert!(asm.contains(".done"), "{asm}");
         assert!(asm.contains("jmp  .loop1"), "{asm}");
+    }
+
+    #[test]
+    fn printing_an_enum_indexes_a_table_of_its_variant_names() {
+        // The same lookup a bool does, one step further: a tag indexes an array
+        // of pointers instead of choosing between two.
+        let asm = compile_src(
+            "enum Colour { Red, Green, Blue }\nfn main() {\n  print(Colour::Green);\n}",
+        );
+        assert!(asm.contains("enum0_v1: db 71, 114, 101, 101, 110, 0"), "{asm}");
+        assert!(asm.contains("enum0_names: dq enum0_v0, enum0_v1, enum0_v2"), "{asm}");
+        assert!(asm.contains("lea  r11, [enum0_names]"), "{asm}");
+        assert!(asm.contains("mov  rdx, [r11+r10*8]"), "{asm}");
+        // It prints as a string, so it borrows that format rather than its own.
+        assert!(asm.contains("lea  rcx, [fmt_str]"), "{asm}");
+    }
+
+    #[test]
+    fn an_enum_that_is_never_printed_needs_no_table() {
+        // Matching is arithmetic on the tag; it never asks what a tag is called.
+        let asm = compile_src(
+            "enum Colour { Red, Green }\nfn main() {\n  Colour c = Colour::Red;\n  \
+             match (c) {\n    Colour::Red => { print(1); }\n    Colour::Green => { print(2); }\n  }\n}",
+        );
+        assert!(!asm.contains("enum0_names"), "{asm}");
+        assert!(!asm.contains("enum0_v0"), "{asm}");
+    }
+
+    #[test]
+    fn a_match_is_a_chain_of_compares_against_the_tag() {
+        let asm = compile_src(
+            "enum Colour { Red, Green, Blue }\nfn main() {\n  Colour c = Colour::Blue;\n  \
+             match (c) {\n    Colour::Red => { print(1); }\n    Colour::Green => { print(2); }\n    \
+             Colour::Blue => { print(3); }\n  }\n}",
+        );
+        // Two tests for three variants, each fused into its branch.
+        assert_eq!(asm.matches("cmp  ").count(), 2, "{asm}");
+        assert!(!asm.contains("sete"), "no comparison is ever materialised: {asm}");
     }
 
     #[test]

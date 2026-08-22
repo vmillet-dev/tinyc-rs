@@ -108,12 +108,14 @@ from the same library — see
 ## The language
 
 ```
-program := fn_decl*
+program := (enum_decl | fn_decl)*
+enum    := "enum" IDENT "{" IDENT ("," IDENT)* "}"
 fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 params  := param ("," param)*
 param   := type IDENT
-type    := "int" | "string" | "bool"
-stmt    := decl | assign | print | if | while | for | return | break | continue | call ";"
+type    := "int" | "string" | "bool" | IDENT
+stmt    := decl | assign | print | if | while | for | match | return
+         | break | continue | call ";"
 decl    := type IDENT "=" expr ";"
 assign  := IDENT "=" expr ";"
 print   := "print" "(" expr ")" ";"
@@ -130,15 +132,19 @@ cmp     := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 sum     := term (("+" | "-") term)*
 term    := unary (("*" | "/" | "%") unary)*
 unary   := ("-" | "!") unary | primary
-primary := INT | STRING | BOOL | IDENT | call | "(" expr ")"
+primary := INT | STRING | BOOL | IDENT | variant | call | match
+         | "(" expr ")"
+variant := IDENT "::" IDENT
 call    := IDENT "(" (expr ("," expr)*)? ")"
+match   := "match" "(" expr ")" "{" arm* "}"
+arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
 ```
 
 `int` is a 64-bit signed integer, `string` is a pointer to static bytes, `bool`
-is `true` or `false`. Arithmetic is `int`-only, `&&`, `||` and `!` are
-`bool`-only, `//` starts a comment, and a variable keeps the type it was
-declared with — assigning a `string` to an `int` is an error. There are
-deliberately no arrays yet.
+is `true` or `false`, and an `enum` declares a type of its own with a fixed set
+of values. Arithmetic is `int`-only, `&&`, `||` and `!` are `bool`-only, `//`
+starts a comment, and a variable keeps the type it was declared with — assigning
+a `string` to an `int` is an error. There are deliberately no arrays yet.
 
 There is no implicit truth test either, so `!n` on an `int` is a type error
 rather than a comparison against zero. `%` takes its sign from the dividend, as
@@ -148,7 +154,8 @@ than wrapping — see
 
 ### Functions
 
-A program is a list of functions and nothing else; execution starts at `main`,
+A program is a list of enums and functions, with no top-level statements;
+execution starts at `main`,
 which takes no parameters and returns nothing
 ([`examples/functions.tc`](examples/functions.tc)):
 
@@ -177,8 +184,9 @@ fn fib(int n) -> int {
   simple — a loop is never assumed to run, so `while (true) { return 1; }` is
   rejected. It can only ever reject a program that would in fact have been fine.
 * **A call returning nothing is a statement, never a value.** `greet("hi");` is
-  the only expression statement in the language, and it exists precisely so that
-  a `void` function is callable at all.
+  one of the language's two expression statements — a `match` written for its
+  effect is the other — and it exists precisely so that a `void` function is
+  callable at all.
 * **At most four parameters**, because that is how many the Microsoft x64 ABI
   passes in registers. A fifth would need stack arguments. The number is the
   target's to state, not the language's: it comes from
@@ -211,6 +219,141 @@ entry0:
   2  %t2 = add %a, %b
   3  return %t2
 ```
+
+### Enums and exhaustive matching
+
+An `enum` declares a type with a fixed set of values, and a `match` must handle
+every one of them ([`examples/enums.tc`](examples/enums.tc)):
+
+```c
+enum Colour { Red, Green, Blue }
+
+fn temperature(Colour c) -> string {
+  return match (c) {
+    Colour::Red => "warm",
+    Colour::Green => "cool",
+    Colour::Blue => "cold",
+  };
+}
+```
+
+Forget one and the program does not build:
+
+```
+error: this match does not cover every variant of `Colour`
+ --> colour.tc:4:3
+  |
+4 |   match (c) {
+  |   ^^^^^ `Green` and `Blue` are not handled
+  = note: every variant needs an arm; TinyC has no catch-all pattern, so that
+          adding a variant cannot be quietly ignored
+```
+
+**There is deliberately no `_` pattern.** A catch-all is exactly what would
+absorb a new variant in silence, and turning "I added a case and forgot
+somewhere" from a bug into a compile error is the entire point of the check.
+
+The decisions behind the rest of it:
+
+* **A variant carries no payload, so a value *is* its variant's index.** It
+  moves and compares like an int, and the backend needs nothing new for it —
+  only a table of names, and only for an enum something actually prints.
+* **A variant is always written qualified**, `Colour::Red`. So two enums may
+  both have a `Red`, no enum can shadow a variable, and telling a variant from a
+  variable or a call needs one token of lookahead and no name table.
+* **Enums answer `==` and `!=` but nothing about order.** The declaration puts
+  the variants in a sequence, but the program never said that sequence meant
+  anything, so `Colour::Red < Colour::Blue` is a type error rather than an
+  invented answer.
+* **An exhaustive match counts as returning.** A match whose every arm is a
+  block ending in `return` needs no trailing `return` after it — there is no
+  path that reaches the end of the body. This is the check paying for itself.
+
+#### A match is an expression
+
+The form above produces a value, so it fits anywhere one does — after `return`,
+in an initialiser, as an operand. Two shapes of arm, and the token after `=>`
+picks between them with no lookahead:
+
+```c
+Colour::Red   => "warm",                              // a value
+Colour::Green => { print("thinking"); return "cool"; } // statements
+```
+
+**A block arm never produces a value.** `return` keeps its single meaning of
+leaving the *function*, rather than gaining a second one inside a match — giving
+one keyword two meanings by context is exactly the guessing this language
+refuses. So where a match is used as a value, a block arm has to be one control
+never falls out of: it must `return`, `break` or `continue`. Anything else is
+rejected, because there would be a path with no value to hand back.
+
+```
+error: this arm produces no value
+6 |     Colour::Green => { print("thinking"); }
+  |             ^^^^^ but the match it belongs to is used as one
+  = note: an arm is either an expression, or a block that returns, breaks or continues
+```
+
+The other three checks that fall out of this: every value arm must agree on a
+type (the first one sets it, and the diagnostic points back at it); a match used
+as a statement may not have value arms, since TinyC discards no values; and a
+match whose every arm leaves produces nothing, so it cannot be used as a value
+at all.
+
+A `match` written for its effect is a statement in the one way a call is —
+`Stmt::Match` wraps the same node that `ExprKind::Match` is. Those two are now
+the only expression statements in the language, and each exists for the same
+reason: without them, a `void` function and an effects-only match would be
+unwritable.
+
+Two consequences reach further down than they look. The parser cannot produce a
+type any more: `Colour c = ...` and `int c = ...` are the same shape, and only
+the stage holding the table of declared types knows whether `Colour` is one. So
+syntax carries a `TypeRef` — a name and a span — and resolution happens once, in
+`sema`. And a declaration may now begin with a plain identifier, so what tells
+`Colour c` from `c = 1` and `c(1)` is the *second* token.
+
+Lowering a match is a chain of equality tests against the tag, with one saving
+that only exhaustiveness makes safe: **the last arm is not tested at all.** There
+is nowhere else for the value to be, so three variants cost two comparisons —
+each one fused into its branch, so none of them ever becomes a 0 or a 1.
+
+```
+  0  %t1 = cmp == %c, 0
+  1  branch %t1 ? arm1 : case2
+arm1: ...
+case2:
+  5  %t3 = cmp == %c, 1
+  6  branch %t3 ? arm3 : arm4      ; `arm4` is Blue, reached by elimination
+```
+
+When the match is a value, every value arm writes the **same** register before
+jumping to the join — the trick `&&` already plays, and the one a non-SSA IR is
+what allows. A diverging block arm writes nothing and never arrives:
+
+```
+arm1:  %t1 = straddr str0    ; jump join5
+arm3:  print string %t4
+       return %t5            ; leaves the function, never reaches join5
+arm4:  %t1 = straddr str3    ; jump join5
+join5: return %t1
+```
+
+Printing a value is the one place the names survive into the binary. It is the
+same lookup a `bool` already did — that picks between `"true"` and `"false"` —
+with a table in place of the choice:
+
+```nasm
+enum0_v0: db 82, 101, 100, 0          ; "Red"
+enum0_names: dq enum0_v0, enum0_v1, enum0_v2
+...
+lea  r11, [enum0_names]
+mov  rdx, [r11+r10*8]
+```
+
+The index is safe by construction rather than by checking: a tag can only have
+come from a variant of that very enum, because there is no cast, no arithmetic
+on enums, and no other way to make one.
 
 ### Control flow
 

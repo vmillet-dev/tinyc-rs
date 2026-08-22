@@ -38,7 +38,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    BinOp, Block as AstBlock, CmpOp, Expr, ExprKind, FnDecl, LogicOp, Program as Ast, Stmt, Ty,
+    ArmBody, BinOp, Block as AstBlock, CmpOp, EnumInfo, Expr, ExprKind, FnDecl, LogicOp,
+    MatchArm, Program as Ast, Stmt, Ty,
 };
 use crate::sema::Types;
 
@@ -146,6 +147,10 @@ pub enum BlockKind {
     Step,
     /// Where a loop leaves.
     Done,
+    /// One `match` arm's body.
+    Arm,
+    /// Where a `match` tests the next variant, having ruled out the ones before.
+    Case,
     /// The right operand of `&&` or `||`, reached only when the left one did
     /// not already settle the answer.
     Rhs,
@@ -168,6 +173,8 @@ impl BlockKind {
             BlockKind::Body => "body",
             BlockKind::Step => "step",
             BlockKind::Done => "done",
+            BlockKind::Arm => "arm",
+            BlockKind::Case => "case",
             BlockKind::Rhs => "rhs",
             BlockKind::Short => "short",
             BlockKind::Unreachable => "unreachable",
@@ -270,11 +277,11 @@ impl Function {
     }
 
     /// The signature line used by the IR dump and by assembly comments.
-    pub fn signature(&self) -> String {
+    pub fn signature(&self, enums: &[EnumInfo]) -> String {
         let params: Vec<String> =
             self.params.iter().map(|&r| format!("%{}", self.name_of(r))).collect();
         let ret = match self.ret {
-            Some(ty) => format!(" -> {}", ty.name()),
+            Some(ty) => format!(" -> {}", ty.name(enums)),
             None => String::new(),
         };
         format!("fn {}({}){}", self.name, params.join(", "), ret)
@@ -285,6 +292,12 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// Interned string literals, each stored without its NUL terminator.
     pub strings: Vec<Vec<u8>>,
+    /// The declared enums, carried through so that a type can still be named
+    /// and a value of one can still be printed.
+    ///
+    /// An enum's *values* need nothing here: a variant is its index, so it is
+    /// an integer everywhere the backend is concerned. Only the names survive.
+    pub enums: Vec<EnumInfo>,
 }
 
 impl Program {
@@ -303,7 +316,7 @@ impl Program {
         }
 
         for function in &self.functions {
-            out.push_str(&format!("{}:\n", function.signature()));
+            out.push_str(&format!("{}:\n", function.signature(&self.enums)));
 
             // Numbering restarts per function, matching the indices the
             // allocator works with.
@@ -377,7 +390,7 @@ impl Program {
                     None => call,
                 }
             }
-            Instr::Print { ty, val } => format!("print {} {}", ty.name(), value(val)),
+            Instr::Print { ty, val } => format!("print {} {}", ty.name(&self.enums), value(val)),
         }
     }
 }
@@ -408,7 +421,7 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
 
     let mut strings = Strings::default();
     let mut functions = Vec::new();
-    for decl in &ast.functions {
+    for (index, decl) in ast.functions.iter().enumerate() {
         let lowering = Lowering {
             blocks: Vec::new(),
             vreg_names: Vec::new(),
@@ -417,14 +430,15 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
             loops: Vec::new(),
             name_counts: HashMap::new(),
             types,
+            enums: types.enums(),
             strings: &mut strings,
             ids: &ids,
         };
-        functions.push(lowering.run(decl));
+        functions.push(lowering.run(decl, types.ret_of(index)));
     }
 
     let functions = prune_unreachable_functions(functions, ids.get(crate::sema::ENTRY_POINT));
-    Program { functions, strings: strings.bytes }
+    Program { functions, strings: strings.bytes, enums: types.enums().to_vec() }
 }
 
 /// The literals every function shares, plus the index that keeps interning them
@@ -586,13 +600,15 @@ struct Lowering<'a> {
     /// another scope gets a distinct dump name (`i`, then `i.1`).
     name_counts: HashMap<String, u32>,
     types: &'a Types,
+    /// The declared enums, for turning a variant name into its tag.
+    enums: &'a [EnumInfo],
     /// Shared with every other function: the strings all land in one section.
     strings: &'a mut Strings,
     ids: &'a HashMap<String, FuncId>,
 }
 
 impl Lowering<'_> {
-    fn run(mut self, decl: &FnDecl) -> Function {
+    fn run(mut self, decl: &FnDecl, ret: Option<Ty>) -> Function {
         self.new_block(BlockKind::Entry);
 
         // Parameters first, so each one is defined at the top of the function.
@@ -630,7 +646,7 @@ impl Lowering<'_> {
         Function {
             name: decl.name.clone(),
             params,
-            ret: decl.ret,
+            ret,
             blocks: prune_unreachable(blocks),
             vreg_names: self.vreg_names,
         }
@@ -742,6 +758,7 @@ impl Lowering<'_> {
                 // backend simply never reaches.
                 self.new_block(BlockKind::Unreachable);
             }
+            Stmt::Match(expr) => self.match_lowering(None, expr),
             Stmt::Break { .. } => self.loop_jump(|frame| &mut frame.breaks),
             Stmt::Continue { .. } => self.loop_jump(|frame| &mut frame.continues),
             Stmt::Call(call) => {
@@ -749,6 +766,114 @@ impl Lowering<'_> {
                 self.emit(Instr::Call { dst: None, callee, args });
             }
         }
+    }
+
+    /// Lower a `match` into a chain of equality tests, optionally leaving what
+    /// its arms produced in `dst`.
+    ///
+    /// A variant is its tag, so this is the same shape as `if / else if`, with
+    /// one saving that only exhaustiveness makes safe: **the last arm is not
+    /// tested at all.** There is nowhere else for a value to be, so the last
+    /// test's failure is already the answer — and no arm has to be written for
+    /// "none of the above", because there is no such case.
+    ///
+    /// When `dst` is given, every value arm writes it before jumping to the
+    /// join — the same trick `&&` plays, and the same one a non-SSA IR is what
+    /// allows. A block arm writes nothing: `sema` has established that control
+    /// never reaches its end.
+    ///
+    /// A jump table would beat the chain on a large enum. It would need an
+    /// indirect terminator, which nothing else in this IR wants yet.
+    fn match_lowering(&mut self, dst: Option<VReg>, expr: &Expr) {
+        let ExprKind::Match { scrutinee, arms, .. } = &expr.kind else {
+            unreachable!("the caller matched a match");
+        };
+        let value = self.expr(scrutinee);
+        let before = self.current;
+
+        // Where each arm's decision begins, so a failing test knows where to
+        // send control; and the tests themselves, which cannot be finished
+        // until the arm *after* them exists.
+        let mut entries = Vec::new();
+        let mut tests = Vec::new();
+        let mut exits = Vec::new();
+
+        for (index, arm) in arms.iter().enumerate() {
+            let tag = self.arm_tag(scrutinee, arm);
+            if index + 1 == arms.len() {
+                entries.push(self.new_block(BlockKind::Arm));
+            } else {
+                // The first test belongs to the block the scrutinee was
+                // computed in; each later one gets a block of its own for the
+                // previous test to fail into.
+                if index > 0 {
+                    self.new_block(BlockKind::Case);
+                }
+                entries.push(self.current);
+                let cond = self.fresh_temp();
+                self.emit(Instr::Cmp {
+                    op: CmpOp::Eq,
+                    dst: cond,
+                    lhs: value,
+                    rhs: Value::Const(tag),
+                });
+                let test = self.current;
+                let arm_block = self.new_block(BlockKind::Arm);
+                tests.push((test, Value::Reg(cond), arm_block));
+            }
+            match &arm.body {
+                // A value arm leaves its answer where the join will read it.
+                // Where the match is a statement `dst` is absent, and `sema`
+                // has already rejected an arm that produced one.
+                ArmBody::Value(value) => match dst {
+                    Some(dst) => self.expr_into(dst, value),
+                    None => unreachable!("sema rejects a value arm in statement position"),
+                },
+                ArmBody::Block(block) => self.block_stmts(block),
+            }
+            exits.push(self.current);
+        }
+
+        let join = self.new_block(BlockKind::Join);
+
+        // A single-variant enum has nothing to test, so control simply runs
+        // into the one arm.
+        if tests.is_empty() {
+            self.finish(before, Terminator::Jump(entries[0]));
+        }
+        for (index, (test, cond, arm)) in tests.into_iter().enumerate() {
+            self.finish(
+                test,
+                Terminator::Branch { cond, then_blk: arm, else_blk: entries[index + 1] },
+            );
+        }
+        for exit in exits {
+            self.finish(exit, Terminator::Jump(join));
+        }
+        self.switch_to(join);
+    }
+
+    /// The tag a `Color::Red` expression stands for, which `sema` has already
+    /// established exists.
+    fn variant_tag(&self, expr: &Expr) -> i64 {
+        let ExprKind::Variant { variant, .. } = &expr.kind else {
+            unreachable!("the caller matched a variant");
+        };
+        let Ty::Enum(id) = self.types.of(expr.id) else {
+            unreachable!("sema gives a variant its enum's type");
+        };
+        self.enums[id.0 as usize].tag(variant).expect("sema rejects an unknown variant")
+    }
+
+    /// The tag an arm's pattern selects.
+    ///
+    /// Both halves were checked by [`crate::sema`], which is what makes the
+    /// lookup here an `expect` rather than a diagnostic.
+    fn arm_tag(&self, scrutinee: &Expr, arm: &MatchArm) -> i64 {
+        let Ty::Enum(id) = self.types.of(scrutinee.id) else {
+            unreachable!("sema rejects a match on anything but an enum");
+        };
+        self.enums[id.0 as usize].tag(&arm.variant).expect("sema rejects an unknown variant")
     }
 
     /// Lower a `break` or a `continue`: hand the block it ends to the innermost
@@ -883,6 +1008,10 @@ impl Lowering<'_> {
         match &expr.kind {
             ExprKind::Int(v) => self.emit(Instr::Const { dst, val: *v }),
             ExprKind::Bool(v) => self.emit(Instr::Const { dst, val: i64::from(*v) }),
+            ExprKind::Variant { .. } => {
+                let val = self.variant_tag(expr);
+                self.emit(Instr::Const { dst, val });
+            }
             ExprKind::Str(bytes) => {
                 let id = self.intern(bytes);
                 self.emit(Instr::StrAddr { dst, id });
@@ -923,6 +1052,7 @@ impl Lowering<'_> {
                 }
             }
             ExprKind::Logic { op, lhs, rhs } => self.logic_into(dst, *op, lhs, rhs),
+            ExprKind::Match { .. } => self.match_lowering(Some(dst), expr),
             ExprKind::Call { .. } => {
                 let (callee, args) = self.call_parts(expr);
                 self.emit(Instr::Call { dst: Some(dst), callee, args });
@@ -1026,6 +1156,10 @@ impl Lowering<'_> {
             ExprKind::Int(v) => Value::Const(*v),
             ExprKind::Bool(v) => Value::Const(i64::from(*v)),
             ExprKind::Var(name) => Value::Reg(self.lookup(name)),
+            // A variant *is* its tag, so it needs no more machinery than an
+            // integer literal does — which is the whole reason a payload-free
+            // enum costs the backend nothing.
+            ExprKind::Variant { .. } => Value::Const(self.variant_tag(expr)),
             ExprKind::Neg(operand) => match self.expr(operand) {
                 // An operand that is already a literal folds, and so does the
                 // whole tree above it: `-(2 * 3)` never reaches an instruction.
@@ -1085,7 +1219,7 @@ impl Lowering<'_> {
                 self.logic_branch(dst, *op, cond, rhs);
                 Value::Reg(dst)
             }
-            ExprKind::Str(_) | ExprKind::Call { .. } => {
+            ExprKind::Str(_) | ExprKind::Call { .. } | ExprKind::Match { .. } => {
                 let dst = self.fresh_temp();
                 self.expr_into(dst, expr);
                 Value::Reg(dst)
@@ -1248,6 +1382,214 @@ mod tests {
         let with_for = lower_main("for (int i = 0; i < 3; i = i + 1) {\n  print(i);\n}");
         let with_while = lower_main("int i = 0;\nwhile (i < 3) {\n  print(i);\n  i = i + 1;\n}");
         assert_eq!(with_for.dump(), with_while.dump());
+    }
+
+    // -- enums and match ---------------------------------------------------
+
+    /// A `Colour` enum and a `main`, so the tests about enums stay about enums.
+    fn lower_colour(body: &str) -> Program {
+        lower_src(&format!("enum Colour {{ Red, Green, Blue }}\nfn main() {{\n{body}\n}}\n"))
+    }
+
+    #[test]
+    fn a_variant_lowers_to_its_tag_and_nothing_else() {
+        // The whole representation: a variant is where it was written in the
+        // declaration, so it is an immediate like any other integer.
+        let ir = lower_colour("Colour c = Colour::Blue;\nprint(c);");
+        assert_eq!(
+            body_dump(&ir),
+            concat!(
+                "entry0:\n",
+                "  0  %c = const 2\n",
+                "  1  print Colour %c\n",
+                "  2  return\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_variant_used_as_an_operand_stays_an_immediate() {
+        let ir = lower_colour("Colour c = Colour::Red;\nprint(c == Colour::Green);");
+        assert!(
+            ir.functions[0].blocks[0]
+                .instrs
+                .iter()
+                .any(|i| matches!(i, Instr::Cmp { rhs: Value::Const(1), .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_match_tests_every_variant_but_the_last() {
+        // Exhaustiveness pays for itself here: there is nowhere else for the
+        // value to be, so the final test would always succeed.
+        let ir = lower_colour(
+            "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Red => { print(1); }\n  \
+             Colour::Green => { print(2); }\n  Colour::Blue => { print(3); }\n}",
+        );
+        let main = &ir.functions[0];
+        assert_eq!(labels(main), vec!["entry0", "arm1", "case2", "arm3", "arm4", "join5"]);
+
+        let comparisons = main
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .filter(|i| matches!(i, Instr::Cmp { .. }))
+            .count();
+        assert_eq!(comparisons, 2, "three variants need two tests: {}", ir.dump());
+    }
+
+    #[test]
+    fn each_match_arm_reaches_the_same_join() {
+        let ir = lower_colour(
+            "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Red => { print(1); }\n  \
+             Colour::Green => { print(2); }\n  Colour::Blue => { print(3); }\n}\nprint(9);",
+        );
+        let main = &ir.functions[0];
+        let join = BlockId(5);
+        for arm in [1usize, 3, 4] {
+            assert!(
+                matches!(main.blocks[arm].term, Terminator::Jump(target) if target == join),
+                "arm {arm}: {}",
+                ir.dump()
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_variant_enum_needs_no_test_at_all() {
+        // There is only one place the value can be, so the scrutinee's block
+        // simply runs into the one arm.
+        let ir = lower_src(
+            "enum Unit { Only }\nfn main() {\n  Unit u = Unit::Only;\n  \
+             match (u) {\n    Unit::Only => { print(1); }\n  }\n}",
+        );
+        let main = &ir.functions[0];
+        assert!(
+            !main.blocks.iter().flat_map(|b| &b.instrs).any(|i| matches!(i, Instr::Cmp { .. })),
+            "{}",
+            ir.dump()
+        );
+        assert!(matches!(main.blocks[0].term, Terminator::Jump(_)), "{}", ir.dump());
+    }
+
+    #[test]
+    fn the_arms_are_matched_in_the_order_they_are_written() {
+        // Not in declaration order: an arm's tag comes from its own pattern.
+        let ir = lower_colour(
+            "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Blue => { print(1); }\n  \
+             Colour::Red => { print(2); }\n  Colour::Green => { print(3); }\n}",
+        );
+        let tags: Vec<i64> = ir.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .filter_map(|i| match i {
+                Instr::Cmp { rhs: Value::Const(tag), .. } => Some(*tag),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tags, vec![2, 0], "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_loop_jump_inside_an_arm_belongs_to_the_loop() {
+        let ir = lower_src(
+            "enum A { X, Y }\nfn main() {\n  while (true) {\n    A a = A::X;\n    \
+             match (a) {\n      A::X => { break; }\n      A::Y => { print(1); }\n    }\n  }\n}",
+        );
+        // The `break` leaves for the loop's exit, not the match's join.
+        let main = &ir.functions[0];
+        let done = main
+            .blocks
+            .iter()
+            .position(|b| b.kind == BlockKind::Done)
+            .expect("the loop has an exit");
+        assert!(
+            main.blocks.iter().any(|b| matches!(b.term, Terminator::Jump(t) if t.0 as usize == done)),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn every_value_arm_writes_the_same_register() {
+        // The trick `&&` already plays, with more arms: a non-SSA IR lets the
+        // join read one register that several blocks wrote.
+        let ir = lower_colour(
+            "string s = match (Colour::Red) {\n  Colour::Red => \"a\",\n  \
+             Colour::Green => \"b\",\n  Colour::Blue => \"c\",\n};\nprint(s);",
+        );
+        let main = &ir.functions[0];
+        let written: Vec<VReg> = main
+            .blocks
+            .iter()
+            .filter(|b| b.kind == BlockKind::Arm)
+            .filter_map(|b| b.instrs.last().and_then(|i| i.def()))
+            .collect();
+        assert_eq!(written.len(), 3, "{}", ir.dump());
+        assert!(written.windows(2).all(|w| w[0] == w[1]), "{written:?} in {}", ir.dump());
+    }
+
+    #[test]
+    fn a_block_arm_writes_nothing_and_never_reaches_the_join() {
+        let ir = lower_src(
+            "enum A { X, Y }\nfn f(A a) -> int {\n  return match (a) {\n    A::X => 1,\n    \
+             A::Y => { print(9); return 2; }\n  };\n}\nfn main() {\n  print(f(A::X));\n}",
+        );
+        let f = &ir.functions[0];
+        // The diverging arm ends in a `return`, not a jump to the join.
+        assert!(
+            f.blocks
+                .iter()
+                .filter(|b| b.kind == BlockKind::Arm)
+                .any(|b| matches!(b.term, Terminator::Return(Some(_)))),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_match_statement_needs_no_destination() {
+        // Nothing reads it, so no temporary is spent on one.
+        let ir = lower_colour(
+            "match (Colour::Red) {\n  Colour::Red => { print(1); }\n  \
+             Colour::Green => { print(2); }\n  Colour::Blue => { print(3); }\n}",
+        );
+        let main = &ir.functions[0];
+        let joins: Vec<&Block> =
+            main.blocks.iter().filter(|b| b.kind == BlockKind::Join).collect();
+        assert_eq!(joins.len(), 1);
+        assert!(joins[0].instrs.is_empty(), "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_match_expression_folds_its_arms_like_any_other_operand() {
+        // A variant arm is a constant, so it never reaches a register at all.
+        let ir = lower_src(
+            "enum A { X, Y }\nfn main() {\n  A a = match (A::X) {\n    A::X => A::Y,\n    \
+             A::Y => A::X,\n  };\n  print(a);\n}",
+        );
+        let main = &ir.functions[0];
+        assert!(
+            main.blocks
+                .iter()
+                .flat_map(|b| &b.instrs)
+                .any(|i| matches!(i, Instr::Const { val: 1, .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn the_enums_travel_with_the_program() {
+        // The backend needs the names to print one, and the dump to name the
+        // type; the values themselves need nothing.
+        let ir = lower_colour("print(Colour::Red);");
+        assert_eq!(ir.enums.len(), 1);
+        assert_eq!(ir.enums[0].name, "Colour");
+        assert_eq!(ir.enums[0].variants, vec!["Red", "Green", "Blue"]);
     }
 
     // -- negation and remainder --------------------------------------------

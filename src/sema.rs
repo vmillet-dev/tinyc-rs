@@ -6,30 +6,168 @@
 //! up: statements are independent enough that later ones are still worth
 //! checking.
 //!
-//! ## Two passes, and why
+//! ## Three passes, and why
 //!
-//! Signatures are collected before any body is checked. That is what lets a
-//! function call another one declared further down the file, and what lets a
-//! function call *itself* — by the time `fib`'s body is checked, `fib` is
-//! already in the table. A single pass could only ever see backwards.
+//! Each one exists because the next needs a table it could not have built for
+//! itself, and a single pass could only ever look backwards.
+//!
+//! 0. **Enums**, because a signature may mention one and a declaration may.
+//!    Nothing in an enum refers to anything else, so one sweep settles them.
+//! 1. **Signatures**, before any body. That is what lets a function call
+//!    another declared further down the file, and what lets a function call
+//!    *itself* — by the time `fib`'s body is checked, `fib` is in the table.
+//! 2. **Bodies**, each with the whole of both tables visible.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, NodeId, Program, Stmt, Ty};
+use crate::ast::{
+    ArmBody, BinOp, Block, EnumId, EnumInfo, Expr, ExprKind, FnDecl, MatchArm, NodeId, Program,
+    Stmt, Ty,
+    TypeRef,
+};
 use crate::diag::{Diagnostic, Result, Span};
 
 /// The name of the entry point.
 pub const ENTRY_POINT: &str = "main";
 
-/// Type of every expression node, indexed by [`NodeId`].
+/// Everything this stage worked out, for the ones after it.
+///
+/// Chiefly the type of every expression, but also the two answers that took a
+/// name lookup to reach and that no later stage can repeat, because only this
+/// one ever holds the table of declared types.
 #[derive(Debug)]
 pub struct Types {
     expr_ty: Vec<Ty>,
+    /// Resolved return type per function, in declaration order.
+    fn_ret: Vec<Option<Ty>>,
+    enums: Vec<EnumInfo>,
 }
 
 impl Types {
     pub fn of(&self, id: NodeId) -> Ty {
         self.expr_ty[id.0 as usize]
+    }
+
+    /// The return type of a function, by its position in the program.
+    pub fn ret_of(&self, function: usize) -> Option<Ty> {
+        self.fn_ret[function]
+    }
+
+    pub fn enums(&self) -> &[EnumInfo] {
+        &self.enums
+    }
+}
+
+/// The declared enums, and everything asked about them after pass 0.
+struct Enums {
+    /// Shared onward with [`crate::ir`]: names, and variant names in order.
+    infos: Vec<EnumInfo>,
+    /// Where each was declared, for "declared here" notes.
+    spans: Vec<Span>,
+    by_name: HashMap<String, EnumId>,
+}
+
+impl Enums {
+    fn id(&self, name: &str) -> Option<EnumId> {
+        self.by_name.get(name).copied()
+    }
+
+    fn info(&self, id: EnumId) -> &EnumInfo {
+        &self.infos[id.0 as usize]
+    }
+}
+
+/// Pass 0: one entry per enum name, with the first declaration winning.
+///
+/// Enums come before signatures because a signature may mention one, and before
+/// bodies because a declaration may. Nothing in an enum can refer to anything
+/// else, so one pass over them is enough.
+fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Enums {
+    let mut enums = Enums { infos: Vec::new(), spans: Vec::new(), by_name: HashMap::new() };
+
+    for declaration in &program.enums {
+        if declaration.variants.is_empty() {
+            errors.push(
+                Diagnostic::new(
+                    format!("`{}` has no variants", declaration.name),
+                    declaration.name_span,
+                )
+                .with_label("an enum needs at least one")
+                .with_note("no value could ever have this type otherwise", None),
+            );
+        }
+
+        // Variants are named within their own enum, so two enums may both have
+        // a `Red` — but one enum may not have two.
+        let mut variants: Vec<String> = Vec::new();
+        for variant in &declaration.variants {
+            if variants.contains(&variant.name) {
+                errors.push(
+                    Diagnostic::new(
+                        format!("`{}` is declared twice in `{}`", variant.name, declaration.name),
+                        variant.name_span,
+                    )
+                    .with_label("a variant may only be named once"),
+                );
+                continue;
+            }
+            variants.push(variant.name.clone());
+        }
+
+        if let Some(&previous) = enums.by_name.get(&declaration.name) {
+            let previous = enums.spans[previous.0 as usize];
+            errors.push(
+                Diagnostic::new(
+                    format!("`{}` is already declared", declaration.name),
+                    declaration.name_span,
+                )
+                .with_label("declared a second time here")
+                .with_note("previous declaration", Some(previous)),
+            );
+            continue;
+        }
+
+        enums.by_name.insert(declaration.name.clone(), EnumId(enums.infos.len() as u32));
+        enums.infos.push(EnumInfo { name: declaration.name.clone(), variants });
+        enums.spans.push(declaration.name_span);
+    }
+
+    enums
+}
+
+/// Turn a written type into the type it names.
+///
+/// `None` means the name does not name a type at all — reported here, so a
+/// caller can fall back on the recovery type without saying anything further.
+fn resolve_type(enums: &Enums, ty: &TypeRef, errors: &mut Vec<Diagnostic>) -> Option<Ty> {
+    match ty.name.as_str() {
+        "int" => Some(Ty::Int),
+        "string" => Some(Ty::Str),
+        "bool" => Some(Ty::Bool),
+        name => enums.id(name).map(Ty::Enum).or_else(|| {
+            errors.push(
+                Diagnostic::new(format!("unknown type `{name}`"), ty.span)
+                    .with_label("no built-in type and no enum goes by this name")
+                    .with_note("the built-in types are `int`, `string` and `bool`", None),
+            );
+            None
+        }),
+    }
+}
+
+/// `` `A` is `` / `` `A` and `B` are ``, so the label agrees with its subject.
+fn missing_verb(missing: &[&str]) -> String {
+    let verb = if missing.len() == 1 { "is" } else { "are" };
+    format!("{} {verb}", list(missing))
+}
+
+/// `A`, `A` and `B`, `A`, `B` and `C` — so a list reads as prose.
+fn list(items: &[&str]) -> String {
+    let quoted: Vec<String> = items.iter().map(|item| format!("`{item}`")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -51,16 +189,25 @@ struct Signature {
 pub fn check(program: &Program, max_params: usize) -> Result<Types> {
     let mut errors = Vec::new();
 
+    // Pass 0: the declared types, before anything can mention one.
+    let enums = collect_enums(program, &mut errors);
+
     // Pass 1: every signature, before any body.
-    let signatures = collect_signatures(program, max_params, &mut errors);
-    check_entry_point(program, &signatures, &mut errors);
+    let signatures = collect_signatures(program, &enums, max_params, &mut errors);
+    check_entry_point(program, &signatures, &enums, &mut errors);
 
     // Pass 2: the bodies, each with the whole table visible.
+    let fn_ret = program.functions.iter().map(|f| signatures[&f.name].ret).collect();
     let mut checker = Checker {
         // `Int` is the recovery type: an expression that failed to check is
         // treated as an int so a single mistake does not cascade.
-        types: Types { expr_ty: vec![Ty::Int; program.node_count] },
+        types: Types {
+            expr_ty: vec![Ty::Int; program.node_count],
+            fn_ret,
+            enums: enums.infos.clone(),
+        },
         signatures: &signatures,
+        enums: &enums,
         errors,
     };
     for function in &program.functions {
@@ -83,6 +230,7 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
 /// Pass 1: one entry per function name, with the first declaration winning.
 fn collect_signatures(
     program: &Program,
+    enums: &Enums,
     max_params: usize,
     errors: &mut Vec<Diagnostic>,
 ) -> HashMap<String, Signature> {
@@ -99,7 +247,7 @@ fn collect_signatures(
                         function.name,
                         function.params.len()
                     ),
-                    offending.ty_span.to(offending.name_span),
+                    offending.ty.span.to(offending.name_span),
                 )
                 .with_label(format!("parameter {} is one too many", max_params + 1))
                 .with_note(
@@ -125,11 +273,20 @@ fn collect_signatures(
             continue;
         }
 
+        // A type that does not resolve was reported by `resolve_type`; `Int`
+        // stands in so the rest of the signature still checks.
         signatures.insert(
             function.name.clone(),
             Signature {
-                params: function.params.iter().map(|p| p.ty).collect(),
-                ret: function.ret,
+                params: function
+                    .params
+                    .iter()
+                    .map(|p| resolve_type(enums, &p.ty, errors).unwrap_or(Ty::Int))
+                    .collect(),
+                ret: function
+                    .ret
+                    .as_ref()
+                    .map(|ty| resolve_type(enums, ty, errors).unwrap_or(Ty::Int)),
                 name_span: function.name_span,
             },
         );
@@ -143,6 +300,7 @@ fn collect_signatures(
 fn check_entry_point(
     program: &Program,
     signatures: &HashMap<String, Signature>,
+    enums: &Enums,
     errors: &mut Vec<Diagnostic>,
 ) {
     let Some(main) = signatures.get(ENTRY_POINT) else {
@@ -168,7 +326,7 @@ fn check_entry_point(
         errors.push(
             Diagnostic::new(
                 format!("`{ENTRY_POINT}` must not take parameters"),
-                first.ty_span.to(decl.params[decl.params.len() - 1].name_span),
+                first.ty.span.to(decl.params[decl.params.len() - 1].name_span),
             )
             .with_label("the runtime calls it with no arguments"),
         );
@@ -180,7 +338,7 @@ fn check_entry_point(
                 format!("`{ENTRY_POINT}` must not return a value"),
                 decl.ret_span,
             )
-            .with_label(format!("expected no return type, found {}", ty.name()))
+            .with_label(format!("expected no return type, found {}", ty.name(&enums.infos)))
             .with_note("the process exit code is always 0", None),
         );
     }
@@ -220,8 +378,52 @@ fn always_returns(block: &Block) -> bool {
         Stmt::If { then_block, else_block: Some(else_block), .. } => {
             always_returns(then_block) && always_returns(else_block)
         }
+        // A `match` needs no `else` to be complete: it covers every variant, so
+        // if every arm returns then so does the statement. This is the one
+        // place exhaustiveness pays for itself in what a program may leave out.
+        Stmt::Match(expr) => match_arms(expr).is_some_and(|arms| {
+            !arms.is_empty()
+                && arms.iter().all(|arm| match &arm.body {
+                    ArmBody::Block(block) => always_returns(block),
+                    // A value arm hands one back to whoever wanted it; it does
+                    // not leave the function.
+                    ArmBody::Value(_) => false,
+                })
+        }),
         _ => false,
     })
+}
+
+/// Whether every path out of a block leaves it early, by any means.
+///
+/// Wider than [`always_returns`], which only counts `return` because only a
+/// `return` ends a *function*. A `match` used as an expression asks a different
+/// question about its block arms — "can control reach the end of this, where a
+/// value would be needed?" — and a `break` or a `continue` answers it just as
+/// well as a `return` does.
+fn diverges(block: &Block) -> bool {
+    block.stmts.iter().any(|stmt| match stmt {
+        Stmt::Return { .. } | Stmt::Break { .. } | Stmt::Continue { .. } => true,
+        Stmt::If { then_block, else_block: Some(else_block), .. } => {
+            diverges(then_block) && diverges(else_block)
+        }
+        Stmt::Match(expr) => match_arms(expr).is_some_and(|arms| {
+            !arms.is_empty()
+                && arms.iter().all(|arm| match &arm.body {
+                    ArmBody::Block(block) => diverges(block),
+                    ArmBody::Value(_) => false,
+                })
+        }),
+        _ => false,
+    })
+}
+
+/// The arms of an expression that is a `match`, for the two walks above.
+fn match_arms(expr: &Expr) -> Option<&[MatchArm]> {
+    match &expr.kind {
+        ExprKind::Match { arms, .. } => Some(arms),
+        _ => None,
+    }
 }
 
 /// What the whole program shares: one type table, one signature table, one list
@@ -230,6 +432,8 @@ struct Checker<'a> {
     types: Types,
     /// Every signature in the program, immutable once pass 1 is done.
     signatures: &'a HashMap<String, Signature>,
+    /// Every declared enum, immutable once pass 0 is done.
+    enums: &'a Enums,
     errors: Vec<Diagnostic>,
 }
 
@@ -259,9 +463,12 @@ struct FnChecker<'a, 'c> {
 
 impl<'a, 'c> FnChecker<'a, 'c> {
     fn new(shared: &'c mut Checker<'a>, function: &FnDecl) -> FnChecker<'a, 'c> {
+        // Pass 1 resolved this already; re-resolving would report an unknown
+        // return type a second time.
+        let ret = shared.signatures[&function.name].ret;
         FnChecker {
             shared,
-            ret: function.ret,
+            ret,
             ret_span: function.ret_span,
             scopes: Vec::new(),
             undeclared: HashSet::new(),
@@ -271,6 +478,23 @@ impl<'a, 'c> FnChecker<'a, 'c> {
 
     fn error(&mut self, diagnostic: Diagnostic) {
         self.shared.errors.push(diagnostic);
+    }
+
+    /// Resolve a written type, falling back on the recovery type when it names
+    /// nothing. The mistake is reported by [`resolve_type`] itself.
+    fn resolve(&mut self, ty: &TypeRef) -> Ty {
+        resolve_type(self.shared.enums, ty, &mut self.shared.errors).unwrap_or(Ty::Int)
+    }
+
+    /// A type's name. [`Ty`] cannot answer this alone — an enum's name is the
+    /// program's, not the compiler's — so every diagnostic asks here.
+    fn ty_name(&self, ty: Ty) -> String {
+        ty.name(&self.shared.enums.infos).to_string()
+    }
+
+    /// The same with its indefinite article, for prose.
+    fn ty_article(&self, ty: Ty) -> String {
+        ty.with_article(&self.shared.enums.infos)
     }
 
     /// The signature of a function anywhere in the program.
@@ -324,8 +548,10 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         // Parameters live in the body's outermost scope, so a local of the same
         // name at the top level of the body is a redeclaration, not a shadow.
         self.scopes.push(HashMap::new());
-        for param in &function.params {
-            self.declare(&param.name, param.ty, param.name_span, "a parameter");
+        // Pass 1 resolved these too, and reported any that named nothing.
+        let params = self.shared.signatures[&function.name].params.clone();
+        for (param, ty) in function.params.iter().zip(params) {
+            self.declare(&param.name, ty, param.name_span, "a parameter");
         }
         for stmt in &function.body.stmts {
             self.stmt(stmt);
@@ -365,7 +591,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     format!("the condition of `{keyword}` must be a `bool`"),
                     cond.span,
                 )
-                .with_label(format!("expected bool, found {}", ty.name()))
+                .with_label(format!("expected bool, found {}", self.ty_name(ty)))
                 .with_note("comparisons like `i < 10` produce a bool", None),
             );
         }
@@ -373,22 +599,27 @@ impl<'a, 'c> FnChecker<'a, 'c> {
 
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Decl { ty, name, name_span, init, .. } => {
+            Stmt::Decl { ty, name, name_span, init } => {
+                let declared = self.resolve(ty);
                 let actual = self.expr(init);
-                if actual != *ty {
+                if actual != declared {
                     self.error(
                         Diagnostic::new(
                             format!(
                                 "cannot initialize {} variable with {} value",
-                                ty.with_article(),
-                                actual.with_article()
+                                self.ty_article(declared),
+                                self.ty_article(actual)
                             ),
                             init.span,
                         )
-                        .with_label(format!("expected {}, found {}", ty.name(), actual.name())),
+                        .with_label(format!(
+                            "expected {}, found {}",
+                            self.ty_name(declared),
+                            self.ty_name(actual)
+                        )),
                     );
                 }
-                self.declare(name, *ty, *name_span, "a variable");
+                self.declare(name, declared, *name_span, "a variable");
             }
             Stmt::Assign { name, name_span, value } => {
                 // The target is looked up *before* the value is checked, so
@@ -417,15 +648,15 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         Diagnostic::new(
                             format!(
                                 "cannot assign {} value to {} variable",
-                                actual.with_article(),
-                                declared.with_article()
+                                self.ty_article(actual),
+                                self.ty_article(declared)
                             ),
                             value.span,
                         )
                         .with_label(format!(
                             "expected {}, found {}",
-                            declared.name(),
-                            actual.name()
+                            self.ty_name(declared),
+                            self.ty_name(actual)
                         ))
                         .with_note(format!("`{name}` was declared here"), Some(declared_span)),
                     );
@@ -455,6 +686,12 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 self.stmt(step);
                 self.loop_body(body);
                 self.scopes.pop();
+            }
+            // The value is discarded, exactly as a call statement's is — and
+            // like one, the type still goes in the table.
+            Stmt::Match(expr) => {
+                let ty = self.match_expr(expr, true).unwrap_or(Ty::Int);
+                self.record(expr.id, ty);
             }
             Stmt::Return { span, value } => self.return_stmt(*span, value.as_ref()),
             Stmt::Break { span } => self.loop_jump(*span, "break", "leaves"),
@@ -518,6 +755,264 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         );
     }
 
+    /// Check `Color::Red` and answer the type it has, which is the enum's.
+    ///
+    /// Both halves can be wrong independently, and are reported separately: the
+    /// enum name underlines one, the variant the other.
+    fn variant(&mut self, name: &str, span: Span, variant: &str, variant_span: Span) -> Ty {
+        let Some(id) = self.shared.enums.id(name) else {
+            self.error(
+                Diagnostic::new(format!("unknown enum `{name}`"), span)
+                    .with_label("no enum goes by this name")
+                    .with_note("a variant is always written `Enum::Variant`", None),
+            );
+            return Ty::Int;
+        };
+
+        if self.shared.enums.info(id).tag(variant).is_none() {
+            let info = self.shared.enums.info(id);
+            let known: Vec<&str> = info.variants.iter().map(String::as_str).collect();
+            let note = format!("`{name}` has {}", list(&known));
+            self.error(
+                Diagnostic::new(format!("`{name}` has no variant `{variant}`"), variant_span)
+                    .with_label("not one of its variants")
+                    .with_note(note, None),
+            );
+        }
+        // Even a misspelt variant has the enum's type: that much was written
+        // down, and reporting the same mistake again as a type error would not
+        // help anybody.
+        Ty::Enum(id)
+    }
+
+    /// Check a `match` and answer the type it produces, or `None` when it
+    /// produces nothing.
+    ///
+    /// Exhaustiveness is the whole point of the construct: a `match` that has
+    /// forgotten a variant does not compile, so adding a variant to an enum
+    /// turns every place that has to think again into an error rather than into
+    /// a silent fall-through — which is also why there is no catch-all pattern.
+    ///
+    /// `as_statement` says whether producing nothing is acceptable here, the
+    /// same question [`Self::call`] asks about a `void` callee.
+    fn match_expr(&mut self, expr: &Expr, as_statement: bool) -> Option<Ty> {
+        let ExprKind::Match { keyword, scrutinee, arms } = &expr.kind else {
+            unreachable!("the parser only builds `Stmt::Match` around a match");
+        };
+        let span = *keyword;
+
+        let ty = self.expr(scrutinee);
+        let Ty::Enum(id) = ty else {
+            self.error(
+                Diagnostic::new(
+                    format!("cannot match on {}", self.ty_article(ty)),
+                    scrutinee.span,
+                )
+                .with_label("a match needs an enum, whose variants can be counted")
+                .with_note("`if` is what asks a question about an int, string or bool", None),
+            );
+            // The arms are still checked: their own mistakes are worth
+            // reporting whatever the scrutinee turned out to be.
+            for arm in arms {
+                self.arm_body(&arm.body);
+            }
+            return None;
+        };
+
+        // Where the first arm for each variant was, in declaration order, which
+        // is the order both diagnostics below want to talk about them in.
+        let variants = self.shared.enums.info(id).variants.clone();
+        let mut covered: Vec<Option<Span>> = vec![None; variants.len()];
+
+        // An arm whose pattern named nothing leaves a hole that is not the
+        // program's real mistake. Reporting what it failed to cover on top of
+        // that would be saying the same thing twice, and the derived complaint
+        // sorts ahead of the true one.
+        let mut readable = true;
+        for arm in arms {
+            readable &= self.match_arm(id, arm, &variants, &mut covered);
+        }
+
+        let missing: Vec<&str> = variants
+            .iter()
+            .zip(&covered)
+            .filter(|(_, seen)| seen.is_none())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !missing.is_empty() && readable {
+            let name = self.ty_name(ty);
+            self.error(
+                Diagnostic::new(
+                    format!("this match does not cover every variant of `{name}`"),
+                    span,
+                )
+                .with_label(format!("{} not handled", missing_verb(&missing)))
+                .with_note(
+                    "every variant needs an arm; TinyC has no catch-all pattern, so that \
+                     adding a variant cannot be quietly ignored",
+                    None,
+                ),
+            );
+        }
+
+        self.match_value(span, arms, as_statement)
+    }
+
+    /// Check an arm's body, whichever of the two shapes it has.
+    fn arm_body(&mut self, body: &ArmBody) {
+        match body {
+            // The type it produced lands in the table; `match_value` reads it
+            // back once every arm has been seen.
+            ArmBody::Value(value) => {
+                self.expr(value);
+            }
+            ArmBody::Block(block) => self.block(block),
+        }
+    }
+
+    /// What the arms produce between them, and whether that is allowed here.
+    ///
+    /// A value arm hands its expression back; a block arm hands back nothing,
+    /// because `return` inside one keeps its single meaning of leaving the
+    /// function. So a block arm is only admissible where a value is wanted if
+    /// control cannot reach its end at all — which is what [`diverges`] asks.
+    fn match_value(&mut self, span: Span, arms: &[MatchArm], as_statement: bool) -> Option<Ty> {
+        // The first arm to produce a value sets the type the rest must agree
+        // with, and is where "expected ..., found ..." points back to.
+        let mut produced: Option<(Ty, Span)> = None;
+        for arm in arms {
+            let ArmBody::Value(value) = &arm.body else { continue };
+            let ty = self.shared.types.of(value.id);
+            match produced {
+                None => produced = Some((ty, value.span)),
+                Some((expected, first)) if ty != expected => self.error(
+                    Diagnostic::new(
+                        format!(
+                            "this arm produces {}, but an earlier one produces {}",
+                            self.ty_article(ty),
+                            self.ty_article(expected)
+                        ),
+                        value.span,
+                    )
+                    .with_label(format!(
+                        "expected {}, found {}",
+                        self.ty_name(expected),
+                        self.ty_name(ty)
+                    ))
+                    .with_note("every arm of a match has to agree", Some(first)),
+                ),
+                Some(_) => {}
+            }
+        }
+
+        if as_statement {
+            // Nothing here would read a value, and TinyC discards none.
+            if let Some((_, first)) = produced {
+                self.error(
+                    Diagnostic::new("this arm produces a value, but nothing uses it", first)
+                        .with_label("a match written as a statement runs its arms for effect")
+                        .with_note(
+                            "wrap it in a block to discard it, or use the match as a value",
+                            None,
+                        ),
+                );
+            }
+            return None;
+        }
+
+        // In value position, a block arm has to be one control never leaves the
+        // end of, or there is a path with no value to hand back.
+        for arm in arms {
+            let ArmBody::Block(block) = &arm.body else { continue };
+            if !diverges(block) {
+                self.error(
+                    Diagnostic::new("this arm produces no value", arm.variant_span)
+                        .with_label("but the match it belongs to is used as one")
+                        .with_note(
+                            "an arm is either an expression, or a block that returns, \
+                             breaks or continues",
+                            None,
+                        ),
+                );
+            }
+        }
+
+        if produced.is_none() {
+            self.error(
+                Diagnostic::new("this match produces no value", span)
+                    .with_label("every arm leaves without one")
+                    .with_note("give at least one arm an expression to hand back", None),
+            );
+        }
+        // `Int` is the recovery type, as everywhere else: a match that produced
+        // nothing has already been reported, and pretending it has no type at
+        // all would make its caller report the same mistake again.
+        Some(produced.map_or(Ty::Int, |(ty, _)| ty))
+    }
+
+    /// One arm: it must name the scrutinee's enum, name a variant of it, and be
+    /// the first arm to do so.
+    ///
+    /// Answers whether the pattern named a variant at all — a duplicate still
+    /// did, and so still says something about coverage.
+    fn match_arm(
+        &mut self,
+        id: EnumId,
+        arm: &MatchArm,
+        variants: &[String],
+        covered: &mut [Option<Span>],
+    ) -> bool {
+        // Always check the body, whatever the pattern turns out to be.
+        let pattern = self.arm_tag(id, arm, variants);
+        self.arm_body(&arm.body);
+
+        let Some(tag) = pattern else { return false };
+        let at = tag as usize;
+        if let Some(previous) = covered[at] {
+            self.error(
+                Diagnostic::new(
+                    format!("`{}` is already covered", variants[at]),
+                    arm.variant_span,
+                )
+                .with_label("this arm can never run")
+                .with_note("covered here", Some(previous)),
+            );
+            return true;
+        }
+        covered[at] = Some(arm.variant_span);
+        true
+    }
+
+    /// The tag an arm's pattern selects, or `None` when the pattern does not
+    /// name a variant of this enum — reported here.
+    fn arm_tag(&mut self, id: EnumId, arm: &MatchArm, variants: &[String]) -> Option<i64> {
+        let expected = self.shared.enums.info(id).name.clone();
+        if arm.enum_name != expected {
+            self.error(
+                Diagnostic::new(
+                    format!("this arm matches `{}`, but the value is a `{expected}`", arm.enum_name),
+                    arm.enum_span,
+                )
+                .with_label(format!("expected a variant of `{expected}`")),
+            );
+            return None;
+        }
+
+        let tag = self.shared.enums.info(id).tag(&arm.variant);
+        if tag.is_none() {
+            let known: Vec<&str> = variants.iter().map(String::as_str).collect();
+            self.error(
+                Diagnostic::new(
+                    format!("`{expected}` has no variant `{}`", arm.variant),
+                    arm.variant_span,
+                )
+                .with_label("not one of its variants")
+                .with_note(format!("`{expected}` has {}", list(&known)), None),
+            );
+        }
+        tag
+    }
+
     /// A loop's body, checked with one more loop open around it.
     fn loop_body(&mut self, body: &Block) {
         self.loop_depth += 1;
@@ -549,15 +1044,15 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         Diagnostic::new(
                             format!(
                                 "cannot return {} value from a function returning {}",
-                                actual.with_article(),
-                                expected.with_article()
+                                self.ty_article(actual),
+                                self.ty_article(expected)
                             ),
                             expr.span,
                         )
                         .with_label(format!(
                             "expected {}, found {}",
-                            expected.name(),
-                            actual.name()
+                            self.ty_name(expected),
+                            self.ty_name(actual)
                         ))
                         .with_note("declared here", Some(self.ret_span)),
                     );
@@ -565,7 +1060,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             }
             (Some(expected), None) => self.error(
                 Diagnostic::new("this `return` needs a value", span)
-                    .with_label(format!("expected {}", expected.with_article()))
+                    .with_label(format!("expected {}", self.ty_article(expected)))
                     .with_note("this return type was declared here", Some(self.ret_span)),
             ),
             (None, Some(expr)) => {
@@ -629,12 +1124,16 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         Diagnostic::new(
                             format!(
                                 "cannot pass {} value where {} is expected",
-                                found.with_article(),
-                                expected.with_article()
+                                self.ty_article(*found),
+                                self.ty_article(*expected)
                             ),
                             arg.span,
                         )
-                        .with_label(format!("expected {}, found {}", expected.name(), found.name()))
+                        .with_label(format!(
+                            "expected {}, found {}",
+                            self.ty_name(*expected),
+                            self.ty_name(*found)
+                        ))
                         .with_note(format!("`{name}` is defined here"), Some(declared_at)),
                     );
                 }
@@ -672,10 +1171,10 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 if inner != Ty::Int {
                     self.error(
                         Diagnostic::new(
-                            format!("cannot apply `-` to {} value", inner.with_article()),
+                            format!("cannot apply `-` to {} value", self.ty_article(inner)),
                             operand.span,
                         )
-                        .with_label(format!("expected int, found {}", inner.name())),
+                        .with_label(format!("expected int, found {}", self.ty_name(inner))),
                     );
                 }
                 Ty::Int
@@ -685,10 +1184,10 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 if inner != Ty::Bool {
                     self.error(
                         Diagnostic::new(
-                            format!("cannot apply `!` to {} value", inner.with_article()),
+                            format!("cannot apply `!` to {} value", self.ty_article(inner)),
                             operand.span,
                         )
-                        .with_label(format!("expected bool, found {}", inner.name()))
+                        .with_label(format!("expected bool, found {}", self.ty_name(inner)))
                         // `!n` on an int is the mistake this catches, and it is
                         // almost always a habit from a language with truthiness.
                         .with_note("`!` negates a bool; there is no implicit truth test", None),
@@ -708,12 +1207,12 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                                 format!(
                                     "cannot apply `{}` to `{}` and `{}`",
                                     op.symbol(),
-                                    lhs_ty.name(),
-                                    rhs_ty.name()
+                                    self.ty_name(lhs_ty),
+                                    self.ty_name(rhs_ty)
                                 ),
                                 operand.span,
                             )
-                            .with_label(format!("expected int, found {}", ty.name())),
+                            .with_label(format!("expected int, found {}", self.ty_name(ty))),
                         );
                     }
                 }
@@ -730,26 +1229,29 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         Diagnostic::new(
                             format!(
                                 "cannot compare `{}` with `{}`",
-                                lhs_ty.name(),
-                                rhs_ty.name()
+                                self.ty_name(lhs_ty),
+                                self.ty_name(rhs_ty)
                             ),
                             rhs.span,
                         )
-                        .with_label(format!("expected {}, found {}", lhs_ty.name(), rhs_ty.name())),
+                        .with_label(format!("expected {}, found {}", self.ty_name(lhs_ty), self.ty_name(rhs_ty))),
                     );
-                } else if lhs_ty == Ty::Str || (lhs_ty == Ty::Bool && op.is_ordering()) {
-                    // `==` works on bools; ordering does not, and strings have
-                    // no comparison at all without a runtime routine.
+                } else if !lhs_ty.has_equality() || (op.is_ordering() && !lhs_ty.is_ordered()) {
+                    // Only ints are ordered. Bools and enums answer `==`, since
+                    // that is a question about which value it is; strings answer
+                    // nothing without a runtime routine, and comparing their
+                    // pointers would quietly answer something else.
+                    let label = if !lhs_ty.has_equality() {
+                        "strings support no comparisons yet".to_string()
+                    } else {
+                        format!("`{}` values only support `==` and `!=`", self.ty_name(lhs_ty))
+                    };
                     self.error(
                         Diagnostic::new(
-                            format!("`{}` values cannot be compared with `{}`", lhs_ty.name(), op.symbol()),
+                            format!("`{}` values cannot be compared with `{}`", self.ty_name(lhs_ty), op.symbol()),
                             expr.span,
                         )
-                        .with_label(if lhs_ty == Ty::Str {
-                            "strings support no comparisons yet".to_string()
-                        } else {
-                            "bools only support `==` and `!=`".to_string()
-                        }),
+                        .with_label(label),
                     );
                 }
                 Ty::Bool
@@ -768,12 +1270,12 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                                 format!(
                                     "cannot apply `{}` to `{}` and `{}`",
                                     op.symbol(),
-                                    lhs_ty.name(),
-                                    rhs_ty.name()
+                                    self.ty_name(lhs_ty),
+                                    self.ty_name(rhs_ty)
                                 ),
                                 operand.span,
                             )
-                            .with_label(format!("expected bool, found {}", ty.name()))
+                            .with_label(format!("expected bool, found {}", self.ty_name(ty)))
                             .with_note(
                                 format!(
                                     "`{}` combines two bools, as in `i < 10 {} ok`",
@@ -787,9 +1289,13 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 }
                 Ty::Bool
             }
+            ExprKind::Variant { enum_name, enum_span, variant, variant_span } => {
+                self.variant(enum_name, *enum_span, variant, *variant_span)
+            }
             // A call in expression position must produce a value; `Int` is the
             // recovery type when it does not.
             ExprKind::Call { .. } => self.call(expr, false).unwrap_or(Ty::Int),
+            ExprKind::Match { .. } => self.match_expr(expr, false).unwrap_or(Ty::Int),
         };
 
         self.record(expr.id, ty)
@@ -1198,6 +1704,354 @@ mod tests {
     #[test]
     fn collects_several_errors() {
         assert_eq!(errors_in_main("print(a);\nprint(b);").len(), 2);
+    }
+
+    // -- enums -------------------------------------------------------------
+
+    /// A `Colour` enum, a `main`, and whatever body is given, so the tests
+    /// about enums stay about enums.
+    fn check_colour(body: &str) -> Result<Types> {
+        check_src(&format!("enum Colour {{ Red, Green, Blue }}\nfn main() {{\n{body}\n}}\n"))
+    }
+
+    fn colour_errors(body: &str) -> Vec<Diagnostic> {
+        check_colour(body).unwrap_err()
+    }
+
+    #[test]
+    fn accepts_an_enum_declared_used_and_matched() {
+        assert!(
+            check_colour(
+                "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Red => { print(1); }\n  \
+                 Colour::Green => { print(2); }\n  Colour::Blue => { print(3); }\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_enum_is_a_type_of_its_own() {
+        // Not an int with a different name: nothing converts either way.
+        assert!(colour_errors("int n = Colour::Red;")[0].message.contains("cannot initialize"));
+        assert!(colour_errors("Colour c = 0;")[0].message.contains("cannot initialize"));
+        assert!(colour_errors("Colour c = Colour::Red;\nc = 1;")[0].message.contains("cannot assign"));
+    }
+
+    #[test]
+    fn arithmetic_and_conditions_reject_an_enum() {
+        assert!(colour_errors("print(Colour::Red + 1);")[0].message.contains("cannot apply `+`"));
+        assert!(colour_errors("print(-Colour::Red);")[0].message.contains("cannot apply `-`"));
+        assert!(colour_errors("print(!Colour::Red);")[0].message.contains("cannot apply `!`"));
+        assert!(colour_errors("if (Colour::Red) {\n}")[0].message.contains("must be a `bool`"));
+    }
+
+    #[test]
+    fn enums_answer_equality_but_not_order() {
+        assert!(check_colour("print(Colour::Red == Colour::Blue);").is_ok());
+        assert!(check_colour("print(Colour::Red != Colour::Blue);").is_ok());
+        // The declaration puts the variants in a sequence, but the program
+        // never said that sequence meant anything.
+        let errors = colour_errors("print(Colour::Red < Colour::Blue);");
+        assert!(errors[0].message.contains("cannot be compared"), "{}", errors[0].message);
+        assert!(errors[0].label.as_deref().unwrap().contains("Colour"), "{errors:#?}");
+    }
+
+    #[test]
+    fn two_enums_are_not_interchangeable() {
+        let errors = check_src(
+            "enum A { X }\nenum B { X }\nfn main() {\n  A a = A::X;\n  a = B::X;\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("cannot assign"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn two_enums_may_share_a_variant_name() {
+        // A variant is always written qualified, so there is nothing to
+        // disambiguate.
+        assert!(
+            check_src("enum A { Red }\nenum B { Red }\nfn main() {\n  A a = A::Red;\n  print(a);\n}")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_type() {
+        for src in [
+            "fn main() {\n  Nope n = 1;\n}",
+            "fn f(Nope n) {\n}\nfn main() {\n}",
+            "fn f() -> Nope {\n}\nfn main() {\n}",
+        ] {
+            let errors = check_src(src).unwrap_err();
+            assert!(errors[0].message.contains("unknown type `Nope`"), "{src}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn rejects_an_unknown_enum_or_variant() {
+        assert!(colour_errors("print(Nope::Red);")[0].message.contains("unknown enum `Nope`"));
+        let errors = colour_errors("print(Colour::Purple);");
+        assert!(errors[0].message.contains("no variant `Purple`"), "{}", errors[0].message);
+        // The note lists the ones it does have, which is the useful half.
+        let note = errors[0].note.as_ref().unwrap().0.clone();
+        assert!(note.contains("`Red`, `Green` and `Blue`"), "{note}");
+    }
+
+    #[test]
+    fn rejects_a_duplicate_enum_or_variant() {
+        let errors = check_src("enum A { X }\nenum A { Y }\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("already declared"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().unwrap().1.is_some());
+
+        let errors = check_src("enum A { X, X }\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("declared twice"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_an_enum_with_no_variants() {
+        // No value could ever have the type, so nothing could be done with it.
+        let errors = check_src("enum Void { }\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("has no variants"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn an_enum_may_be_a_parameter_and_a_return_type() {
+        assert!(
+            check_src(
+                "enum A { X, Y }\nfn flip(A a) -> A {\n  match (a) {\n    A::X => { return A::Y; }\n    \
+                 A::Y => { return A::X; }\n  }\n}\nfn main() {\n  print(flip(A::X));\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    // -- exhaustiveness ----------------------------------------------------
+
+    #[test]
+    fn rejects_a_match_that_misses_a_variant() {
+        let errors = colour_errors(
+            "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Red => { print(1); }\n}",
+        );
+        assert!(errors[0].message.contains("does not cover every variant"), "{}", errors[0].message);
+        // The label names exactly what is missing, in declaration order.
+        let label = errors[0].label.as_deref().unwrap();
+        assert!(label.contains("`Green` and `Blue` are not handled"), "{label}");
+    }
+
+    #[test]
+    fn a_single_missing_variant_reads_as_one() {
+        let errors = colour_errors(
+            "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Red => { }\n  Colour::Green => { }\n}",
+        );
+        assert!(
+            errors[0].label.as_deref().unwrap().contains("`Blue` is not handled"),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_match_is_missing_everything() {
+        let errors = colour_errors("Colour c = Colour::Red;\nmatch (c) {\n}");
+        assert!(errors[0].message.contains("does not cover"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_a_variant_covered_twice() {
+        let errors = colour_errors(
+            "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Red => { }\n  Colour::Red => { }\n  \
+             Colour::Green => { }\n  Colour::Blue => { }\n}",
+        );
+        assert!(errors[0].message.contains("already covered"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().unwrap().1.is_some(), "and points at the first arm");
+    }
+
+    #[test]
+    fn rejects_an_arm_belonging_to_another_enum() {
+        let errors = check_src(
+            "enum A { X }\nenum B { Y }\nfn main() {\n  A a = A::X;\n  match (a) {\n    \
+             B::Y => { }\n  }\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("but the value is a `A`"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_a_match_on_something_that_is_not_an_enum() {
+        for body in ["match (1) {\n}", "match (true) {\n}", "match (\"a\") {\n}"] {
+            let errors = errors_in_main(body);
+            assert!(errors[0].message.contains("cannot match on"), "{body}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn an_arm_body_is_checked_whatever_is_wrong_with_its_pattern() {
+        // A mistake inside an arm is worth reporting even when the arm itself
+        // will never run.
+        let errors = colour_errors(
+            "Colour c = Colour::Red;\nmatch (c) {\n  Colour::Purple => { print(nope); }\n}",
+        );
+        assert!(errors.iter().any(|d| d.message.contains("undeclared variable `nope`")), "{errors:#?}");
+    }
+
+    // -- match as an expression --------------------------------------------
+
+    #[test]
+    fn a_match_of_values_is_an_expression_of_their_type() {
+        assert!(
+            check_colour(
+                "string s = match (Colour::Red) {\n  Colour::Red => \"warm\",\n  \
+                 Colour::Green => \"cool\",\n  Colour::Blue => \"cold\",\n};\nprint(s);"
+            )
+            .is_ok()
+        );
+        // And is checked against what wanted it.
+        let errors = colour_errors(
+            "int n = match (Colour::Red) {\n  Colour::Red => \"warm\",\n  \
+             Colour::Green => \"cool\",\n  Colour::Blue => \"cold\",\n};",
+        );
+        assert!(errors[0].message.contains("cannot initialize"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn every_arm_of_a_match_has_to_agree() {
+        let errors = colour_errors(
+            "string s = match (Colour::Red) {\n  Colour::Red => \"warm\",\n  \
+             Colour::Green => 1,\n  Colour::Blue => \"cold\",\n};",
+        );
+        assert!(errors[0].message.contains("but an earlier one produces"), "{}", errors[0].message);
+        // The note points back at the arm that set the type.
+        assert!(errors[0].note.as_ref().unwrap().1.is_some(), "{errors:#?}");
+    }
+
+    #[test]
+    fn a_block_arm_is_admissible_in_value_position_only_if_it_diverges() {
+        // `return` keeps its one meaning, so a block hands nothing back — it
+        // has to be one control never falls out of.
+        assert!(
+            check_colour(
+                "string s = match (Colour::Red) {\n  Colour::Red => \"warm\",\n  \
+                 Colour::Green => { print(\"x\"); return; }\n  Colour::Blue => \"cold\",\n};"
+            )
+            .is_ok()
+        );
+        let errors = colour_errors(
+            "string s = match (Colour::Red) {\n  Colour::Red => \"warm\",\n  \
+             Colour::Green => { print(\"x\"); }\n  Colour::Blue => \"cold\",\n};",
+        );
+        assert!(errors[0].message.contains("produces no value"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_break_or_a_continue_makes_a_block_arm_diverge_too() {
+        // The question is whether control can reach the end of the block, and
+        // a loop jump answers it as well as a `return` does.
+        assert!(
+            check_colour(
+                "while (true) {\n  int n = match (Colour::Red) {\n    Colour::Red => 1,\n    \
+                 Colour::Green => { break; }\n    Colour::Blue => { continue; }\n  };\n  print(n);\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_match_where_every_arm_leaves_produces_nothing() {
+        let errors = colour_errors(
+            "int n = match (Colour::Red) {\n  Colour::Red => { return; }\n  \
+             Colour::Green => { return; }\n  Colour::Blue => { return; }\n};",
+        );
+        assert!(errors[0].message.contains("produces no value"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_value_arm_has_nowhere_to_go_in_statement_position() {
+        // TinyC discards no values; a match written as a statement runs its
+        // arms for effect.
+        let errors = colour_errors(
+            "match (Colour::Red) {\n  Colour::Red => 1,\n  Colour::Green => 2,\n  \
+             Colour::Blue => 3,\n}",
+        );
+        assert!(errors[0].message.contains("nothing uses it"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_match_of_blocks_is_still_a_statement() {
+        assert!(
+            check_colour(
+                "match (Colour::Red) {\n  Colour::Red => { print(1); }\n  \
+                 Colour::Green => { print(2); }\n  Colour::Blue => { print(3); }\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_match_expression_is_still_checked_for_exhaustiveness() {
+        // The two checks are independent: neither form escapes either.
+        let errors = colour_errors("string s = match (Colour::Red) {\n  Colour::Red => \"a\",\n};");
+        assert!(errors[0].message.contains("does not cover"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_match_may_be_the_scrutinee_of_another() {
+        assert!(
+            check_src(
+                "enum A { X, Y }\nfn main() {\n  A a = match (A::X) {\n    A::X => A::Y,\n    \
+                 A::Y => A::X,\n  };\n  match (a) {\n    A::X => { print(1); }\n    \
+                 A::Y => { print(2); }\n  }\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_exhaustive_match_counts_as_returning() {
+        // The payoff of the check: no trailing `return` is needed, and none
+        // would be reachable.
+        assert!(
+            check_src(
+                "enum A { X, Y }\nfn f(A a) -> int {\n  match (a) {\n    A::X => { return 1; }\n    \
+                 A::Y => { return 2; }\n  }\n}\nfn main() {\n  print(f(A::X));\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_match_with_one_arm_not_returning_does_not_count() {
+        let errors = check_src(
+            "enum A { X, Y }\nfn f(A a) -> int {\n  match (a) {\n    A::X => { return 1; }\n    \
+             A::Y => { print(2); }\n  }\n}\nfn main() {\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("may finish without returning"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn break_and_continue_work_inside_an_arm() {
+        assert!(
+            check_src(
+                "enum A { X, Y }\nfn main() {\n  while (true) {\n    A a = A::X;\n    \
+                 match (a) {\n      A::X => { break; }\n      A::Y => { continue; }\n    }\n  }\n}"
+            )
+            .is_ok()
+        );
+        // And are still rejected when there is no loop around them.
+        let errors = check_src(
+            "enum A { X }\nfn main() {\n  A a = A::X;\n  match (a) {\n    A::X => { break; }\n  }\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("outside of a loop"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn an_arm_is_a_scope_of_its_own() {
+        let errors = check_src(
+            "enum A { X, Y }\nfn main() {\n  A a = A::X;\n  match (a) {\n    \
+             A::X => { int n = 1; print(n); }\n    A::Y => { print(n); }\n  }\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("undeclared variable `n`"), "{}", errors[0].message);
     }
 
     // -- functions ---------------------------------------------------------
