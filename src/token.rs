@@ -6,15 +6,21 @@ use crate::diag::Span;
 pub enum TokenKind {
     // Literals and names.
     Int(i64),
-    /// Decoded bytes of a string literal, without the surrounding quotes and
-    /// without a NUL terminator.
-    Str(Vec<u8>),
+    /// The characters of a string literal, without the surrounding quotes and
+    /// with every escape already resolved.
+    ///
+    /// Characters rather than bytes: this is the point where the source's UTF-8
+    /// is decoded, and after it nothing in the compiler counts bytes again.
+    Str(Vec<char>),
+    /// A character literal, `'a'` — exactly one character.
+    Char(char),
     Bool(bool),
     Ident(String),
 
     // Keywords.
     KwInt,
     KwString,
+    KwChar,
     KwBool,
     KwPrint,
     KwIf,
@@ -78,6 +84,7 @@ impl TokenKind {
         match self {
             TokenKind::Int(v) => format!("`{v}`"),
             TokenKind::Str(_) => "string literal".to_string(),
+            TokenKind::Char(c) => format!("`'{c}'`"),
             TokenKind::Bool(v) => format!("`{v}`"),
             TokenKind::Ident(name) => format!("`{name}`"),
             TokenKind::Eof => "end of file".to_string(),
@@ -96,6 +103,7 @@ impl TokenKind {
             // Keywords.
             TokenKind::KwInt => "int",
             TokenKind::KwString => "string",
+            TokenKind::KwChar => "char",
             TokenKind::KwBool => "bool",
             TokenKind::KwPrint => "print",
             TokenKind::KwIf => "if",
@@ -148,6 +156,7 @@ impl TokenKind {
             // No fixed spelling: a generic noun, not a value.
             TokenKind::Int(_) => "integer literal",
             TokenKind::Str(_) => "string literal",
+            TokenKind::Char(_) => "character literal",
             TokenKind::Bool(_) => "boolean literal",
             TokenKind::Ident(_) => "identifier",
             TokenKind::Eof => "end of file",

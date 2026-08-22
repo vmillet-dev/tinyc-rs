@@ -115,7 +115,7 @@ field   := type IDENT ";"
 fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 params  := param ("," param)*
 param   := type IDENT | "self"
-type    := ("int" | "string" | "bool" | IDENT) ("[" INT "]")?
+type    := ("int" | "string" | "char" | "bool" | IDENT) ("[" INT "]")?
 stmt    := decl | assign | print | if | while | for | match | return
          | break | continue | call ";"
 decl    := type IDENT "=" expr ";"
@@ -136,24 +136,26 @@ sum     := term (("+" | "-") term)*
 term    := unary (("*" | "/" | "%") unary)*
 unary   := ("-" | "!") unary | primary
 primary := atom postfix*
-atom    := INT | STRING | BOOL | IDENT | variant | call | match | array
-         | object | len | "(" expr ")"
+atom    := INT | STRING | CHAR | BOOL | IDENT | variant | call | match | array
+         | object | len | convert | "(" expr ")"
 postfix := "[" expr "]" | "." IDENT | "." IDENT "(" args? ")"
 variant := IDENT "::" IDENT
 array   := "[" (expr ("," expr)*)? "]"
 object  := IDENT "{" (IDENT ":" expr ("," IDENT ":" expr)*)? "}"
 len     := "len" "(" expr ")"
+convert := ("int" | "char" | "string" | "bool") "(" expr ")"
 call    := IDENT "(" (expr ("," expr)*)? ")"
 match   := "match" "(" expr ")" "{" arm* "}"
 arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
 ```
 
-`int` is a 64-bit signed integer, `string` is a pointer to static bytes, `bool`
-is `true` or `false`, an `enum` declares a type of its own with a fixed set of
-values, a `class` declares one with fields and methods, and `int[3]` is a
-fixed-length array of them. Arithmetic is `int`-only,
-`&&`, `||` and `!` are `bool`-only, `//` starts a comment, and a variable keeps
-the type it was declared with — assigning a `string` to an `int` is an error.
+`int` is a 64-bit signed integer, `string` is a run of characters, `char` is one
+Unicode character, `bool` is `true` or `false`, an `enum` declares a type of its
+own with a fixed set of values, a `class` declares one with fields and methods,
+and `int[3]` is a fixed-length array of them. Arithmetic is `int`-only, `+` also
+joins two strings, `&&`, `||` and `!` are `bool`-only, `//` starts a comment, and
+a variable keeps the type it was declared with — assigning a `string` to an
+`int` is an error.
 
 There is no implicit truth test either, so `!n` on an `int` is a type error
 rather than a comparison against zero. `%` takes its sign from the dividend, as
@@ -432,6 +434,109 @@ differ.
 looks that far: a type's length is a literal, and what follows the `]` is a name
 in a declaration and an `=` in an assignment.
 
+### Strings and characters
+
+A `string` is a run of **characters**, not of bytes
+([`examples/strings.tc`](examples/strings.tc)):
+
+```c
+string a = "héllo";
+print(len(a));                 // 5 — five characters, six bytes to write
+print(a[1]);                   // é
+print(a + " wörld");           // héllo wörld
+print(a == "héllo");           // true — the contents, not the address
+print("count = " + string(5)); // count = 5
+```
+
+`len` counts characters, `s[i]` is one character, and a letter written with an
+accent counts once however many bytes it took to type. UTF-8 lives only at the
+edges: the lexer decodes the source, `print` encodes what it writes, and nothing
+in between ever sees it. What TinyC counts is Unicode *scalar values*, not
+grapheme clusters — `"é"` typed at a keyboard is one, the same letter written as
+`e` plus a combining accent is two. Normalising would take Unicode tables the
+compiler does not carry, so it says so rather than promising more.
+
+A `char` is one of those characters, and it is a type of its own rather than a
+small integer. It compares, including for order, because the order of code
+points is a fact about the encoding — `'0' <= c && c <= '9'` is the question it
+exists to answer. Two *strings* are not ordered: where `é` sorts is a question
+about a language, not about characters, so `<` on strings is refused rather than
+quietly answered wrongly.
+
+There is no arithmetic on a character and no implicit widening. The way across
+is written out, and these four conversions are the whole list:
+
+| Written | Gives | Fails when |
+|---|---|---|
+| `int(c)` | a character's code point | never |
+| `char(n)` | the character with that code point | `n` names none — checked at compile time when it is a constant, at run time otherwise |
+| `string(c)` | a string of that one character | never |
+| `string(n)` | a number written out in decimal | never |
+
+A string is **read-only**: `s[i] = c` is a compile error, and `+` produces a
+third string rather than changing either operand. That is what makes sharing one
+free — two variables may well hold the same characters in memory, and since
+neither can change them, the alias cannot be observed. "Assignment copies, never
+aliases" therefore stays true everywhere it can be seen, while assigning a
+string moves one pointer.
+
+### What strings changed underneath
+
+**TinyC gained a heap, and it never frees.** Until now every value lived in a
+register or in a frame, and the rule was that *no address ever travels outward*
+— a callee borrows the caller's array, a returned object fills room the caller
+reserved. That rule is what made dangling impossible without lifetimes.
+
+A string cannot obey it. `a + b` needs characters nobody wrote at compile time,
+and `fn greet(string) -> string` cannot fill room its caller reserved, because
+the caller has no way to know how much to reserve. So a built string is cut from
+an **arena**: a bump pointer through chunks asked of `malloc`, where nothing is
+ever given back.
+
+That is the amendment, and it is deliberate. An arena address *does* travel
+outward — but memory that is never freed cannot dangle, so the question the old
+rule existed to answer does not arise. No lifetimes, no reference counts, no
+collector. What it costs is memory a long-running program stops using and never
+reclaims; TinyC programs run and finish, so the trade is a good one, and it is
+the whole reason a string can be a value here at all.
+
+**A string is one pointer, with its length in front of it.**
+
+```
+[ character count : 8 bytes ][ characters, 4 bytes each ]
+                             ^ this is the value
+```
+
+Four bytes per character, so `s[i]` is an address computation and not a walk
+from the start — the trade UTF-8 makes the other way round. The count sits
+*behind* the address, which is the only place in the compiler that reads
+backwards from a pointer it was given, and it buys three things at once: a
+string still travels in a register, still fits in an array slot, and still knows
+its own length. `len(s)` is one `mov` from `[p-8]`.
+
+**A literal is laid out identically.** `.data` holds the same count and the same
+four-byte characters as the arena produces, so no instruction anywhere asks
+which kind of string it is holding. There is one representation, not two.
+
+**Only the loops became calls.** `len` is a load, `s[i]` is a bounds check and a
+`lea`, and a character read out of a string is a 32-bit `mov` that widens as it
+lands — the one value in the language narrower than a machine word. What needs
+to walk the characters becomes a call to `tc$rt$…`: joining, comparing, encoding
+for output, and writing a number out. The backend emits each only when the
+program reaches it, so a program that touches no string never links `malloc`.
+
+**Every index into a string is checked.** An array's length is part of its type,
+so a constant index is settled at compile time and costs nothing. A string's
+length is not knowable until it exists, so even `s[1]` is guarded — the same
+single unsigned comparison, now against a loaded length rather than a literal.
+
+**Printing goes through the encoder.** A string's characters are encoded into a
+UTF-8 buffer — itself cut from the arena, and kept between calls so a loop of
+prints allocates once — and handed to the same `printf` everything else uses, so
+nothing interleaves. The entry point of a program that writes text also calls
+`SetConsoleOutputCP(65001)` first: without it a Windows console renders `é` as
+mojibake, and the language's promise about characters would stop at the terminal.
+
 ### Enums and exhaustive matching
 
 An `enum` declares a type with a fixed set of values, and a `match` must handle
@@ -707,10 +812,11 @@ Every diagnostic points at a line and a column:
 ```
 $ cargo run -- examples/errors/type_mismatch.tc
 error: cannot apply `+` to `int` and `string`
- --> examples/errors/type_mismatch.tc:4:13
+ --> examples/errors/type_mismatch.tc:4:9
   |
 4 |   print(x + s);
-  |             ^ expected int, found string
+  |         ^ expected string, found int
+  = note: `+` joins two strings; `string(n)` makes one out of a number, and `string(c)` out of a character
 ```
 
 Columns are counted in characters rather than bytes, so non-ASCII text earlier
@@ -852,10 +958,16 @@ The first two the CPU refuses outright; left alone that is a silent
 `0xC0000094` with nothing printed. The third it performs happily, wrapping
 around to a number of the wrong sign — which is worse, because nothing marks it.
 
-An array index is the fourth thing, and follows the same pattern for the same
-reason: reaching past the end is something the machine would do without
+An index out of range is the fourth thing, and follows the same pattern for the
+same reason: reaching past the end is something the machine would do without
 complaint, so the compiler settles what it can and guards the rest. It is
-described under [Arrays](#arrays).
+described under [Arrays](#arrays), and applies to
+[strings](#strings-and-characters) too.
+
+Two more joined the family with strings, and are checked the same way: `char(n)`
+for an `n` that names no character — settled at compile time when it is a
+constant — and an arena that cannot get memory from the operating system. Six
+ways to stop, one routine to report them, and none of them answers wrongly.
 
 The rule is checked in whichever of two places can see it:
 
@@ -963,10 +1075,12 @@ Unit tests live beside each stage, and two integration suites sit on top:
   repository inspects text, and text cannot tell a `setl` from a `setg` or
   notice a register clobbered between two instructions that each look right on
   their own. Each example is assembled, linked and run, and its output compared
-  against `examples/expected/`; a second test does the same for the corners of
+  against `examples/expected/`; further tests do the same for the corners of
   code generation that are easiest to get subtly wrong — a destination that
   aliases its own operand, an immediate too wide for an instruction, enough live
-  values to force spills.
+  values to force spills — and for what a string does, where each case answers a
+  *number* wherever it can, so that a mangled character shows up as a wrong
+  count rather than as output that merely looks odd.
 
 The execution suite needs `nasm` and the Microsoft linker. When it cannot find
 them it says so and passes, so `cargo test` still works without a toolchain:

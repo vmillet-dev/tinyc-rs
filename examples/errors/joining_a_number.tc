@@ -1,0 +1,4 @@
+fn main() {
+  int n = 3;
+  print("count = " + n);
+}

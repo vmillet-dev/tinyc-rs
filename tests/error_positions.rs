@@ -12,7 +12,7 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 9] = [
+const EXAMPLES: [&str; 10] = [
     "arith.tc",
     "spill.tc",
     "reassign.tc",
@@ -22,6 +22,7 @@ const EXAMPLES: [&str; 9] = [
     "enums.tc",
     "arrays.tc",
     "classes.tc",
+    "strings.tc",
 ];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
@@ -64,7 +65,10 @@ fn undeclared_variable_points_at_the_use() {
 
 #[test]
 fn type_mismatch_points_at_the_offending_operand() {
-    assert_error_at("type_mismatch.tc", "4:13");
+    // `x + s` mixes an int with a string. Since `+` joins strings, the operand
+    // that is not one is the one at fault — which is also the reading that
+    // helps, because the mistake this catches is nearly always `"total: " + n`.
+    assert_error_at("type_mismatch.tc", "4:9");
 }
 
 #[test]
@@ -206,6 +210,47 @@ fn an_index_the_compiler_can_see_points_at_the_index() {
 #[test]
 fn a_length_that_disagrees_points_at_the_literal() {
     assert_error_at("array_length_mismatch.tc", "2:15");
+}
+
+// -- strings and characters -----------------------------------------------
+
+#[test]
+fn writing_into_a_string_points_at_the_element() {
+    // A string is read-only, which is what makes sharing one unobservable.
+    assert_error_at("string_modified.tc", "3:3");
+}
+
+#[test]
+fn arithmetic_on_a_character_points_at_the_character() {
+    assert_error_at("char_arithmetic.tc", "3:9");
+}
+
+#[test]
+fn a_conversion_that_does_not_exist_points_at_the_whole_conversion() {
+    assert_error_at("no_conversion.tc", "2:9");
+}
+
+#[test]
+fn ordering_two_strings_points_at_the_whole_comparison() {
+    // Equality is fine; order is not, and the refusal explains itself rather
+    // than merely happening.
+    assert_error_at("string_ordering.tc", "2:9");
+}
+
+#[test]
+fn a_character_literal_with_two_characters_points_at_the_literal() {
+    assert_error_at("char_literal_too_long.tc", "2:12");
+}
+
+#[test]
+fn a_number_that_names_no_character_points_at_the_number() {
+    // Settled here rather than at run time, like a constant index out of range.
+    assert_error_at("not_a_character.tc", "2:14");
+}
+
+#[test]
+fn joining_a_number_to_a_string_points_at_the_number() {
+    assert_error_at("joining_a_number.tc", "3:22");
 }
 
 // -- classes --------------------------------------------------------------

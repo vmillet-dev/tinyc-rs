@@ -38,8 +38,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArmBody, BinOp, Block as AstBlock, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
-    MatchArm, Place, Program as Ast, Stmt, Ty, TypeTable,
+    ArmBody, BinOp, Block as AstBlock, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp, MatchArm,
+    Place, Prim, Program as Ast, Stmt, Ty, TypeTable, is_scalar_value,
 };
 use crate::sema::Types;
 
@@ -47,6 +47,17 @@ use crate::sema::Types;
 /// [`Function`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct VReg(pub u32);
+
+/// Bytes one character of a string occupies.
+///
+/// Four, because a character is a Unicode scalar value and they run to
+/// `0x10FFFF`. Storing them at a fixed width is what makes `s[i]` an address
+/// computation rather than a walk from the start — the trade UTF-8 makes the
+/// other way round, and the reason UTF-8 stays at the edges of the language.
+pub const CHAR_BYTES: u32 = 4;
+
+/// Bytes of header in front of a string's characters, holding the count.
+pub const STR_HEADER: u32 = 8;
 
 /// Index into [`Program::strings`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,13 +108,31 @@ pub enum Instr {
     /// `dst = base + index * scale`, the address of one element.
     ///
     /// `len` travels with it so the backend can bounds check, and *only* so it
-    /// can: a constant index was checked at compile time and needs none, which
-    /// is the same bargain `DivGuards` strikes for division.
+    /// can: an index and a length both known at compile time were settled by
+    /// `sema` and need none, which is the same bargain `DivGuards` strikes for
+    /// division. An array's length is always known; a string's never is, so
+    /// indexing one always costs the check.
     ///
-    /// `scale` is eight for everything that fits in a register and the object's
-    /// room for an array of them — which is the one case where the address is
-    /// not a single `lea`, because x86 scales by 1, 2, 4 or 8 and nothing else.
-    Elem { dst: VReg, base: Value, index: Value, len: u32, scale: u32 },
+    /// `scale` is eight for everything that fits in a register, four for the
+    /// characters of a string, and the object's room for an array of them —
+    /// which is the one case where the address is not a single `lea`, because
+    /// x86 scales by 1, 2, 4 or 8 and nothing else.
+    Elem { dst: VReg, base: Value, index: Value, len: Value, scale: u32 },
+    /// `dst = len(str)`: the character count a string carries in front of its
+    /// characters.
+    ///
+    /// The one place the compiler reads *behind* an address it was given. That
+    /// is the whole reason the count lives there: a string stays one pointer,
+    /// so it still travels in a register and still fits in an array slot, and
+    /// yet knows its own length.
+    StrLen { dst: VReg, str: Value },
+    /// `dst = *addr`, reading four bytes and widening them.
+    ///
+    /// Only a string's characters are narrower than a machine word. Everywhere
+    /// else — a variable, a field, an array element — a character occupies the
+    /// eight bytes everything else does, which is what keeps every other offset
+    /// in the compiler a multiple of eight.
+    LoadChar { dst: VReg, addr: Value },
     /// `*dst = *src` for `bytes` bytes: what copying an aggregate *is*.
     ///
     /// An object or an array does not fit in a register, so assigning one is a
@@ -138,7 +167,48 @@ pub enum Instr {
     /// subclasses; when it has none there is nothing to decide, and an ordinary
     /// [`Instr::Call`] goes out instead.
     CallVirtual { dst: Option<VReg>, slot: u32, receiver: Value, args: Vec<Value> },
+    /// `dst = callee(args)`, where the callee is one of the compiler's own
+    /// routines rather than anything the program declared.
+    ///
+    /// It travels as a [`Runtime`] rather than a name so that the choice of
+    /// which routines exist stays here, in the target-independent half, and
+    /// only their *spelling* belongs to a backend.
+    RtCall { dst: Option<VReg>, callee: Runtime, args: Vec<Value> },
     Print { ty: Ty, val: Value },
+}
+
+/// The compiler's own routines, called like functions but declared by nobody.
+///
+/// Each is here because it is a *loop*, and a loop is the one thing lowering
+/// cannot inline without emitting blocks for it. Everything a string does in a
+/// straight line — its length, one of its characters — is an instruction
+/// instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Runtime {
+    /// `(a, b) -> string`: a new string holding a's characters then b's.
+    Concat,
+    /// `(a, b) -> bool`: same length, same characters. Comparing the two
+    /// addresses would answer a question nobody asked.
+    StrEq,
+    /// `(n) -> char`: `n` itself, having refused one that names no character.
+    CheckChar,
+    /// `(c) -> string`: a string holding that one character.
+    CharToStr,
+    /// `(n) -> string`: the number written out in decimal.
+    IntToStr,
+}
+
+impl Runtime {
+    /// What this routine is called, without the prefix a backend adds.
+    pub fn name(self) -> &'static str {
+        match self {
+            Runtime::Concat => "concat",
+            Runtime::StrEq => "str_eq",
+            Runtime::CheckChar => "check_char",
+            Runtime::CharToStr => "char_str",
+            Runtime::IntToStr => "int_str",
+        }
+    }
 }
 
 /// How a basic block ends. Every block has exactly one.
@@ -265,14 +335,18 @@ impl Instr {
             | Instr::Param { .. }
             | Instr::Frame { .. }
             | Instr::VTable { .. } => {}
-            Instr::Copy { src, .. } | Instr::Load { addr: src, .. } => reg(src),
+            Instr::Copy { src, .. }
+            | Instr::Load { addr: src, .. }
+            | Instr::LoadChar { addr: src, .. }
+            | Instr::StrLen { str: src, .. } => reg(src),
             Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => {
                 reg(lhs);
                 reg(rhs);
             }
-            Instr::Elem { base, index, .. } => {
+            Instr::Elem { base, index, len, .. } => {
                 reg(base);
                 reg(index);
+                reg(len);
             }
             Instr::Field { base, .. } => reg(base),
             Instr::Store { addr, value } => {
@@ -284,7 +358,7 @@ impl Instr {
                 reg(src);
             }
             Instr::Print { val, .. } => reg(val),
-            Instr::Call { args, .. } => args.iter().for_each(reg),
+            Instr::Call { args, .. } | Instr::RtCall { args, .. } => args.iter().for_each(reg),
             Instr::CallVirtual { receiver, args, .. } => {
                 reg(receiver);
                 args.iter().for_each(reg);
@@ -305,8 +379,12 @@ impl Instr {
             | Instr::Elem { dst, .. }
             | Instr::Field { dst, .. }
             | Instr::Load { dst, .. }
+            | Instr::LoadChar { dst, .. }
+            | Instr::StrLen { dst, .. }
             | Instr::Cmp { dst, .. } => Some(*dst),
-            Instr::Call { dst, .. } | Instr::CallVirtual { dst, .. } => *dst,
+            Instr::Call { dst, .. } | Instr::CallVirtual { dst, .. } | Instr::RtCall { dst, .. } => {
+                *dst
+            }
             Instr::Print { .. } | Instr::Store { .. } | Instr::CopyBytes { .. } => None,
         }
     }
@@ -314,7 +392,13 @@ impl Instr {
     /// Whether this instruction performs a call, and therefore destroys the
     /// caller-saved registers.
     pub fn is_call(&self) -> bool {
-        matches!(self, Instr::Print { .. } | Instr::Call { .. } | Instr::CallVirtual { .. })
+        matches!(
+            self,
+            Instr::Print { .. }
+                | Instr::Call { .. }
+                | Instr::CallVirtual { .. }
+                | Instr::RtCall { .. }
+        )
     }
 }
 
@@ -368,8 +452,8 @@ impl Function {
 
 pub struct Program {
     pub functions: Vec<Function>,
-    /// Interned string literals, each stored without its NUL terminator.
-    pub strings: Vec<Vec<u8>>,
+    /// Interned string literals, each as the characters it holds.
+    pub strings: Vec<Vec<char>>,
     /// One method table per class, in `ClassId` order.
     pub vtables: Vec<Vec<FuncId>>,
     /// Every type the program has, carried through so that a type can still be named
@@ -389,7 +473,8 @@ impl Program {
     pub fn dump(&self) -> String {
         let mut out = String::new();
         for (i, s) in self.strings.iter().enumerate() {
-            out.push_str(&format!("str{i} = {:?}\n", String::from_utf8_lossy(s)));
+            out.push_str(&format!("str{i} = {:?}
+", s.iter().collect::<String>()));
         }
         if !self.strings.is_empty() {
             out.push('\n');
@@ -469,11 +554,26 @@ impl Program {
                 format!("%{} = field {} + {offset}", function.name_of(*dst), value(base))
             }
             Instr::Elem { dst, base, index, len, scale } => format!(
-                "%{} = elem {}[{}] of {len} by {scale}",
+                "%{} = elem {}[{}] of {} by {scale}",
                 function.name_of(*dst),
                 value(base),
-                value(index)
+                value(index),
+                value(len)
             ),
+            Instr::StrLen { dst, str } => {
+                format!("%{} = strlen {}", function.name_of(*dst), value(str))
+            }
+            Instr::LoadChar { dst, addr } => {
+                format!("%{} = loadchar {}", function.name_of(*dst), value(addr))
+            }
+            Instr::RtCall { dst, callee, args } => {
+                let args: Vec<String> = args.iter().map(value).collect();
+                let call = format!("rt.{}({})", callee.name(), args.join(", "));
+                match dst {
+                    Some(dst) => format!("%{} = {call}", function.name_of(*dst)),
+                    None => call,
+                }
+            }
             Instr::CopyBytes { dst, src, bytes } => {
                 format!("copy {} bytes to {}, from {}", bytes, value(dst), value(src))
             }
@@ -574,7 +674,7 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
 
     let (functions, vtables) =
         prune_unreachable_functions(functions, vtables, ids.get(crate::sema::ENTRY_POINT));
-    Program { functions, strings: strings.bytes, table: types.table().clone(), vtables }
+    Program { functions, strings: strings.chars, table: types.table().clone(), vtables }
 }
 
 /// The name each of the program's functions is known by once methods and free
@@ -594,8 +694,8 @@ fn qualified_names(ast: &Ast) -> Vec<String> {
 /// a lookup rather than a scan.
 #[derive(Default)]
 struct Strings {
-    bytes: Vec<Vec<u8>>,
-    ids: HashMap<Vec<u8>, StrId>,
+    chars: Vec<Vec<char>>,
+    ids: HashMap<Vec<char>, StrId>,
 }
 
 /// Drop the functions nothing can call, and renumber the survivors.
@@ -1247,22 +1347,104 @@ impl Lowering<'_> {
     /// not lowered as arithmetic and never picks up the overflow guard that
     /// `Bin` carries.
     fn element_address(&mut self, array: &Expr, index: &Expr) -> VReg {
-        let (len, scale) = self.shape_of(self.types.of(array.id));
+        let ty = self.types.of(array.id);
         let base = self.expr(array);
+        let (len, scale) = self.shape_of(ty, base);
         let index = self.expr(index);
         let dst = self.fresh_temp();
         self.emit(Instr::Elem { dst, base, index, len, scale });
         dst
     }
 
-    /// How long an array type is and how wide each of its elements is — both
-    /// facts about the type, so both known here without anything computed.
-    fn shape_of(&self, ty: Ty) -> (u32, u32) {
-        let Ty::Array(id) = ty else {
-            unreachable!("sema rejects indexing anything but an array");
+    /// How long the thing in `base` is and how wide each of its elements is.
+    ///
+    /// For an array both are facts about the *type*, known here with nothing
+    /// computed. For a string the width still is, but the length is a load —
+    /// which is the whole difference between the two, and the reason a constant
+    /// index into a string is checked at run time like any other.
+    fn shape_of(&mut self, ty: Ty, base: Value) -> (Value, u32) {
+        match ty {
+            Ty::Array(id) => {
+                let info = self.table.array(id);
+                (Value::Const(i64::from(info.len)), self.table.size_of(info.elem))
+            }
+            Ty::Str => (self.length_of(base), CHAR_BYTES),
+            _ => unreachable!("sema rejects indexing anything but an array or a string"),
+        }
+    }
+
+    /// The character count in front of a string's characters.
+    fn length_of(&mut self, str: Value) -> Value {
+        let dst = self.fresh_temp();
+        self.emit(Instr::StrLen { dst, str });
+        Value::Reg(dst)
+    }
+
+    /// Whether this is one of the operators a string gives a second meaning to,
+    /// and so one that becomes a call rather than an instruction.
+    fn is_string_op(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Bin { op: BinOp::Add, lhs, .. } | ExprKind::Cmp { lhs, .. } => {
+                self.types.of(lhs.id) == Ty::Str
+            }
+            _ => false,
+        }
+    }
+
+    /// Lower `a + b` or `a == b` on two strings into `dst`.
+    fn string_op_into(&mut self, dst: VReg, expr: &Expr) {
+        let (op, lhs, rhs) = match &expr.kind {
+            ExprKind::Bin { lhs, rhs, .. } => (None, lhs, rhs),
+            ExprKind::Cmp { op, lhs, rhs } => (Some(*op), lhs, rhs),
+            _ => unreachable!("the caller checked this is a string operator"),
         };
-        let info = self.table.array(id);
-        (info.len, self.table.size_of(info.elem))
+        let args = vec![self.expr(lhs), self.expr(rhs)];
+
+        let Some(op) = op else {
+            self.emit(Instr::RtCall { dst: Some(dst), callee: Runtime::Concat, args });
+            return;
+        };
+
+        // The routine answers whether the two are the same, and `!=` is that
+        // question read the other way round — so one routine serves both, and
+        // the negation costs the comparison against zero that `!` already is.
+        if op == CmpOp::Eq {
+            self.emit(Instr::RtCall { dst: Some(dst), callee: Runtime::StrEq, args });
+            return;
+        }
+        let same = self.fresh_temp();
+        self.emit(Instr::RtCall { dst: Some(same), callee: Runtime::StrEq, args });
+        self.emit(Instr::Cmp {
+            op: CmpOp::Eq,
+            dst,
+            lhs: Value::Reg(same),
+            rhs: Value::Const(0),
+        });
+    }
+
+    /// Lower `int(c)` or `char(n)` into `dst`.
+    ///
+    /// One direction is free and the other is not, and the asymmetry is the
+    /// design: every character has a code point, but not every number names a
+    /// character. So only that direction can fail — and it fails where it was
+    /// written, rather than handing on a value nothing else in the language
+    /// could have produced.
+    fn convert_into(&mut self, dst: VReg, to: Prim, value: &Expr) {
+        let from = self.types.of(value.id);
+        let src = self.expr(value);
+        // A constant `sema` has already accepted needs no check at run time,
+        // which is the same bargain a constant index strikes.
+        let settled = matches!(src, Value::Const(c) if is_scalar_value(c));
+
+        let callee = match (from, to) {
+            (Ty::Int, Prim::Char) if !settled => Runtime::CheckChar,
+            (Ty::Char, Prim::Str) => Runtime::CharToStr,
+            (Ty::Int, Prim::Str) => Runtime::IntToStr,
+            // A code point *is* the character's representation, so reading one
+            // as the other moves nothing at all.
+            _ => return self.emit(Instr::Copy { dst, src }),
+        };
+        self.emit(Instr::RtCall { dst: Some(dst), callee, args: vec![src] });
     }
 
     /// Room in the frame for a value of `ty`, with its address in `dst`.
@@ -1376,8 +1558,9 @@ impl Lowering<'_> {
         match place {
             Place::Var { .. } => unreachable!("a variable is a register, not an address"),
             Place::Element { base, index, .. } => {
-                let (len, scale) = self.shape_of(self.place_type(base));
+                let ty = self.place_type(base);
                 let object = self.place_value(base);
+                let (len, scale) = self.shape_of(ty, object);
                 let index = self.expr(index);
                 let dst = self.fresh_temp();
                 self.emit(Instr::Elem { dst, base: object, index, len, scale });
@@ -1478,7 +1661,7 @@ impl Lowering<'_> {
             ExprKind::MethodCall { .. } => self.method_call(Some(dst), expr),
             ExprKind::Array { elements, .. } => {
                 let ty = self.types.of(expr.id);
-                let (len, scale) = self.shape_of(ty);
+                let (len, scale) = self.shape_of(ty, Value::Reg(dst));
                 self.allocate_for(dst, ty);
                 for (index, element) in elements.iter().enumerate() {
                     let addr = self.fresh_temp();
@@ -1493,21 +1676,33 @@ impl Lowering<'_> {
                 }
             }
             ExprKind::Index { array, index, .. } => {
+                let of = self.types.of(array.id);
                 let addr = self.element_address(array, index);
+                let addr = Value::Reg(addr);
                 // An aggregate element *is* its address; only a value that
-                // fits in a register has to be read out.
-                match self.types.of(expr.id).fits_in_a_register() {
-                    true => self.emit(Instr::Load { dst, addr: Value::Reg(addr) }),
-                    false => self.emit(Instr::Copy { dst, src: Value::Reg(addr) }),
+                // fits in a register has to be read out — and a string's
+                // characters are the one thing narrower than a register.
+                match (of, self.types.of(expr.id).fits_in_a_register()) {
+                    (Ty::Str, _) => self.emit(Instr::LoadChar { dst, addr }),
+                    (_, true) => self.emit(Instr::Load { dst, addr }),
+                    (_, false) => self.emit(Instr::Copy { dst, src: addr }),
                 }
             }
-            ExprKind::Len { array, .. } => {
-                let val = i64::from(self.shape_of(self.types.of(array.id)).0);
-                self.emit(Instr::Const { dst, val });
+            ExprKind::Len { .. } => {
+                let src = self.expr(expr);
+                self.emit(Instr::Copy { dst, src });
             }
+            ExprKind::Char(c) => self.emit(Instr::Const { dst, val: i64::from(*c as u32) }),
+            ExprKind::Convert { to, value, .. } => self.convert_into(dst, *to, value),
             ExprKind::Str(bytes) => {
                 let id = self.intern(bytes);
                 self.emit(Instr::StrAddr { dst, id });
+            }
+            // `+` on two strings, and `==` on two strings, are the only
+            // operators that are a *loop* rather than an instruction, so they
+            // are the only ones that leave through a call.
+            ExprKind::Bin { .. } | ExprKind::Cmp { .. } if self.is_string_op(expr) => {
+                self.string_op_into(dst, expr)
             }
             ExprKind::Bin { op, lhs, rhs } => {
                 let lhs = self.expr(lhs);
@@ -1665,16 +1860,30 @@ impl Lowering<'_> {
             ExprKind::Variant { .. } => Value::Const(self.variant_tag(expr)),
             // A length is a fact about a type, so it is a constant here and
             // costs nothing at all — `i < len(xs)` compares against a literal.
-            ExprKind::Len { array, .. } => {
-                Value::Const(i64::from(self.shape_of(self.types.of(array.id)).0))
-            }
+            ExprKind::Char(c) => Value::Const(i64::from(*c as u32)),
+            ExprKind::Len { array, .. } => match self.types.of(array.id) {
+                // An array's length is a fact about its type, so it costs
+                // nothing at all — `i < len(xs)` compares against a literal.
+                // A string's is a load, because a string that had to be built
+                // could not have told the compiler how long it would be.
+                Ty::Array(id) => Value::Const(i64::from(self.table.array(id).len)),
+                _ => {
+                    let str = self.expr(array);
+                    self.length_of(str)
+                }
+            },
             ExprKind::Index { array, index, .. } => {
+                let of = self.types.of(array.id);
                 let addr = self.element_address(array, index);
-                if !self.types.of(expr.id).fits_in_a_register() {
+                if of != Ty::Str && !self.types.of(expr.id).fits_in_a_register() {
                     return Value::Reg(addr);
                 }
                 let dst = self.fresh_temp();
-                self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
+                let addr = Value::Reg(addr);
+                match of {
+                    Ty::Str => self.emit(Instr::LoadChar { dst, addr }),
+                    _ => self.emit(Instr::Load { dst, addr }),
+                }
                 Value::Reg(dst)
             }
             ExprKind::Neg(operand) => match self.expr(operand) {
@@ -1692,6 +1901,11 @@ impl Lowering<'_> {
                     Value::Reg(dst)
                 }
             },
+            ExprKind::Bin { .. } | ExprKind::Cmp { .. } if self.is_string_op(expr) => {
+                let dst = self.fresh_temp();
+                self.string_op_into(dst, expr);
+                Value::Reg(dst)
+            }
             ExprKind::Bin { op, lhs, rhs } => {
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
@@ -1737,6 +1951,7 @@ impl Lowering<'_> {
                 Value::Reg(dst)
             }
             ExprKind::Str(_)
+            | ExprKind::Convert { .. }
             | ExprKind::Call { .. }
             | ExprKind::Match { .. }
             | ExprKind::Array { .. }
@@ -1750,13 +1965,13 @@ impl Lowering<'_> {
         }
     }
 
-    fn intern(&mut self, bytes: &[u8]) -> StrId {
-        if let Some(&id) = self.strings.ids.get(bytes) {
+    fn intern(&mut self, chars: &[char]) -> StrId {
+        if let Some(&id) = self.strings.ids.get(chars) {
             return id;
         }
-        let id = StrId(self.strings.bytes.len() as u32);
-        self.strings.bytes.push(bytes.to_vec());
-        self.strings.ids.insert(bytes.to_vec(), id);
+        let id = StrId(self.strings.chars.len() as u32);
+        self.strings.chars.push(chars.to_vec());
+        self.strings.ids.insert(chars.to_vec(), id);
         id
     }
 }
@@ -2778,6 +2993,106 @@ mod tests {
     fn identical_strings_are_interned_once() {
         let ir = lower_main("string a = \"hi\";\nstring b = \"hi\";\nprint(a);\nprint(b);");
         assert_eq!(ir.strings.len(), 1);
+    }
+
+    #[test]
+    fn a_literal_is_interned_as_characters() {
+        let ir = lower_main("print(\"é\");");
+        assert_eq!(ir.strings[0], vec!['é']);
+    }
+
+    /// Every instruction a function lowered to, flattened.
+    fn instrs(ir: &Program) -> Vec<&Instr> {
+        ir.functions[0].blocks.iter().flat_map(|b| &b.instrs).collect()
+    }
+
+    #[test]
+    fn joining_two_strings_becomes_a_call_and_not_an_add() {
+        let ir = lower_main("string a = \"x\";\nprint(a + a);");
+        assert!(
+            instrs(&ir)
+                .iter()
+                .any(|i| matches!(i, Instr::RtCall { callee: Runtime::Concat, .. })),
+            "{}",
+            ir.dump()
+        );
+        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::Bin { .. })), "{}", ir.dump());
+    }
+
+    #[test]
+    fn comparing_two_strings_asks_the_runtime_rather_than_the_processor() {
+        let ir = lower_main("string a = \"x\";\nprint(a == a);");
+        let lowered = instrs(&ir);
+        assert!(
+            lowered.iter().any(|i| matches!(i, Instr::RtCall { callee: Runtime::StrEq, .. })),
+            "{}",
+            ir.dump()
+        );
+        // `!=` is the same routine read the other way round, so it costs one
+        // comparison against zero and not a second routine.
+        let ir = lower_main("string a = \"x\";\nprint(a != a);");
+        let lowered = instrs(&ir);
+        assert!(lowered.iter().any(|i| matches!(i, Instr::RtCall { callee: Runtime::StrEq, .. })));
+        assert!(lowered.iter().any(|i| matches!(i, Instr::Cmp { op: CmpOp::Eq, .. })));
+    }
+
+    #[test]
+    fn an_arrays_length_is_a_constant_and_a_strings_is_a_load() {
+        let ir = lower_main("int[3] xs = [1, 2, 3];\nprint(len(xs));");
+        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::StrLen { .. })), "{}", ir.dump());
+
+        let ir = lower_main("print(len(\"abc\"));");
+        assert!(instrs(&ir).iter().any(|i| matches!(i, Instr::StrLen { .. })), "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_constant_index_into_a_string_is_still_checked() {
+        // An array's length is part of its type, so `sema` settled the index
+        // and the `Elem` carries a constant length the backend can drop the
+        // check for. A string's length is a load, so there is nothing to settle.
+        let ir = lower_main("int[3] xs = [1, 2, 3];\nprint(xs[1]);");
+        let lengths: Vec<&Value> = instrs(&ir)
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Elem { len, .. } => Some(len),
+                _ => None,
+            })
+            .collect();
+        assert!(lengths.iter().all(|len| matches!(len, Value::Const(_))), "{}", ir.dump());
+
+        let ir = lower_main("print(\"abc\"[1]);");
+        let lengths: Vec<&Value> = instrs(&ir)
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Elem { len, .. } => Some(len),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lengths.len(), 1);
+        assert!(matches!(lengths[0], Value::Reg(_)), "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_code_point_and_its_character_are_the_same_value() {
+        // `int(c)` moves nothing: a character *is* its code point. Only the
+        // direction that can fail costs an instruction.
+        let ir = lower_main("char c = 'a';\nprint(int(c));");
+        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::RtCall { .. })), "{}", ir.dump());
+
+        let ir = lower_main("int n = 65;\nprint(char(n));");
+        assert!(
+            instrs(&ir)
+                .iter()
+                .any(|i| matches!(i, Instr::RtCall { callee: Runtime::CheckChar, .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn a_constant_character_needs_no_check_at_run_time() {
+        let ir = lower_main("print(char(65));");
+        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::RtCall { .. })), "{}", ir.dump());
     }
 
     // -- functions ---------------------------------------------------------

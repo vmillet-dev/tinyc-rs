@@ -50,10 +50,26 @@
 //! `main` is the exception, and has to be: it is the name the C runtime startup
 //! calls. Nothing this module generates is called `main`, so it is safe to leave
 //! alone.
+//!
+//! ## The runtime
+//!
+//! Everything under `tc$rt$` is emitted by this module and called like an
+//! ordinary function. There are two families. The *aborts* are jumped to, never
+//! called, and never return — see [`abort_stubs`]. The rest are real routines,
+//! and they exist for one reason each: they are **loops**. Everything a string
+//! does in a straight line is emitted inline; joining two, comparing two,
+//! encoding one for output and writing a number out have to walk characters, so
+//! they become calls.
+//!
+//! Their memory comes from an arena that never frees — see [`arena`], which is
+//! also where the trade that buys it is written down.
+//!
+//! Each routine is emitted only when the program reaches it, so a program that
+//! touches no string links no `malloc` and carries no encoder.
 
 use crate::ast::{BinOp, ClassId, CmpOp, EnumId, Ty};
 use crate::codegen::{Allocation, Backend, Location, PhysReg, RegisterFile};
-use crate::ir::{Block, Function, Instr, Program, Terminator, VReg, Value};
+use crate::ir::{Block, Function, Instr, Program, Runtime, Terminator, VReg, Value};
 
 /// Register numbers follow the usual x86-64 encoding order.
 const NAMES: [&str; 16] = [
@@ -96,21 +112,79 @@ const SYMBOL_PREFIX: &str = "tc$";
 /// function called `rt` becomes `tc$rt`, not `tc$rt$anything`.
 const RUNTIME_PREFIX: &str = "tc$rt$";
 
-/// Where arithmetic that cannot be performed lands.
+/// Where an operation that cannot be performed lands.
+///
+/// Each is a label the failing instruction jumps to, paired with the text it
+/// reports. They are kept together so that adding a way to fail means adding
+/// one row rather than touching four places.
+const ABORTS: [Abort; 6] = [
+    Abort::new(ABORT_DIV_ZERO, "division by zero"),
+    Abort::new(ABORT_DIV_OVERFLOW, "division overflows an int"),
+    Abort::new(ABORT_OVERFLOW, "arithmetic overflows an int"),
+    Abort::new(ABORT_BOUNDS, "index out of bounds"),
+    Abort::new(ABORT_OOM, "out of memory"),
+    Abort::new(ABORT_BAD_CHAR, "this number is not a character"),
+];
+
 const ABORT_DIV_ZERO: &str = "tc$rt$div_by_zero";
 const ABORT_DIV_OVERFLOW: &str = "tc$rt$div_overflow";
 const ABORT_OVERFLOW: &str = "tc$rt$overflow";
 const ABORT_BOUNDS: &str = "tc$rt$bounds";
+const ABORT_OOM: &str = "tc$rt$out_of_memory";
+const ABORT_BAD_CHAR: &str = "tc$rt$bad_char";
 const ABORT_REPORT: &str = "tc$rt$abort";
-const MSG_DIV_ZERO: &str = "tc$rt$msg_div_zero";
-const MSG_DIV_OVERFLOW: &str = "tc$rt$msg_div_overflow";
-const MSG_OVERFLOW: &str = "tc$rt$msg_overflow";
-const MSG_BOUNDS: &str = "tc$rt$msg_bounds";
 
-const DIV_ZERO_TEXT: &str = "runtime error: division by zero\n";
-const DIV_OVERFLOW_TEXT: &str = "runtime error: division overflows an int\n";
-const OVERFLOW_TEXT: &str = "runtime error: arithmetic overflows an int\n";
-const BOUNDS_TEXT: &str = "runtime error: array index out of bounds\n";
+/// One way a program can stop rather than answer wrongly.
+struct Abort {
+    /// What the failing instruction jumps to.
+    label: &'static str,
+    /// What went wrong, as the program reports it.
+    what: &'static str,
+}
+
+impl Abort {
+    const fn new(label: &'static str, what: &'static str) -> Abort {
+        Abort { label, what }
+    }
+
+    /// The label of this failure's text in `.data`, derived from its own so
+    /// that a new way to fail is one row here and nothing anywhere else.
+    fn message(&self) -> String {
+        format!("{}_text", self.label)
+    }
+
+    fn text(&self) -> String {
+        format!("runtime error: {}\n", self.what)
+    }
+}
+
+/// The arena every string built at run time is cut from, and the routine that
+/// cuts it. See [`arena`] for what it is and why it never gives anything back.
+const ARENA_NEXT: &str = "tc$rt$arena_next";
+const ARENA_END: &str = "tc$rt$arena_end";
+const ALLOC: &str = "tc$rt$alloc";
+
+/// Bytes the arena asks the C runtime for at a time.
+///
+/// Big enough that a program doing string work calls `malloc` a handful of
+/// times, small enough that a program doing none pays nothing — the first
+/// chunk is only asked for when something is first allocated.
+const CHUNK_BYTES: u32 = 1 << 16;
+
+/// Encodes one character as UTF-8, which is the only place the language's
+/// representation meets the one the outside world reads.
+const UTF8: &str = "tc$rt$utf8";
+const PRINT_STR: &str = "tc$rt$print_str";
+const PRINT_CHAR: &str = "tc$rt$print_char";
+/// Where `print` builds the UTF-8 of a string, kept between calls so that
+/// printing in a loop allocates once rather than once per line.
+const SCRATCH: &str = "tc$rt$scratch";
+const SCRATCH_CAP: &str = "tc$rt$scratch_cap";
+
+/// The code page that makes a Windows console read what is written to it as
+/// UTF-8. Without it a program that prints `é` prints two bytes of mojibake,
+/// and the language's promise about characters would stop at the terminal.
+const UTF8_CODE_PAGE: u32 = 65001;
 
 /// The file descriptor `_write` should report a runtime failure on.
 const STDERR: u32 = 2;
@@ -206,13 +280,19 @@ impl DivGuards {
 /// fail at all.
 fn may_abort(instr: &Instr) -> bool {
     match instr {
-        // A constant index was settled at compile time; anything else is
-        // checked where it lands.
-        Instr::Elem { index, .. } => !matches!(index, Value::Const(_)),
+        // A constant index into an array of known length was settled at
+        // compile time; anything else — including every index into a string,
+        // whose length is never known here — is checked where it lands.
+        Instr::Elem { index, len, .. } => {
+            !matches!((index, len), (Value::Const(_), Value::Const(_)))
+        }
         Instr::Bin { op, lhs, rhs, .. } if op.divides() => DivGuards::of(lhs, rhs).any(),
         // `add`, `sub` and `imul` are all guarded; a folded result never
         // reaches an instruction in the first place.
         Instr::Bin { .. } => true,
+        // Every runtime routine can fail: the two that allocate run out of
+        // memory, and the one that checks a character refuses.
+        Instr::RtCall { .. } => true,
         _ => false,
     }
 }
@@ -268,9 +348,16 @@ impl Backend for X64Windows {
         asm.line("section .text");
 
         for (function, allocation) in program.functions.iter().zip(allocations) {
-            FnEmitter::new(program, function, allocation, &self.registers, &mut asm).run();
+            FnEmitter::new(program, function, allocation, &self.registers, &used, &mut asm).run();
         }
 
+        if used.allocates() {
+            arena(&mut asm);
+        }
+        string_stubs(&mut asm, &used);
+        if used.writes_text() {
+            text_stubs(&mut asm, &used);
+        }
         if used.aborts {
             abort_stubs(&mut asm);
         }
@@ -290,6 +377,16 @@ struct Used {
     /// emitted. A class nothing builds has no objects to dispatch on.
     vtables: Vec<bool>,
     aborts: bool,
+    /// Which of the compiler's own routines the program reaches, directly or
+    /// through another one. A program that never touches a string pays for
+    /// none of them — not even the arena.
+    concat: bool,
+    str_eq: bool,
+    check_char: bool,
+    char_str: bool,
+    int_str: bool,
+    print_str: bool,
+    print_char: bool,
 }
 
 impl Used {
@@ -299,36 +396,74 @@ impl Used {
             enums: vec![false; program.table.enums.len()],
             vtables: vec![false; program.vtables.len()],
             aborts: false,
+            concat: false,
+            str_eq: false,
+            check_char: false,
+            char_str: false,
+            int_str: false,
+            print_str: false,
+            print_char: false,
         };
         for instr in program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instrs) {
             match instr {
                 Instr::Print { ty, .. } => {
                     used.formats[format_index(*ty)] = true;
-                    if let Ty::Enum(id) = ty {
-                        used.enums[id.0 as usize] = true;
+                    match ty {
+                        Ty::Enum(id) => used.enums[id.0 as usize] = true,
+                        Ty::Str => used.print_str = true,
+                        Ty::Char => used.print_char = true,
+                        _ => {}
                     }
                 }
                 Instr::VTable { class, .. } => used.vtables[class.0 as usize] = true,
-                other => used.aborts |= may_abort(other),
+                other => {
+                    used.aborts |= may_abort(other);
+                    if let Instr::RtCall { callee, .. } = other {
+                        match callee {
+                            Runtime::Concat => used.concat = true,
+                            Runtime::StrEq => used.str_eq = true,
+                            Runtime::CheckChar => used.check_char = true,
+                            Runtime::CharToStr => used.char_str = true,
+                            Runtime::IntToStr => used.int_str = true,
+                        }
+                    }
+                }
             }
         }
+        // Asking the arena for memory is a way to fail like any other, and a
+        // `print` reaches it without any instruction saying so: the buffer it
+        // encodes into is cut from the arena too.
+        used.aborts |= used.allocates();
         used
     }
 
     fn prints(&self, ty: Ty) -> bool {
         self.formats[format_index(ty)]
     }
+
+    /// Whether anything cuts memory out of the arena — which is what decides
+    /// whether the program calls `malloc` at all.
+    fn allocates(&self) -> bool {
+        self.concat || self.char_str || self.int_str || self.print_str
+    }
+
+    /// Whether any character is ever written out, and so whether the encoder
+    /// and the console's code page are needed.
+    fn writes_text(&self) -> bool {
+        self.print_str || self.print_char
+    }
 }
 
 /// Which format string a type is printed with.
 ///
 /// An enum shares the string one: printing a value of one means printing the
-/// name of its variant, so what reaches `printf` is a pointer to bytes exactly
-/// as a `string` is.
+/// name of its variant, which is a C string in `.data`. A `string` and a `char`
+/// share it too, one step further removed — they are encoded into a buffer
+/// first, and it is that buffer `printf` is given.
 fn format_index(ty: Ty) -> usize {
     match ty {
         Ty::Int => 0,
-        Ty::Str | Ty::Enum(_) | Ty::Array(_) | Ty::Class(_) => 1,
+        Ty::Str | Ty::Char | Ty::Enum(_) | Ty::Array(_) | Ty::Class(_) => 1,
         Ty::Bool => 2,
     }
 }
@@ -400,6 +535,14 @@ fn header(asm: &mut Asm, target: &str, used: &Used) {
         asm.line("extern _write");
         asm.line("extern exit");
     }
+    if used.allocates() {
+        // The arena's chunks. Nothing is ever given back, so there is no `free`
+        // to declare — see `arena`.
+        asm.line("extern malloc");
+    }
+    if used.writes_text() {
+        asm.line("extern SetConsoleOutputCP");
+    }
     asm.line(&format!("global {ENTRY_POINT}"));
     asm.blank();
 }
@@ -457,22 +600,46 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
     }
     if used.aborts {
         // No NUL: `_write` is given a length, not a C string.
-        asm.asm(&format!("{MSG_DIV_ZERO}: db {}", bytes_of(DIV_ZERO_TEXT)));
-        asm.asm(&format!("{MSG_DIV_OVERFLOW}: db {}", bytes_of(DIV_OVERFLOW_TEXT)));
-        asm.asm(&format!("{MSG_OVERFLOW}: db {}", bytes_of(OVERFLOW_TEXT)));
-        asm.asm(&format!("{MSG_BOUNDS}: db {}", bytes_of(BOUNDS_TEXT)));
+        for abort in &ABORTS {
+            asm.asm(&format!("{}: db {}", abort.message(), bytes_of(&*abort.text())));
+        }
     }
-    for (index, bytes) in program.strings.iter().enumerate() {
-        // Emitting raw bytes avoids every string-quoting corner case.
-        let values: Vec<String> = bytes
-            .iter()
-            .map(|b| b.to_string())
-            .chain(std::iter::once("0".to_string()))
-            .collect();
-        let text = String::from_utf8_lossy(bytes).escape_debug().to_string();
-        asm.asm(&format!("str{index}: db {}    ; \"{text}\"", values.join(", ")));
+    // A literal is laid out exactly as a string built at run time is: the
+    // character count in the eight bytes before the characters, and the
+    // characters four bytes each. That is the whole reason nothing downstream
+    // has to know which kind of string it holds.
+    for (index, chars) in program.strings.iter().enumerate() {
+        let text = chars.iter().collect::<String>().escape_debug().to_string();
+        asm.asm("align 8");
+        asm.asm(&format!("str{index}_len: dq {}", chars.len()));
+        match chars.is_empty() {
+            // Nothing may follow the label, and nothing will read it either:
+            // its length says there is no character to fetch.
+            true => asm.asm(&format!("str{index}:    ; \"\"")),
+            false => {
+                let values: Vec<String> =
+                    chars.iter().map(|c| (*c as u32).to_string()).collect();
+                asm.asm(&format!("str{index}: dd {}    ; \"{text}\"", values.join(", ")));
+            }
+        }
     }
     asm.blank();
+
+    // Uninitialised, so the arena's bookkeeping costs nothing in the file: a
+    // next pointer and an end pointer that start equal at zero, which is what
+    // sends the very first allocation to ask for a chunk.
+    if used.allocates() || used.print_str {
+        asm.line("section .bss");
+        if used.allocates() {
+            asm.asm(&format!("{ARENA_NEXT}: resq 1"));
+            asm.asm(&format!("{ARENA_END}: resq 1"));
+        }
+        if used.print_str {
+            asm.asm(&format!("{SCRATCH}: resq 1"));
+            asm.asm(&format!("{SCRATCH_CAP}: resq 1"));
+        }
+        asm.blank();
+    }
 }
 
 fn bytes_of(text: &str) -> String {
@@ -490,24 +657,16 @@ fn abort_stubs(asm: &mut Asm) {
     asm.blank();
     asm.comment("runtime failures: report on stderr, then leave with a non-zero status");
 
-    asm.line(&format!("{ABORT_DIV_ZERO}:"));
-    asm.asm(&format!("lea  {RDX}, [{MSG_DIV_ZERO}]"));
-    asm.asm(&format!("mov  r8d, {}", DIV_ZERO_TEXT.len()));
-    asm.asm(&format!("jmp  {ABORT_REPORT}"));
-
-    asm.line(&format!("{ABORT_DIV_OVERFLOW}:"));
-    asm.asm(&format!("lea  {RDX}, [{MSG_DIV_OVERFLOW}]"));
-    asm.asm(&format!("mov  r8d, {}", DIV_OVERFLOW_TEXT.len()));
-    asm.asm(&format!("jmp  {ABORT_REPORT}"));
-
-    asm.line(&format!("{ABORT_OVERFLOW}:"));
-    asm.asm(&format!("lea  {RDX}, [{MSG_OVERFLOW}]"));
-    asm.asm(&format!("mov  r8d, {}", OVERFLOW_TEXT.len()));
-    asm.asm(&format!("jmp  {ABORT_REPORT}"));
-
-    asm.line(&format!("{ABORT_BOUNDS}:"));
-    asm.asm(&format!("lea  {RDX}, [{MSG_BOUNDS}]"));
-    asm.asm(&format!("mov  r8d, {}", BOUNDS_TEXT.len()));
+    for (at, abort) in ABORTS.iter().enumerate() {
+        asm.line(&format!("{}:", abort.label));
+        asm.asm(&format!("lea  {RDX}, [{}]", abort.message()));
+        asm.asm(&format!("mov  r8d, {}", abort.text().len()));
+        // The last one falls straight through into the report rather than
+        // jumping to the instruction after itself.
+        if at + 1 < ABORTS.len() {
+            asm.asm(&format!("jmp  {ABORT_REPORT}"));
+        }
+    }
 
     asm.line(&format!("{ABORT_REPORT}:"));
     asm.comment("a frame of its own, so nothing that jumps here owes one");
@@ -523,6 +682,370 @@ fn abort_stubs(asm: &mut Asm) {
     asm.asm("call exit");
 }
 
+/// The arena: where every string the program builds lives.
+///
+/// A bump pointer through chunks asked of `malloc`, and **nothing is ever given
+/// back**. That is not an omission but the design: a string built here may be
+/// returned, stored, and passed on, so its address travels outward — which the
+/// rest of the language never lets an address do, precisely because an address
+/// that outlives what it points at is the one mistake no type checker here
+/// would catch. Memory that is never freed cannot dangle, so the question does
+/// not arise, and no lifetimes, no reference counts and no collector are
+/// needed to answer it.
+///
+/// What it costs is the memory a long-running program stops using and never
+/// reclaims. TinyC programs run and finish, so the trade is a good one — and it
+/// is the *whole* reason strings can be values here.
+fn arena(asm: &mut Asm) {
+    asm.blank();
+    asm.comment("the arena: a bump pointer through chunks, and nothing is ever freed");
+    asm.line(&format!("{ALLOC}:"));
+    asm.comment("rcx = bytes wanted -> rax = their address");
+    asm.asm("push rbx");
+    asm.asm("push rsi");
+    asm.asm("sub  rsp, 40    ; shadow space + alignment");
+    asm.comment("round up, so every block starts 16-aligned like malloc's own");
+    asm.asm("lea  rbx, [rcx+15]");
+    asm.asm("and  rbx, -16");
+    asm.asm(&format!("mov  {RAX}, [{ARENA_NEXT}]"));
+    asm.asm(&format!("lea  {RDX}, [{RAX}+rbx]"));
+    asm.asm(&format!("cmp  {RDX}, [{ARENA_END}]"));
+    asm.asm("ja   .refill");
+    asm.asm(&format!("mov  [{ARENA_NEXT}], {RDX}"));
+    asm.asm("add  rsp, 40");
+    asm.asm("pop  rsi");
+    asm.asm("pop  rbx");
+    asm.asm("ret");
+
+    asm.line(".refill:");
+    asm.comment("what is left of the old chunk is abandoned: nothing here frees");
+    asm.asm(&format!("mov  rsi, {CHUNK_BYTES}"));
+    asm.asm("cmp  rsi, rbx");
+    asm.asm("jae  .big_enough");
+    asm.comment("a single string can be bigger than a chunk, so ask for it whole");
+    asm.asm("mov  rsi, rbx");
+    asm.line(".big_enough:");
+    asm.asm(&format!("mov  {RCX}, rsi"));
+    asm.asm("call malloc");
+    asm.asm(&format!("test {RAX}, {RAX}"));
+    asm.asm(&format!("jz   {ABORT_OOM}"));
+    asm.asm(&format!("lea  {RDX}, [{RAX}+rsi]"));
+    asm.asm(&format!("mov  [{ARENA_END}], {RDX}"));
+    asm.asm(&format!("lea  {RDX}, [{RAX}+rbx]"));
+    asm.asm(&format!("mov  [{ARENA_NEXT}], {RDX}"));
+    asm.asm("add  rsp, 40");
+    asm.asm("pop  rsi");
+    asm.asm("pop  rbx");
+    asm.asm("ret");
+}
+
+/// The routines a string's operators become.
+///
+/// Each is here because it is a *loop*. Everything a string does in a straight
+/// line — its length, one of its characters — is an instruction the backend
+/// emits inline; only the operations that have to walk the characters are worth
+/// a call.
+fn string_stubs(asm: &mut Asm, used: &Used) {
+    if used.concat {
+        asm.blank();
+        asm.comment("a + b: a new string in the arena, holding a's characters then b's");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::Concat)));
+        asm.comment("rcx = a, rdx = b -> rax = the joined string");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("push rdi");
+        asm.asm("push r12");
+        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm(&format!("mov  rdi, {RDX}"));
+        asm.asm("mov  rbx, [rsi-8]    ; how many characters a has");
+        asm.asm("mov  r12, [rdi-8]");
+        asm.asm(&format!("lea  {RCX}, [rbx+r12]"));
+        asm.asm(&format!("lea  {RCX}, [{RCX}*4+8]    ; the header, then four bytes each"));
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("lea  {RDX}, [rbx+r12]"));
+        asm.asm(&format!("mov  [{RAX}], {RDX}    ; the count goes in front"));
+        asm.asm(&format!("add  {RAX}, 8    ; and the value is where the characters start"));
+        asm.asm(&format!("mov  {RDX}, {RAX}"));
+        asm.asm(&format!("mov  {RCX}, rbx"));
+        asm.line(".left:");
+        asm.asm(&format!("test {RCX}, {RCX}"));
+        asm.asm("jz   .right_start");
+        asm.asm("mov  r8d, [rsi]");
+        asm.asm(&format!("mov  [{RDX}], r8d"));
+        asm.asm("add  rsi, 4");
+        asm.asm(&format!("add  {RDX}, 4"));
+        asm.asm(&format!("dec  {RCX}"));
+        asm.asm("jmp  .left");
+        asm.line(".right_start:");
+        asm.asm(&format!("mov  {RCX}, r12"));
+        asm.line(".right:");
+        asm.asm(&format!("test {RCX}, {RCX}"));
+        asm.asm("jz   .done");
+        asm.asm("mov  r8d, [rdi]");
+        asm.asm(&format!("mov  [{RDX}], r8d"));
+        asm.asm("add  rdi, 4");
+        asm.asm(&format!("add  {RDX}, 4"));
+        asm.asm(&format!("dec  {RCX}"));
+        asm.asm("jmp  .right");
+        asm.line(".done:");
+        asm.asm("add  rsp, 40");
+        asm.asm("pop  r12");
+        asm.asm("pop  rdi");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+
+    if used.str_eq {
+        asm.blank();
+        asm.comment("a == b: the same length and the same characters, never the same address");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::StrEq)));
+        asm.comment("rcx = a, rdx = b -> rax = 1 when they hold the same characters");
+        asm.asm(&format!("mov  {RAX}, [{RCX}-8]"));
+        asm.asm(&format!("cmp  {RAX}, [{RDX}-8]"));
+        asm.comment("different lengths settle it without looking at a character");
+        asm.asm("jne  .differ");
+        asm.asm(&format!("mov  r8, {RAX}"));
+        asm.line(".next:");
+        asm.asm("test r8, r8");
+        asm.asm("jz   .same");
+        asm.asm(&format!("mov  r9d, [{RCX}]"));
+        asm.asm(&format!("cmp  r9d, [{RDX}]"));
+        asm.asm("jne  .differ");
+        asm.asm(&format!("add  {RCX}, 4"));
+        asm.asm(&format!("add  {RDX}, 4"));
+        asm.asm("dec  r8");
+        asm.asm("jmp  .next");
+        asm.line(".same:");
+        asm.asm("mov  eax, 1");
+        asm.asm("ret");
+        asm.line(".differ:");
+        asm.asm("xor  eax, eax");
+        asm.asm("ret");
+    }
+
+    if used.check_char {
+        asm.blank();
+        asm.comment("char(n): n itself, unless n names no character");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::CheckChar)));
+        asm.comment("rcx = n -> rax = n");
+        asm.asm(&format!("mov  {RAX}, {RCX}"));
+        asm.comment("unsigned, so a negative n is enormous and fails the same test");
+        asm.asm(&format!("cmp  {RCX}, 0x10FFFF"));
+        asm.asm(&format!("ja   {ABORT_BAD_CHAR}"));
+        asm.comment("the surrogate block in the middle names nothing either");
+        asm.asm(&format!("mov  {RDX}, {RCX}"));
+        asm.asm(&format!("sub  {RDX}, 0xD800"));
+        asm.asm(&format!("cmp  {RDX}, 0x7FF"));
+        asm.asm(&format!("jbe  {ABORT_BAD_CHAR}"));
+        asm.asm("ret");
+    }
+
+    if used.char_str {
+        asm.blank();
+        asm.comment("string(c): a string of exactly one character");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::CharToStr)));
+        asm.comment("rcx = the character -> rax = the string");
+        asm.asm("push rbx");
+        asm.asm("sub  rsp, 32    ; shadow space");
+        asm.asm(&format!("mov  rbx, {RCX}"));
+        asm.asm(&format!("mov  {RCX}, 12    ; the count, then the one character"));
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("mov  qword [{RAX}], 1"));
+        asm.asm(&format!("add  {RAX}, 8"));
+        asm.asm(&format!("mov  [{RAX}], ebx"));
+        asm.asm("add  rsp, 32");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+
+    if used.int_str {
+        asm.blank();
+        asm.comment("string(n): the number written out in decimal");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::IntToStr)));
+        asm.comment("rcx = n -> rax = its text");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("push rdi");
+        asm.asm("push r12");
+        asm.asm("sub  rsp, 72    ; shadow space + room for the digits");
+        asm.asm("xor  r12, r12    ; how many digits so far");
+        asm.asm("lea  rdi, [rsp+32]");
+        asm.asm(&format!("mov  rbx, {RCX}    ; keep n, to read its sign back"));
+        asm.asm(&format!("mov  {RAX}, {RCX}"));
+        asm.comment("work on the negative side: the most negative int has no positive twin");
+        asm.asm(&format!("test {RAX}, {RAX}"));
+        asm.asm("js   .digits");
+        asm.asm(&format!("neg  {RAX}"));
+        asm.line(".digits:");
+        asm.asm("mov  rsi, 10");
+        asm.line(".next:");
+        asm.asm("cqo");
+        asm.asm("idiv rsi");
+        asm.comment("the remainder carries the dividend's sign, so it comes back up");
+        asm.asm(&format!("neg  {RDX}"));
+        asm.asm(&format!("add  {RDX}, 48    ; '0'"));
+        asm.asm("mov  [rdi+r12], dl");
+        asm.asm("inc  r12");
+        asm.asm(&format!("test {RAX}, {RAX}"));
+        asm.asm("jnz  .next");
+        asm.asm("test rbx, rbx");
+        asm.asm("jns  .unsigned");
+        asm.asm("mov  byte [rdi+r12], 45    ; '-'");
+        asm.asm("inc  r12");
+        asm.line(".unsigned:");
+        asm.asm(&format!("lea  {RCX}, [r12*4+8]"));
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("mov  [{RAX}], r12"));
+        asm.asm(&format!("add  {RAX}, 8"));
+        asm.comment("the digits came out backwards, so they go back front to back");
+        asm.asm(&format!("mov  {RCX}, r12"));
+        asm.asm(&format!("mov  {RDX}, {RAX}"));
+        asm.line(".copy:");
+        asm.asm(&format!("dec  {RCX}"));
+        asm.asm(&format!("movzx r8d, byte [rdi+{RCX}]"));
+        asm.asm(&format!("mov  [{RDX}], r8d"));
+        asm.asm(&format!("add  {RDX}, 4"));
+        asm.asm(&format!("test {RCX}, {RCX}"));
+        asm.asm("jnz  .copy");
+        asm.asm("add  rsp, 72");
+        asm.asm("pop  r12");
+        asm.asm("pop  rdi");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+}
+
+/// Writing text out: the one place the language's characters meet UTF-8.
+///
+/// A string is four bytes per character inside the program, because that is
+/// what makes `s[i]` an address and not a walk. The outside world reads UTF-8,
+/// so it is encoded here, at the boundary, and nowhere else.
+fn text_stubs(asm: &mut Asm, used: &Used) {
+    asm.blank();
+    asm.comment("encode one character as UTF-8");
+    asm.line(&format!("{UTF8}:"));
+    asm.comment("ecx = character, rdx = where to put it -> rax = bytes written");
+    asm.asm("cmp  ecx, 0x80");
+    asm.asm("jae  .two");
+    asm.asm(&format!("mov  [{RDX}], cl"));
+    asm.asm("mov  eax, 1");
+    asm.asm("ret");
+    asm.line(".two:");
+    asm.asm("cmp  ecx, 0x800");
+    asm.asm("jae  .three");
+    for (shift, mask, tag, at) in [(6, 0x1F, 0xC0, 0), (0, 0x3F, 0x80, 1)] {
+        utf8_byte(asm, shift, mask, tag, at);
+    }
+    asm.asm("mov  eax, 2");
+    asm.asm("ret");
+    asm.line(".three:");
+    asm.asm("cmp  ecx, 0x10000");
+    asm.asm("jae  .four");
+    for (shift, mask, tag, at) in [(12, 0x0F, 0xE0, 0), (6, 0x3F, 0x80, 1), (0, 0x3F, 0x80, 2)] {
+        utf8_byte(asm, shift, mask, tag, at);
+    }
+    asm.asm("mov  eax, 3");
+    asm.asm("ret");
+    asm.line(".four:");
+    for (shift, mask, tag, at) in
+        [(18, 0x07, 0xF0, 0), (12, 0x3F, 0x80, 1), (6, 0x3F, 0x80, 2), (0, 0x3F, 0x80, 3)]
+    {
+        utf8_byte(asm, shift, mask, tag, at);
+    }
+    asm.asm("mov  eax, 4");
+    asm.asm("ret");
+
+    if used.print_str {
+        asm.blank();
+        asm.comment("print a string: encode the whole of it, then hand printf one C string");
+        asm.line(&format!("{PRINT_STR}:"));
+        asm.comment("rcx = the string");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("push rdi");
+        asm.asm("sub  rsp, 32    ; shadow space");
+        asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm(&format!("mov  rbx, [{RCX}-8]"));
+        asm.comment("four bytes per character is the most UTF-8 can need, plus the NUL");
+        asm.asm(&format!("lea  {RCX}, [rbx*4+1]"));
+        asm.asm(&format!("cmp  {RCX}, [{SCRATCH_CAP}]"));
+        asm.asm("jbe  .room");
+        asm.comment("the buffer is kept between calls, so a loop of prints allocates once");
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("mov  [{SCRATCH}], {RAX}"));
+        asm.asm(&format!("lea  {RCX}, [rbx*4+1]"));
+        asm.asm(&format!("mov  [{SCRATCH_CAP}], {RCX}"));
+        asm.line(".room:");
+        asm.asm(&format!("mov  rdi, [{SCRATCH}]"));
+        asm.line(".next:");
+        asm.asm("test rbx, rbx");
+        asm.asm("jz   .done");
+        asm.asm(&format!("mov  ecx, [rsi]"));
+        asm.asm(&format!("mov  {RDX}, rdi"));
+        asm.asm(&format!("call {UTF8}"));
+        asm.asm(&format!("add  rdi, {RAX}"));
+        asm.asm("add  rsi, 4");
+        asm.asm("dec  rbx");
+        asm.asm("jmp  .next");
+        asm.line(".done:");
+        asm.asm("mov  byte [rdi], 0");
+        asm.asm(&format!("lea  {RCX}, [{FMT_STR}]"));
+        asm.asm(&format!("mov  {RDX}, [{SCRATCH}]"));
+        asm.asm("call printf");
+        asm.asm("add  rsp, 32");
+        asm.asm("pop  rdi");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+
+    if used.print_char {
+        asm.blank();
+        asm.comment("print one character: at most four bytes, so the frame is buffer enough");
+        asm.line(&format!("{PRINT_CHAR}:"));
+        asm.comment("rcx = the character");
+        asm.asm("sub  rsp, 56    ; shadow space + a five-byte buffer + alignment");
+        asm.asm(&format!("lea  {RDX}, [rsp+32]"));
+        asm.asm(&format!("call {UTF8}"));
+        asm.asm(&format!("mov  byte [rsp+{RAX}+32], 0"));
+        asm.asm(&format!("lea  {RCX}, [{FMT_STR}]"));
+        asm.asm(&format!("lea  {RDX}, [rsp+32]"));
+        asm.asm("call printf");
+        asm.asm("add  rsp, 56");
+        asm.asm("ret");
+    }
+}
+
+/// One byte of a UTF-8 sequence: some bits of the character, under the tag that
+/// says which byte of how many this is.
+fn utf8_byte(asm: &mut Asm, shift: u32, mask: u32, tag: u32, at: u32) {
+    asm.asm("mov  eax, ecx");
+    if shift > 0 {
+        asm.asm(&format!("shr  eax, {shift}"));
+    }
+    asm.asm(&format!("and  eax, {mask:#x}"));
+    asm.asm(&format!("or   eax, {tag:#x}"));
+    match at {
+        0 => asm.asm(&format!("mov  [{RDX}], al")),
+        _ => asm.asm(&format!("mov  [{RDX}+{at}], al")),
+    }
+}
+
+/// The assembly name of one of the compiler's own routines.
+fn runtime_symbol(callee: Runtime) -> String {
+    format!("{RUNTIME_PREFIX}{}", callee.name())
+}
+
+/// The 32-bit half of a register, which is what reads a character out of a
+/// string and, in doing so, widens it.
+fn narrow(reg: &str) -> &'static str {
+    let at = NAMES.iter().position(|&n| n == reg).expect("a name this backend gave a register");
+    NAMES32[at]
+}
+
 // -- one function ----------------------------------------------------------
 
 struct FnEmitter<'a, 'o> {
@@ -530,6 +1053,7 @@ struct FnEmitter<'a, 'o> {
     function: &'a Function,
     allocation: &'a Allocation,
     registers: &'a RegisterFile,
+    used: &'a Used,
     frame: FrameLayout,
     asm: &'o mut Asm,
     /// Serial number for the local labels a division guard needs.
@@ -542,20 +1066,27 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         function: &'a Function,
         allocation: &'a Allocation,
         registers: &'a RegisterFile,
+        used: &'a Used,
         asm: &'o mut Asm,
     ) -> FnEmitter<'a, 'o> {
         // A leaf makes no call, so it owes neither shadow space nor alignment.
         // Jumping to a runtime abort does not count: that routine builds its
         // own frame, precisely so a function full of guarded arithmetic does
         // not have to carry one for a path it almost never takes.
-        let leaf = !function
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instrs)
-            .any(|instr| instr.is_call());
+        //
+        // The entry point of a program that writes text is never a leaf: it
+        // calls the console's code page into shape first, even when every
+        // print happens somewhere else.
+        let entry = function.name == ENTRY_POINT;
+        let leaf = !(entry && used.writes_text())
+            && !function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instrs)
+                .any(|instr| instr.is_call());
 
         let frame = FrameLayout::new(allocation, function.frame_bytes, leaf);
-        FnEmitter { program, function, allocation, registers, frame, asm, next_label: 0 }
+        FnEmitter { program, function, allocation, registers, used, frame, asm, next_label: 0 }
     }
 
     fn run(&mut self) {
@@ -565,6 +1096,11 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         }
         self.asm.line(&format!("{}:", symbol(&self.function.name)));
         self.prologue();
+        if self.is_entry_point() && self.used.writes_text() {
+            self.asm.comment("tell the console the bytes it is about to receive are UTF-8");
+            self.asm.asm(&format!("mov  ecx, {UTF8_CODE_PAGE}"));
+            self.asm.asm("call SetConsoleOutputCP");
+        }
 
         for (index, block) in self.function.blocks.iter().enumerate() {
             self.asm.blank();
@@ -851,9 +1387,12 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             // carries none of the overflow guards `Bin` does.
             Instr::Elem { dst, base, index, len, scale } => {
                 let base = self.in_register(base, SCRATCH0);
-                if let Value::Const(at) = index {
+                if let (Value::Const(at), Value::Const(_)) = (index, len) {
                     // `sema` proved this one is in range, so it needs no check
-                    // and its offset folds into the addressing mode.
+                    // and its offset folds into the addressing mode. Only an
+                    // array can reach here: a string's length is not known
+                    // until the program runs, so an index into one is checked
+                    // however plainly it is written.
                     let work = self.work_reg(*dst, false);
                     self.asm.asm(&format!("lea  {work}, [{base}+{}]", at * i64::from(*scale)));
                     self.store_back(*dst, &work);
@@ -864,6 +1403,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 // One *unsigned* comparison rules out both ends: a negative
                 // index read as unsigned is enormous, so it fails the same
                 // test that catches one past the end.
+                let len = self.value(len);
                 self.asm.asm(&format!("cmp  {index}, {len}"));
                 self.asm.asm(&format!("jae  {ABORT_BOUNDS}"));
 
@@ -899,6 +1439,24 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 let addr = self.in_register(addr, SCRATCH0);
                 let work = self.work_reg(*dst, false);
                 self.asm.asm(&format!("mov  {work}, [{addr}]"));
+                self.store_back(*dst, &work);
+            }
+            // A character is four bytes inside a string and eight everywhere
+            // else, so reading one widens it. Writing the 32-bit half of a
+            // register clears the top half, which is the widening: a character
+            // is never negative, so there is nothing to sign extend.
+            Instr::LoadChar { dst, addr } => {
+                let addr = self.in_register(addr, SCRATCH0);
+                let work = self.work_reg(*dst, false);
+                self.asm.asm(&format!("mov  {}, [{addr}]", narrow(&work)));
+                self.store_back(*dst, &work);
+            }
+            // The count a string carries in the eight bytes before its
+            // characters. One load, which is why `len` is not a routine.
+            Instr::StrLen { dst, str } => {
+                let str = self.in_register(str, SCRATCH0);
+                let work = self.work_reg(*dst, false);
+                self.asm.asm(&format!("mov  {work}, [{str}-8]"));
                 self.store_back(*dst, &work);
             }
             Instr::Store { addr, value } => {
@@ -944,6 +1502,30 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 self.asm.asm(&format!("call [{SCRATCH0}+{}]", slot * 8));
                 self.take_result(*dst);
             }
+            // The same call an ordinary one is, with a name only this module
+            // can produce. Nothing about the sequence differs, which is the
+            // point: a routine of the compiler's own is not a special form.
+            Instr::RtCall { dst, callee, args } => {
+                for (index, arg) in args.iter().enumerate() {
+                    let src = self.value(arg);
+                    self.asm.mov(ARG_REGS[index], &src);
+                }
+                self.asm.asm(&format!("call {}", runtime_symbol(*callee)));
+                self.take_result(*dst);
+            }
+            // A string and a character are written by a routine rather than by
+            // `printf`, because what they hold has to be encoded first. The
+            // routine ends in the same `printf` all the same, so everything
+            // still reaches one buffered stream and nothing interleaves.
+            Instr::Print { ty: ty @ (Ty::Str | Ty::Char), val } => {
+                let value = self.value(val);
+                self.asm.mov(RCX, &value);
+                let routine = match ty {
+                    Ty::Str => PRINT_STR,
+                    _ => PRINT_CHAR,
+                };
+                self.asm.asm(&format!("call {routine}"));
+            }
             Instr::Print { ty, val } => {
                 // Load the value first: the format string is a constant, so it
                 // can never be clobbered by the argument move.
@@ -969,8 +1551,9 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 }
                 let format = match ty {
                     Ty::Int => FMT_INT,
-                    Ty::Str | Ty::Enum(_) | Ty::Array(_) | Ty::Class(_) => FMT_STR,
                     Ty::Bool => FMT_BOOL,
+                    // A string and a character left through the arm above.
+                    _ => FMT_STR,
                 };
                 self.asm.asm(&format!("lea  {RCX}, [{format}]"));
                 self.asm.asm("call printf");
@@ -1596,9 +2179,65 @@ mod tests {
     }
 
     #[test]
-    fn strings_are_emitted_as_bytes() {
+    fn a_literal_is_laid_out_like_a_string_built_at_run_time() {
         let asm = compile("string s = \"hi\";\nprint(s);");
-        assert!(asm.contains("str0: db 104, 105, 0"), "{asm}");
+        // The count first, then one four-byte character each — the same shape
+        // the arena produces, so nothing downstream tells the two apart.
+        assert!(asm.contains("str0_len: dq 2"), "{asm}");
+        assert!(asm.contains("str0: dd 104, 105"), "{asm}");
+    }
+
+    #[test]
+    fn a_literal_counts_characters_rather_than_bytes() {
+        let asm = compile("string s = \"é\";\nprint(s);");
+        assert!(asm.contains("str0_len: dq 1"), "{asm}");
+        assert!(asm.contains("str0: dd 233"), "{asm}");
+    }
+
+    #[test]
+    fn a_program_that_touches_no_string_gets_no_arena() {
+        // Nothing unused is emitted, and the arena is the largest thing there
+        // is to leave out: a program of pure arithmetic never calls `malloc`.
+        let asm = compile("int x = 1;\nprint(x + 1);");
+        assert!(!asm.contains("extern malloc"), "{asm}");
+        assert!(!asm.contains(ALLOC), "{asm}");
+        assert!(!asm.contains("SetConsoleOutputCP"), "{asm}");
+    }
+
+    #[test]
+    fn printing_a_string_brings_the_arena_and_the_encoder_with_it() {
+        // Printing encodes into a buffer cut from the arena, so even a program
+        // that only prints a literal allocates — and can therefore run out of
+        // memory, which is why the abort stubs come too.
+        let asm = compile("print(\"hi\");");
+        assert!(asm.contains("extern malloc"), "{asm}");
+        assert!(asm.contains(&format!("{ABORT_OOM}:")), "{asm}");
+        assert!(asm.contains(&format!("{UTF8}:")), "{asm}");
+    }
+
+    #[test]
+    fn a_string_operator_that_is_not_used_is_not_emitted() {
+        let asm = compile("print(\"a\" == \"b\");");
+        assert!(asm.contains(&runtime_symbol(Runtime::StrEq)), "{asm}");
+        assert!(!asm.contains(&runtime_symbol(Runtime::Concat)), "{asm}");
+    }
+
+    #[test]
+    fn the_entry_point_sets_the_console_up_before_writing_any_text() {
+        let asm = compile("print('a');");
+        let main = asm.find("\nmain:").expect("an entry point");
+        let setup = asm.find("call SetConsoleOutputCP").expect("the console setup");
+        let print = asm.find(PRINT_CHAR).expect("the print routine");
+        assert!(main < setup && setup < print, "{asm}");
+    }
+
+    #[test]
+    fn a_string_knows_its_own_length_without_being_told() {
+        // One load, from behind the address the value holds. That is the whole
+        // reason the count lives in front of the characters.
+        let asm = compile("string s = \"abc\";\nprint(len(s));");
+        assert!(asm.contains("-8]"), "{asm}");
+        assert!(!asm.contains(&format!("call {}", runtime_symbol(Runtime::StrEq))), "{asm}");
     }
 
     // -- functions ---------------------------------------------------------

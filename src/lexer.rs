@@ -85,6 +85,7 @@ impl<'a> Lexer<'a> {
                 '%' => self.single(TokenKind::Percent),
                 ',' => self.single(TokenKind::Comma),
                 '"' => self.string()?,
+                '\'' => self.character()?,
                 c if c.is_ascii_digit() => self.number()?,
                 c if is_ident_start(c) => self.ident(),
                 c => {
@@ -170,6 +171,7 @@ impl<'a> Lexer<'a> {
         match &self.src[start..self.offset()] {
             "int" => TokenKind::KwInt,
             "string" => TokenKind::KwString,
+            "char" => TokenKind::KwChar,
             "bool" => TokenKind::KwBool,
             "print" => TokenKind::KwPrint,
             "if" => TokenKind::KwIf,
@@ -228,47 +230,131 @@ impl<'a> Lexer<'a> {
         Ok(TokenKind::Int(value))
     }
 
+    /// A string literal, decoded into the characters it stands for.
+    ///
+    /// The source is UTF-8 and `chars` has already decoded it, so a literal
+    /// containing `é` yields one character here and everywhere after. Nothing
+    /// downstream ever sees the two bytes it took to write.
     fn string(&mut self) -> std::result::Result<TokenKind, Diagnostic> {
         let open = self.offset();
         self.bump(); // opening quote
-        let mut bytes = Vec::new();
+        let mut chars = Vec::new();
         loop {
-            let escape_start = self.offset();
-            match self.bump() {
-                Some('"') => return Ok(TokenKind::Str(bytes)),
-                Some('\\') => {
-                    let escaped = match self.bump() {
-                        Some('n') => b'\n',
-                        Some('t') => b'\t',
-                        Some('r') => b'\r',
-                        Some('0') => 0,
-                        Some('\\') => b'\\',
-                        Some('"') => b'"',
-                        Some(c) => {
-                            return Err(Diagnostic::new(
-                                format!("unknown escape sequence `\\{c}`"),
-                                Span::new(escape_start, self.offset() - escape_start),
-                            )
-                            .with_note(SUPPORTED_ESCAPES, None));
-                        }
-                        None => break,
-                    };
-                    bytes.push(escaped);
+            match self.peek() {
+                Some('"') => {
+                    self.bump();
+                    return Ok(TokenKind::Str(chars));
                 }
+                Some('\\') => match self.escape()? {
+                    Some(c) => chars.push(c),
+                    None => break,
+                },
                 // A string literal may not span lines.
                 Some('\n') | None => break,
                 Some(c) => {
-                    let mut buf = [0u8; 4];
-                    bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    self.bump();
+                    chars.push(c);
                 }
             }
         }
         Err(Diagnostic::new("unterminated string literal", Span::new(open, 1))
             .with_label("this quote has no match on the same line"))
     }
+
+    /// A character literal: exactly one character between single quotes.
+    ///
+    /// "Exactly one" is the whole check, and it is worth making — `'ab'` is a
+    /// string somebody quoted the wrong way, and saying so is more useful than
+    /// silently keeping the first character.
+    fn character(&mut self) -> std::result::Result<TokenKind, Diagnostic> {
+        let open = self.offset();
+        self.bump(); // opening quote
+
+        let unterminated = || {
+            Diagnostic::new("unterminated character literal", Span::new(open, 1))
+                .with_label("this quote has no match on the same line")
+                .with_note("a character literal is written `'a'`", None)
+        };
+
+        let value = match self.peek() {
+            Some('\'') => {
+                self.bump();
+                return Err(Diagnostic::new(
+                    "empty character literal",
+                    Span::new(open, self.offset() - open),
+                )
+                .with_label("a character literal holds exactly one character")
+                .with_note("the empty *string* is written `\"\"`", None));
+            }
+            Some('\\') => match self.escape()? {
+                Some(c) => c,
+                None => return Err(unterminated()),
+            },
+            Some('\n') | None => return Err(unterminated()),
+            Some(c) => {
+                self.bump();
+                c
+            }
+        };
+
+        match self.peek() {
+            Some('\'') => {
+                self.bump();
+                Ok(TokenKind::Char(value))
+            }
+            // Run to the closing quote so the whole literal can be underlined
+            // rather than the one character that was allowed.
+            Some(_) => {
+                while !matches!(self.peek(), Some('\'') | Some('\n') | None) {
+                    self.bump();
+                }
+                let closed = self.peek() == Some('\'');
+                if closed {
+                    self.bump();
+                }
+                match closed {
+                    true => Err(Diagnostic::new(
+                        "character literal holds more than one character",
+                        Span::new(open, self.offset() - open),
+                    )
+                    .with_label("a character literal holds exactly one character")
+                    .with_note("write it with double quotes for a string", None)),
+                    false => Err(unterminated()),
+                }
+            }
+            None => Err(unterminated()),
+        }
+    }
+
+    /// One escape sequence, starting at the backslash.
+    ///
+    /// `None` means the file ended inside it, which is the caller's business:
+    /// what is unterminated is the literal, not the escape.
+    fn escape(&mut self) -> std::result::Result<Option<char>, Diagnostic> {
+        let start = self.offset();
+        self.bump(); // the backslash
+        let escaped = match self.bump() {
+            Some('n') => '\n',
+            Some('t') => '\t',
+            Some('r') => '\r',
+            Some('0') => '\0',
+            Some('\\') => '\\',
+            Some('"') => '"',
+            Some('\'') => '\'',
+            Some(c) => {
+                return Err(Diagnostic::new(
+                    format!("unknown escape sequence `\\{c}`"),
+                    Span::new(start, self.offset() - start),
+                )
+                .with_note(SUPPORTED_ESCAPES, None));
+            }
+            None => return Ok(None),
+        };
+        Ok(Some(escaped))
+    }
 }
 
-const SUPPORTED_ESCAPES: &str = r#"supported escapes are \n \t \r \0 \\ \""#;
+const SUPPORTED_ESCAPES: &str = r#"supported escapes are \n \t \r \0 \\ \" \'"#;
 
 fn is_ident_start(c: char) -> bool {
     c == '_' || c.is_alphabetic()
@@ -284,6 +370,11 @@ mod tests {
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         lex(src).unwrap().into_iter().map(|t| t.kind).collect()
+    }
+
+    /// The characters a literal is expected to have produced.
+    fn chars(text: &str) -> Vec<char> {
+        text.chars().collect()
     }
 
     /// The single diagnostic a malformed source produces.
@@ -322,7 +413,7 @@ mod tests {
 
     #[test]
     fn decodes_escapes() {
-        assert_eq!(kinds(r#""a\n\"b""#), vec![TokenKind::Str(b"a\n\"b".to_vec()), TokenKind::Eof]);
+        assert_eq!(kinds(r#""a\n\"b""#), vec![TokenKind::Str(chars("a\n\"b")), TokenKind::Eof]);
     }
 
     #[test]
@@ -676,7 +767,7 @@ mod tests {
     fn decodes_every_escape() {
         assert_eq!(
             kinds(r#""\n\t\r\0\\\"""#),
-            vec![TokenKind::Str(b"\n\t\r\0\\\"".to_vec()), TokenKind::Eof]
+            vec![TokenKind::Str(chars("\n\t\r\0\\\"")), TokenKind::Eof]
         );
     }
 
@@ -686,12 +777,53 @@ mod tests {
     }
 
     #[test]
-    fn a_string_holds_utf8_bytes() {
-        // Characters are re-encoded on the way in, so the token carries bytes
-        // and not chars.
+    fn a_string_holds_characters_not_bytes() {
+        // The source's UTF-8 is decoded here and nowhere else, so `é` is one
+        // character from this point on however many bytes it took to write.
+        let token = kinds(r#""héllo""#);
+        assert_eq!(token, vec![TokenKind::Str(chars("héllo")), TokenKind::Eof]);
+        let TokenKind::Str(decoded) = &token[0] else { panic!("a string literal") };
+        assert_eq!(decoded.len(), 5, "five characters, six bytes");
+    }
+
+    // -- character literals ------------------------------------------------
+
+    #[test]
+    fn lexes_a_character_literal() {
+        assert_eq!(kinds("'a'"), vec![TokenKind::Char('a'), TokenKind::Eof]);
+        assert_eq!(kinds("'é'"), vec![TokenKind::Char('é'), TokenKind::Eof]);
+        assert_eq!(kinds(r"'\n'"), vec![TokenKind::Char('\n'), TokenKind::Eof]);
+        assert_eq!(kinds(r"'\''"), vec![TokenKind::Char('\''), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn rejects_a_character_literal_holding_more_than_one() {
+        // `'ab'` is a string somebody quoted the wrong way, and saying so is
+        // more useful than keeping the first character.
+        let error = error("'ab'");
+        assert!(error.message.contains("more than one character"), "{}", error.message);
+        assert_eq!(error.span, Span::new(0, 4), "the whole literal is underlined");
+        assert!(error.note.is_some(), "the note points at double quotes");
+    }
+
+    #[test]
+    fn rejects_an_empty_character_literal() {
+        let error = error("''");
+        assert!(error.message.contains("empty character literal"), "{}", error.message);
+    }
+
+    #[test]
+    fn rejects_an_unterminated_character_literal() {
+        let error = error("'a\n");
+        assert!(error.message.contains("unterminated character literal"), "{}", error.message);
+        assert_eq!(error.span, Span::new(0, 1), "the caret goes on the quote");
+    }
+
+    #[test]
+    fn char_is_a_keyword() {
         assert_eq!(
-            kinds(r#""héllo""#),
-            vec![TokenKind::Str("héllo".as_bytes().to_vec()), TokenKind::Eof]
+            kinds("char c"),
+            vec![TokenKind::KwChar, TokenKind::Ident("c".to_string()), TokenKind::Eof]
         );
     }
 
@@ -699,7 +831,7 @@ mod tests {
     fn a_comment_marker_inside_a_string_is_just_text() {
         assert_eq!(
             kinds(r#""// not a comment""#),
-            vec![TokenKind::Str(b"// not a comment".to_vec()), TokenKind::Eof]
+            vec![TokenKind::Str(chars("// not a comment")), TokenKind::Eof]
         );
     }
 

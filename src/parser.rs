@@ -8,7 +8,7 @@
 //! fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 //! params  := param ("," param)*
 //! param   := type IDENT
-//! type    := ("int" | "string" | "bool" | IDENT) ("[" INT "]")?
+//! type    := ("int" | "string" | "char" | "bool" | IDENT) ("[" INT "]")?
 //! stmt    := decl | assign | print | if | while | for | match | return
 //!          | break | continue
 //! decl    := type IDENT "=" expr ";"
@@ -28,12 +28,13 @@
 //! sum     := term (("+" | "-") term)*
 //! term    := unary (("*" | "/" | "%") unary)*
 //! unary   := ("-" | "!") unary | primary
-//! primary := INT | STRING | BOOL | IDENT | variant | call | match | array
-//!          | index | len | "(" expr ")"
+//! primary := INT | STRING | CHAR | BOOL | IDENT | variant | call | match
+//!          | array | index | len | convert | "(" expr ")"
 //! variant := IDENT "::" IDENT
 //! array   := "[" (expr ("," expr)*)? "]"
 //! index   := IDENT "[" expr "]"
-//! len     := "len" "(" IDENT ")"
+//! len     := "len" "(" expr ")"
+//! convert := ("int" | "char" | "string" | "bool") "(" expr ")"
 //! call    := IDENT "(" (expr ("," expr)*)? ")"
 //! match   := "match" "(" expr ")" "{" arm* "}"
 //! arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
@@ -45,7 +46,7 @@
 use crate::ast;
 use crate::ast::{
     ArmBody, BinOp, Block, ClassDecl, CmpOp, EnumDecl, Expr, ExprKind, FieldDecl, FieldInit,
-    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Program, Stmt, TypeRef, Variant,
+    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Prim, Program, Stmt, TypeRef, Variant,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
@@ -214,7 +215,7 @@ impl<'a> Parser<'a> {
     fn expect_type(&mut self, what: &str) -> PResult<TypeRef> {
         let token = self.peek();
         let name = match &token.kind {
-            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwBool => {
+            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwChar | TokenKind::KwBool => {
                 token.kind.text().to_string()
             }
             TokenKind::Ident(name) => name.clone(),
@@ -224,7 +225,7 @@ impl<'a> Parser<'a> {
                     token.span,
                 )
                 .with_label(format!("{what} needs a type here"))
-                .with_note("the types are `int`, `string`, `bool` and any declared enum", None));
+                .with_note("the types are `int`, `string`, `char`, `bool` and any declared enum or class", None));
             }
         };
         let span = self.bump().span;
@@ -260,7 +261,7 @@ impl<'a> Parser<'a> {
     /// declaration and an `=` in an assignment.
     fn starts_declaration(&self) -> bool {
         match self.peek().kind {
-            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwBool => true,
+            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwChar | TokenKind::KwBool => true,
             TokenKind::Ident(_) => match self.peek_at(1).kind {
                 TokenKind::Ident(_) => true,
                 TokenKind::LBracket => {
@@ -873,8 +874,30 @@ impl<'a> Parser<'a> {
         let span = token.span;
         let kind = match &token.kind {
             TokenKind::Int(v) => ExprKind::Int(*v),
-            TokenKind::Str(bytes) => ExprKind::Str(bytes.clone()),
+            TokenKind::Str(chars) => ExprKind::Str(chars.clone()),
+            TokenKind::Char(c) => ExprKind::Char(*c),
             TokenKind::Bool(v) => ExprKind::Bool(*v),
+            // `int(c)` — a conversion, written as the type it produces. A type
+            // keyword in expression position can be nothing else: a declaration
+            // is a *statement*, and statements are told apart before this point.
+            TokenKind::KwInt | TokenKind::KwChar | TokenKind::KwString | TokenKind::KwBool => {
+                let to = match token.kind {
+                    TokenKind::KwInt => Prim::Int,
+                    TokenKind::KwChar => Prim::Char,
+                    TokenKind::KwString => Prim::Str,
+                    _ => Prim::Bool,
+                };
+                let keyword = self.bump().span;
+                let open = self.expect(TokenKind::LParen)?.span;
+                let value = self.expr()?;
+                let close = self.expect_closing_paren(open)?;
+                let span = keyword.to(close);
+                return Ok(Expr {
+                    id: self.node_id(),
+                    span,
+                    kind: ExprKind::Convert { to, value: Box::new(value), span },
+                });
+            }
             // A name is a variable unless a `(` follows, which makes it a call.
             // Both need the identifier consumed before the decision, so this
             // arm leaves through its own `return` rather than the shared

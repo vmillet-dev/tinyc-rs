@@ -206,8 +206,20 @@ impl EnumInfo {
 pub enum Ty {
     /// 64-bit signed integer.
     Int,
-    /// Pointer to NUL-terminated static bytes.
+    /// A run of characters, held as the address of the first one.
+    ///
+    /// The characters are four bytes each and the count sits in the eight bytes
+    /// *before* them, so a string knows its own length and `len` is a load. A
+    /// literal is laid out the same way in `.data` as a built one is in the
+    /// arena, which is why nothing anywhere has to ask which kind it holds.
     Str,
+    /// One Unicode scalar value: what a string is made of, and what indexing
+    /// one produces.
+    ///
+    /// A separate type rather than a small `int`, so that `+` cannot be applied
+    /// to it by accident and `print` knows to write a character rather than a
+    /// number. Going between the two is spelled out — see [`Prim`].
+    Char,
     /// `true` or `false`.
     Bool,
     /// One of the variants of a declared enum, held as its index.
@@ -233,6 +245,7 @@ impl Ty {
         match self {
             Ty::Int => "int".to_string(),
             Ty::Str => "string".to_string(),
+            Ty::Char => "char".to_string(),
             Ty::Bool => "bool".to_string(),
             Ty::Enum(id) => types.enum_info(id).name.clone(),
             Ty::Class(id) => types.class(id).name.clone(),
@@ -260,18 +273,24 @@ impl Ty {
     ///
     /// An enum's variants have an order in the declaration, but it is not one
     /// the program said anything about, so TinyC declines to invent it.
+    ///
+    /// Characters are ordered by their Unicode scalar value, which *is* a fact
+    /// the program can rely on — it is what `'0' <= c && c <= '9'` asks. Two
+    /// strings are not, deliberately: that would look like alphabetical order
+    /// and would not be it, since where `é` sorts is a question about a
+    /// language rather than about the encoding.
     pub fn is_ordered(self) -> bool {
-        matches!(self, Ty::Int)
+        matches!(self, Ty::Int | Ty::Char)
     }
 
     /// Whether two values of this type can be compared for equality at all.
     ///
-    /// Strings cannot: it would need a runtime routine, and comparing the
-    /// pointers would quietly answer a different question. Arrays cannot for
-    /// the same reason — element by element is a loop, and the addresses are
-    /// not what anybody meant to ask about.
+    /// Strings can, and it is their *contents* that answer: comparing the
+    /// addresses would quietly answer a different question, so this one costs a
+    /// call. Arrays and objects cannot — element by element is a loop nobody
+    /// asked for, and the addresses are not what anybody meant.
     pub fn has_equality(self) -> bool {
-        !matches!(self, Ty::Str | Ty::Array(_) | Ty::Class(_))
+        !matches!(self, Ty::Array(_) | Ty::Class(_))
     }
 
     /// Whether a value of this type travels in a register.
@@ -299,6 +318,39 @@ pub struct TypeRef {
     pub array_len: Option<(i64, Span)>,
     /// The whole type as written, brackets included.
     pub span: Span,
+}
+
+/// A type written where a value is expected, which is how TinyC spells a
+/// conversion: `int(c)` is the code point of a character, `char(n)` the
+/// character with that code point.
+///
+/// Only the types with a keyword can be written this way, which is what keeps
+/// the form unambiguous — every other type name is an identifier, and an
+/// identifier followed by `(` is a call.
+///
+/// The point of the form is that **there are no implicit conversions at all**.
+/// Where another language would quietly widen a character into an integer, this
+/// one makes you say which of the two you meant; and because the answer is
+/// spelled out, `char(n)` may reject at run time an `n` that names no character
+/// rather than inventing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prim {
+    Int,
+    Char,
+    Str,
+    Bool,
+}
+
+impl Prim {
+    /// The type this converts to.
+    pub fn ty(self) -> Ty {
+        match self {
+            Prim::Int => Ty::Int,
+            Prim::Char => Ty::Char,
+            Prim::Str => Ty::Str,
+            Prim::Bool => Ty::Bool,
+        }
+    }
 }
 
 /// Index of an expression node, used by [`crate::sema`] to record its type
@@ -479,7 +531,11 @@ pub struct Expr {
 #[derive(Clone, Debug)]
 pub enum ExprKind {
     Int(i64),
-    Str(Vec<u8>),
+    /// The characters of a string literal, already decoded from the source's
+    /// UTF-8. What the program manipulates is characters; UTF-8 is a transport
+    /// the lexer reads and printing writes, and nothing between them sees it.
+    Str(Vec<char>),
+    Char(char),
     Bool(bool),
     Var(String),
     /// Unary minus, on an `int`.
@@ -499,11 +555,16 @@ pub enum ExprKind {
     Array { elements: Vec<Expr>, span: Span },
     /// `xs[i]`.
     Index { array: Box<Expr>, index: Box<Expr> },
-    /// `len(xs)` — the length of an array, which is always a constant.
+    /// `len(xs)` — how many an array holds, or how many characters a string
+    /// has.
     ///
-    /// A construct rather than a library function because there is nothing a
-    /// library function could be given: an array's length is in its *type*.
+    /// A construct rather than a library function because of the array case:
+    /// there is nothing a library function could be given, since an array's
+    /// length is in its *type* and folds to a literal. A string's is a load,
+    /// which is the only reason this ever reaches the emitted code at all.
     Len { array: Box<Expr>, span: Span },
+    /// `int(c)`, `char(n)` — a conversion, written as the type it produces.
+    Convert { to: Prim, value: Box<Expr>, span: Span },
     /// `Circle { r: 5 }` — the only way to make an object.
     ///
     /// Every field the class has, inherited ones included, must be named
@@ -952,9 +1013,10 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
     let pad = "  ".repeat(depth);
     match &expr.kind {
         ExprKind::Int(v) => out.push_str(&format!("{pad}int {v}\n")),
-        ExprKind::Str(bytes) => {
-            out.push_str(&format!("{pad}string {:?}\n", String::from_utf8_lossy(bytes)))
+        ExprKind::Str(chars) => {
+            out.push_str(&format!("{pad}string {:?}\n", chars.iter().collect::<String>()))
         }
+        ExprKind::Char(c) => out.push_str(&format!("{pad}char {c:?}\n")),
         ExprKind::Bool(v) => out.push_str(&format!("{pad}bool {v}\n")),
         ExprKind::Var(name) => out.push_str(&format!("{pad}var {name}\n")),
         ExprKind::Variant { enum_name, variant, .. } => {
@@ -974,6 +1036,10 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
         ExprKind::Len { array, .. } => {
             out.push_str(&format!("{pad}len\n"));
             dump_expr(out, array, depth + 1);
+        }
+        ExprKind::Convert { to, value, .. } => {
+            out.push_str(&format!("{pad}convert to {}\n", to.ty().name(&TypeTable::default())));
+            dump_expr(out, value, depth + 1);
         }
         ExprKind::New { class, fields, .. } => {
             out.push_str(&format!("{pad}new {class}\n"));
@@ -1034,4 +1100,13 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
             }
         }
     }
+}
+
+/// Whether a number names a character.
+///
+/// Not every number does, and that is the whole reason `char(n)` is checked at
+/// all: the range stops at `0x10FFFF`, and the block reserved for UTF-16
+/// surrogates in the middle of it names no character either.
+pub fn is_scalar_value(value: i64) -> bool {
+    u32::try_from(value).is_ok_and(|v| char::from_u32(v).is_some())
 }

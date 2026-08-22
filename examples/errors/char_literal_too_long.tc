@@ -1,0 +1,4 @@
+fn main() {
+  char c = 'ab';
+  print(c);
+}

@@ -27,7 +27,7 @@ use tinyc::codegen::Target;
 
 /// Programs that must keep printing exactly what `examples/expected/<name>.txt`
 /// says, and the source of truth for what a working TinyC program looks like.
-const EXAMPLES: [&str; 10] = [
+const EXAMPLES: [&str; 11] = [
     "hello.tc",
     "arith.tc",
     "spill.tc",
@@ -38,6 +38,7 @@ const EXAMPLES: [&str; 10] = [
     "enums.tc",
     "arrays.tc",
     "classes.tc",
+    "strings.tc",
 ];
 
 #[test]
@@ -106,11 +107,64 @@ fn the_awkward_corners_of_code_generation_still_compute() {
         ("int a = 17;\nint b = 5;\na = a % b;\nprint(a);", "2"),
     ];
 
+    run_each(&tools, "corner", &cases);
+}
+
+/// What a string does, checked by running it rather than by reading assembly.
+///
+/// Every case here answers a *number* or a `true`/`false` wherever it can, so
+/// that a mangled character shows up as a wrong count rather than as output
+/// that merely looks odd.
+#[test]
+fn strings_hold_characters_rather_than_bytes() {
+    let Some(tools) = Tools::find() else { return };
+
+    let cases: [(&str, &str); 16] = [
+        // A length is a count of characters, whatever they cost to write.
+        (r#"print(len("héllo"));"#, "5"),
+        (r#"print(len("日本語"));"#, "3"),
+        (r#"print(len(""));"#, "0"),
+        // Joining, including the two empty cases the copy loops have to get
+        // right by doing nothing at all.
+        (r#"print("a" + "b" == "ab");"#, "true"),
+        (r#"print("" + "x" == "x");"#, "true"),
+        (r#"print("x" + "" == "x");"#, "true"),
+        (r#"print(len("é" + "é"));"#, "2"),
+        // Equality is about contents. Two literals are interned, so a program
+        // that compared addresses would get the first of these right and the
+        // second wrong.
+        (r#"print("ab" == "ab");"#, "true"),
+        (r#"string s = "a" + "b";
+            print(s == "ab");"#, "true"),
+        (r#"print("ab" == "abc");"#, "false"),
+        (r#"print("abc" == "abd");"#, "false"),
+        // Indexing lands on the character it promises, not on a byte of one.
+        (r#"print(int("héllo"[1]));"#, "233"),
+        (r#"print(int("日本語"[2]));"#, "35486"),
+        // A round trip through both conversions, for a character that needs
+        // three bytes of UTF-8 and would lose them if anything counted bytes.
+        (r#"print(string(char(int('語'))) == "語");"#, "true"),
+        // A number written out, including the one with no positive twin.
+        (r#"print(string(0 - 9223372036854775807 - 1) == "-9223372036854775808");"#, "true"),
+        // Enough joining to send the arena back to `malloc` for another chunk.
+        (r#"string s = "";
+            for (int i = 0; i < 5000; i = i + 1) {
+              s = s + "0123456789";
+            }
+            print(len(s));"#, "50000"),
+    ];
+
+    run_each(&tools, "string", &cases);
+}
+
+/// Compile each body as the whole of `main`, run it, and check what it printed.
+fn run_each(tools: &Tools, stem: &str, cases: &[(&str, &str)]) {
     for (index, (body, expected)) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("corner{index}.tc"));
+        let name = format!("{stem}{index}");
+        let source = tools.scratch.join(format!("{name}.tc"));
         std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
 
-        let run = tools.build_and_run(&source, &format!("corner{index}"));
+        let run = tools.build_and_run(&source, &name);
         assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
     }
@@ -607,6 +661,8 @@ impl Tools {
         // developer command prompt would have set up for it.
         //
         //  - msvcrt.lib                   : the C runtime, where printf lives
+        //  - kernel32.lib                 : SetConsoleOutputCP, so a console reads
+        //                                   what is printed to it as UTF-8
         //  - legacy_stdio_definitions.lib : printf as a real symbol rather than
         //                                   the inline function the UCRT headers
         //                                   normally provide
@@ -615,7 +671,7 @@ impl Tools {
             .args(["/nologo", "/subsystem:console", "/entry:mainCRTStartup"])
             .arg(format!("/out:{}", exe.display()))
             .arg(&obj)
-            .args(["msvcrt.lib", "legacy_stdio_definitions.lib"])
+            .args(["msvcrt.lib", "kernel32.lib", "legacy_stdio_definitions.lib"])
             .output()
             .expect("link should run");
         assert!(

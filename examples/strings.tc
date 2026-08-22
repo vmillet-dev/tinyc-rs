@@ -1,0 +1,98 @@
+// Strings: the first values the compiler cannot write out in advance.
+//
+// A string is a run of *characters* — not bytes. `len` counts characters, `s[i]`
+// is one character, and a letter written with an accent counts once however
+// many bytes it took to type. UTF-8 exists only at the edges: the lexer decodes
+// the source, `print` encodes what it writes, and nothing in between sees it.
+//
+// The characters of a string built while the program runs live in an arena the
+// runtime never gives back. That is what lets a string be returned, stored and
+// passed on: its address travels outward, and memory that is never freed cannot
+// dangle. It is the one place TinyC spends memory to avoid a question.
+
+// A string may be returned, unlike an array or an object. The caller reserves
+// no room for it, because nobody could know how much to reserve — what comes
+// back is a piece of the arena, which outlives every call.
+fn greet(string name) -> string {
+  return "hello, " + name;
+}
+
+fn shout(string text) -> string {
+  string out = "";
+  for (int i = 0; i < len(text); i = i + 1) {
+    char c = text[i];
+    // No arithmetic on a character: the conversions are written out, so the
+    // step from a letter to a number is never taken by accident.
+    if (c >= 'a' && c <= 'z') {
+      c = char(int(c) - 32);
+    }
+    out = out + string(c);
+  }
+  return out;
+}
+
+fn main() {
+  string a = "héllo";
+  string b = "wörld";
+
+  // A length is a number of characters. Both of these have five, although one
+  // of them takes six bytes to write down.
+  print(len(a));                 // 5
+  print(len(b));                 // 5
+
+  // `+` joins two strings, and produces a third: neither operand changes.
+  string both = a + " " + b;
+  print(both);                   // héllo wörld
+  print(len(both));              // 11
+  print(a);                      // héllo — still itself
+
+  // `==` compares what two strings *hold*. Comparing their addresses would
+  // answer a different question, and would say `false` here.
+  print(both == "héllo wörld");  // true
+  print(both == "héllo world");  // false
+  print(a != b);                 // true
+
+  // Indexing gives one character. A string's length is not known until the
+  // program runs, so every index is checked — even one written as a literal.
+  print(both[1]);                // é
+  print(both[len(both) - 1]);    // d
+
+  // Characters have their own type. They compare, including for order, because
+  // the order of code points is a fact about the encoding. Two *strings* do
+  // not: where `é` sorts is a question about a language, not about characters.
+  char first = both[0];
+  print(first == 'h');           // true
+  print('a' < 'z');              // true
+
+  // The four conversions, which are the whole list. Nothing converts on its
+  // own, so a message with a number in it says where the number became text.
+  print(int('A'));               // 65
+  print(char(9731));             // ☃
+  print(string('x'));            // x
+  print("count = " + string(len(both)));   // count = 11
+
+  print(greet("world"));         // hello, world
+  print(shout("héllo wörld"));   // HéLLO WöRLD
+
+  // A string is read-only, which is what makes it safe to share: `kept` and
+  // `both` may well be the same characters in memory, and neither can change
+  // them under the other. `s[i] = c` is a compile error.
+  string kept = both;
+  both = both + "!";
+  print(kept);                   // héllo wörld
+  print(both);                   // héllo wörld!
+
+  // Strings live in arrays like anything else.
+  string[3] words = ["un", "deux", "trois"];
+  int total = 0;
+  for (int i = 0; i < len(words); i = i + 1) {
+    total = total + len(words[i]);
+  }
+  print(total);                  // 11
+
+  // The empty string is a string like any other.
+  string nothing = "";
+  print(len(nothing));           // 0
+  print(nothing == "");          // true
+  print("a" + nothing == "a");   // true
+}

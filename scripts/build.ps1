@@ -71,13 +71,15 @@ if (-not (Test-Path $vcvars)) {
 
 # 5. Link inside a developer command prompt, which sets the LIB paths link needs.
 #    - msvcrt.lib                    : the C runtime (printf lives here)
+#    - kernel32.lib                  : SetConsoleOutputCP, so a console reads what
+#                                      is printed to it as UTF-8
 #    - legacy_stdio_definitions.lib  : exports printf as a real symbol rather
 #                                      than the inline function the UCRT headers
 #                                      normally provide
 Write-Host "==> link"
 $commands = @(
     "call `"$vcvars`" >nul 2>&1",
-    "link /nologo /subsystem:console /entry:mainCRTStartup /out:`"$exe`" `"$obj`" msvcrt.lib legacy_stdio_definitions.lib"
+    "link /nologo /subsystem:console /entry:mainCRTStartup /out:`"$exe`" `"$obj`" msvcrt.lib kernel32.lib legacy_stdio_definitions.lib"
 ) -join " && "
 
 & cmd.exe /c $commands

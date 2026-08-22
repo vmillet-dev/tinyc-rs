@@ -1,0 +1,4 @@
+fn main() {
+  string s = "abc";
+  s[0] = 'x';
+}

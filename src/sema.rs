@@ -23,9 +23,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     ArmBody, ArrayId, ArrayInfo, BinOp, Block, ClassId, ClassInfo, EnumId, EnumInfo, Expr,
-    ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Program, Stmt, Ty,
-    TypeRef,
-    TypeTable,
+    ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Prim, Program,
+    Stmt, Ty, TypeRef, TypeTable, is_scalar_value,
 };
 use crate::diag::{Diagnostic, Result, Span};
 
@@ -437,6 +436,7 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
     let element = match ty.name.as_str() {
         "int" => Some(Ty::Int),
         "string" => Some(Ty::Str),
+        "char" => Some(Ty::Char),
         "bool" => Some(Ty::Bool),
         name => declared
             .enum_id(name)
@@ -446,7 +446,7 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
                 errors.push(
                     Diagnostic::new(format!("unknown type `{name}`"), ty.span)
                         .with_label("no built-in type, enum or class goes by this name")
-                        .with_note("the built-in types are `int`, `string` and `bool`", None),
+                        .with_note("the built-in types are `int`, `string`, `char` and `bool`", None),
                 );
                 None
             }),
@@ -477,6 +477,23 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
 /// storing every element, so a huge one would emit a huge function. A repeat
 /// form like `[0; 1000]` lowered to a loop is what would lift it.
 pub const MAX_ARRAY_LEN: i64 = 1024;
+
+/// Every conversion the language has, listed wherever one is refused.
+///
+/// It is a short list on purpose: nothing converts on its own, so this is also
+/// the complete answer to "how do I turn this into that".
+const CONVERSIONS: &str = "the conversions are `int(c)`, `char(n)`, `string(c)` and `string(n)`";
+
+/// Why a particular number is not a character, which is a different sentence
+/// depending on where it lands.
+fn scalar_range_label(value: i64) -> String {
+    match value {
+        0xD800..=0xDFFF => format!(
+            "`{value}` is in the surrogate range 55296..=57343, which names no character"
+        ),
+        _ => "a character's code point is in 0..=1114111".to_string(),
+    }
+}
 
 /// `` `A` is `` / `` `A` and `B` are ``, so the label agrees with its subject.
 fn missing_verb(missing: &[&str]) -> String {
@@ -1308,6 +1325,21 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             Place::Var { name, .. } => self.lookup(name).map(|(ty, _)| ty),
             Place::Element { base, index, .. } => {
                 let of = self.place_type(base)?;
+                // A string is read-only, and that is what makes sharing one
+                // safe: two variables may hold the same characters precisely
+                // because neither can change them under the other.
+                if of == Ty::Str {
+                    self.error(
+                        Diagnostic::new("a string cannot be modified", place.span())
+                            .with_label("strings are read-only")
+                            .with_note(
+                                "build the string you want instead — `+` joins two of them",
+                                None,
+                            ),
+                    );
+                    self.index(Some(of), index);
+                    return None;
+                }
                 let (name, at) = base.root();
                 let (name, at) = (name.to_string(), at);
                 let element = self.element_type(of, at, &name, base.span());
@@ -1462,10 +1494,13 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     fn element_type(&mut self, ty: Ty, declared_span: Span, name: &str, at: Span) -> Option<Ty> {
         match ty {
             Ty::Array(id) => Some(self.shared.declared.table.array(id).elem),
+            // A string is a run of characters, so indexing one produces a
+            // character — never a byte and never a string of length one.
+            Ty::Str => Some(Ty::Char),
             other => {
                 let mut diagnostic =
                     Diagnostic::new(format!("cannot index {}", self.ty_article(other)), at)
-                        .with_label("only an array has elements");
+                        .with_label("only an array or a string has elements");
                 if !name.is_empty() {
                     diagnostic = diagnostic
                         .with_note(format!("`{name}` was declared here"), Some(declared_span));
@@ -1657,6 +1692,69 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             );
         }
         ret
+    }
+
+    /// Check `int(c)` and its relatives, and answer the type produced.
+    ///
+    /// The whole point of the form is that these are the *only* conversions in
+    /// the language: nothing widens, narrows or stringifies on its own, so this
+    /// list is exhaustive and the refusal below can say so.
+    fn convert(&mut self, to: Prim, value: &Expr, span: Span) -> Ty {
+        let from = self.expr(value);
+        let target = to.ty();
+
+        match (from, target) {
+            // A character's code point, and the character with that code point.
+            // Two directions, spelled apart, so neither can happen by accident.
+            (Ty::Char, Ty::Int) => {}
+            // Into a string: a character on its own, or a number written out in
+            // decimal. Both exist because `+` converts nothing, so a message
+            // with a value in it has to say where the value became text.
+            (Ty::Char | Ty::Int, Ty::Str) => {}
+            (Ty::Int, Ty::Char) => {
+                // A constant that names no character is settled here, exactly
+                // as a constant index out of range is: what reaches the emitted
+                // code is only ever a value the running program alone knows.
+                if let Some(at) = const_int(value)
+                    && !is_scalar_value(at)
+                {
+                    self.error(
+                        Diagnostic::new(format!("`{at}` is not a character"), value.span)
+                            .with_label(scalar_range_label(at))
+                            .with_note(
+                                "a character is a Unicode scalar value, and only some numbers name one",
+                                None,
+                            ),
+                    );
+                }
+            }
+            // An identity conversion is not wrong so much as confused: it
+            // reads as if something happened.
+            (from, target) if from == target => {
+                self.error(
+                    Diagnostic::new(
+                        format!("this is already {}", self.ty_article(target)),
+                        span,
+                    )
+                    .with_label("a conversion to its own type does nothing"),
+                );
+            }
+            _ => {
+                self.error(
+                    Diagnostic::new(
+                        format!(
+                            "there is no conversion from `{}` to `{}`",
+                            self.ty_name(from),
+                            self.ty_name(target)
+                        ),
+                        span,
+                    )
+                    .with_label(format!("this is {}", self.ty_article(from)))
+                    .with_note(CONVERSIONS, None),
+                );
+            }
+        }
+        target
     }
 
     /// Check an index expression: it must be an `int`, and when it is a
@@ -1989,6 +2087,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         let ty = match &expr.kind {
             ExprKind::Int(_) => Ty::Int,
             ExprKind::Str(_) => Ty::Str,
+            ExprKind::Char(_) => Ty::Char,
             ExprKind::Bool(_) => Ty::Bool,
             ExprKind::Var(name) => match self.lookup(name) {
                 Some((ty, _)) => ty,
@@ -2034,21 +2133,58 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 let lhs_ty = self.expr(lhs);
                 let rhs_ty = self.expr(rhs);
 
-                // Arithmetic is int-only in v0; report the offending operand.
-                for (ty, operand) in [(lhs_ty, lhs), (rhs_ty, rhs)] {
-                    if ty != Ty::Int {
+                // `+` joins two strings. It is the one operator with a second
+                // meaning, and it gets one because there is no other operator a
+                // reader would look for: joining is not "adding" anything else.
+                if *op == BinOp::Add && (lhs_ty == Ty::Str || rhs_ty == Ty::Str) {
+                    if lhs_ty != Ty::Str || rhs_ty != Ty::Str {
+                        let (ty, operand) =
+                            if lhs_ty == Ty::Str { (rhs_ty, rhs) } else { (lhs_ty, lhs) };
                         self.error(
                             Diagnostic::new(
                                 format!(
-                                    "cannot apply `{}` to `{}` and `{}`",
-                                    op.symbol(),
+                                    "cannot apply `+` to `{}` and `{}`",
                                     self.ty_name(lhs_ty),
                                     self.ty_name(rhs_ty)
                                 ),
                                 operand.span,
                             )
-                            .with_label(format!("expected int, found {}", self.ty_name(ty))),
+                            .with_label(format!("expected string, found {}", self.ty_name(ty)))
+                            // The mistake this catches is `"n = " + n`, which
+                            // every language with a looser `+` would accept —
+                            // so the note says how to write what was meant.
+                            .with_note(
+                                "`+` joins two strings; `string(n)` makes one out of a number, \
+                                 and `string(c)` out of a character",
+                                None,
+                            ),
                         );
+                    }
+                    return self.record(expr.id, Ty::Str);
+                }
+
+                // Everything else is int-only; report the offending operand.
+                for (ty, operand) in [(lhs_ty, lhs), (rhs_ty, rhs)] {
+                    if ty != Ty::Int {
+                        let mut diagnostic = Diagnostic::new(
+                            format!(
+                                "cannot apply `{}` to `{}` and `{}`",
+                                op.symbol(),
+                                self.ty_name(lhs_ty),
+                                self.ty_name(rhs_ty)
+                            ),
+                            operand.span,
+                        )
+                        .with_label(format!("expected int, found {}", self.ty_name(ty)));
+                        // A character is a character, not a small number. The
+                        // way to do arithmetic on one is to say so.
+                        if ty == Ty::Char {
+                            diagnostic = diagnostic.with_note(
+                                "`int(c)` is a character's code point, and `char(n)` goes back",
+                                None,
+                            );
+                        }
+                        self.error(diagnostic);
                     }
                 }
 
@@ -2072,22 +2208,33 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         .with_label(format!("expected {}, found {}", self.ty_name(lhs_ty), self.ty_name(rhs_ty))),
                     );
                 } else if !lhs_ty.has_equality() || (op.is_ordering() && !lhs_ty.is_ordered()) {
-                    // Only ints are ordered. Bools and enums answer `==`, since
-                    // that is a question about which value it is; strings answer
-                    // nothing without a runtime routine, and comparing their
-                    // pointers would quietly answer something else.
+                    // Ints and characters are ordered. Everything else that can
+                    // be compared at all answers only `==`, since that is a
+                    // question about *which value it is*; an array or an object
+                    // answers nothing, because comparing addresses would quietly
+                    // answer something else again.
                     let label = if !lhs_ty.has_equality() {
-                        "strings support no comparisons yet".to_string()
+                        format!(
+                            "comparing two `{}` values would compare addresses, not contents",
+                            self.ty_name(lhs_ty)
+                        )
                     } else {
                         format!("`{}` values only support `==` and `!=`", self.ty_name(lhs_ty))
                     };
-                    self.error(
-                        Diagnostic::new(
-                            format!("`{}` values cannot be compared with `{}`", self.ty_name(lhs_ty), op.symbol()),
-                            expr.span,
-                        )
-                        .with_label(label),
-                    );
+                    let mut diagnostic = Diagnostic::new(
+                        format!("`{}` values cannot be compared with `{}`", self.ty_name(lhs_ty), op.symbol()),
+                        expr.span,
+                    )
+                    .with_label(label);
+                    // Ordering strings is the one refusal a reader is likely to
+                    // argue with, so it says why rather than only that.
+                    if lhs_ty == Ty::Str && op.is_ordering() {
+                        diagnostic = diagnostic.with_note(
+                            "where a string sorts is a question about a language, not about the encoding; characters are ordered, strings are not",
+                            None,
+                        );
+                    }
+                    self.error(diagnostic);
                 }
                 Ty::Bool
             }
@@ -2135,20 +2282,26 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 element.unwrap_or(Ty::Int)
             }
             ExprKind::Len { array, span } => {
-                // The answer is a fact about the *type*, so the only thing to
-                // check is that what was given has one with a length.
+                // For an array the answer is a fact about the *type* and folds
+                // to a literal; for a string it is a load. Both are `len`,
+                // because from the source's point of view they are the same
+                // question.
                 let of = self.expr(array);
-                if !matches!(of, Ty::Array(_)) {
+                if !matches!(of, Ty::Array(_) | Ty::Str) {
                     self.error(
                         Diagnostic::new(
-                            format!("`len` needs an array, but this is {}", self.ty_article(of)),
+                            format!(
+                                "`len` needs an array or a string, but this is {}",
+                                self.ty_article(of)
+                            ),
                             *span,
                         )
-                        .with_label("only an array has a length"),
+                        .with_label("only an array or a string has a length"),
                     );
                 }
                 Ty::Int
             }
+            ExprKind::Convert { to, value, span } => self.convert(*to, value, *span),
             ExprKind::New { class, class_span, fields, span } => {
                 self.object_literal(class, *class_span, fields, *span)
             }
@@ -2358,7 +2511,92 @@ mod tests {
     #[test]
     fn rejects_ordering_comparisons_that_make_no_sense() {
         assert!(errors_in_main("print(true < false);")[0].message.contains("cannot be compared"));
-        assert!(errors_in_main("print(\"a\" == \"b\");")[0].message.contains("cannot be compared"));
+        // Two strings answer `==`, but not `<`: sorting them is a question
+        // about a language rather than about the characters.
+        let error = &errors_in_main("print(\"a\" < \"b\");")[0];
+        assert!(error.message.contains("cannot be compared"), "{}", error.message);
+        assert!(error.note.is_some(), "the refusal explains itself");
+    }
+
+    #[test]
+    fn two_strings_can_be_compared_for_equality() {
+        assert!(check_main("print(\"a\" == \"b\");\nprint(\"a\" != \"b\");").is_ok());
+    }
+
+    // -- strings and characters --------------------------------------------
+
+    #[test]
+    fn joining_two_strings_produces_a_string() {
+        assert!(check_main("string s = \"a\" + \"b\";\nprint(s + s);").is_ok());
+    }
+
+    #[test]
+    fn rejects_joining_a_string_to_anything_else() {
+        // The mistake every language with a looser `+` accepts, and the note
+        // says how to write what was meant.
+        let errors = errors_in_main("print(\"n = \" + 1);");
+        assert!(errors[0].message.contains("cannot apply `+`"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().is_some_and(|(text, _)| text.contains("string(n)")));
+    }
+
+    #[test]
+    fn a_string_has_a_length_and_so_does_an_array() {
+        assert!(check_main("print(len(\"abc\"));").is_ok());
+        let errors = errors_in_main("print(len(1));");
+        assert!(errors[0].message.contains("array or a string"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn indexing_a_string_produces_a_character() {
+        assert!(check_main("char c = \"abc\"[0];\nprint(c);").is_ok());
+        // Never an int, and never a string of length one: no conversion is
+        // implied anywhere, so the declared type has to agree.
+        let errors = errors_in_main("int n = \"abc\"[0];");
+        assert!(errors[0].message.contains("with a `char` value"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_string_cannot_be_written_into() {
+        // Immutability is what makes sharing a string unobservable, so this is
+        // load-bearing rather than a restriction.
+        let errors = errors_in_main("string s = \"abc\";\ns[0] = 'x';");
+        assert!(errors[0].message.contains("cannot be modified"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn characters_compare_but_do_not_do_arithmetic() {
+        assert!(check_main("print('a' == 'b');\nprint('a' < 'b');").is_ok());
+        let errors = errors_in_main("print('a' + 1);");
+        assert!(errors[0].message.contains("cannot apply `+`"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().is_some_and(|(text, _)| text.contains("int(c)")));
+    }
+
+    #[test]
+    fn the_four_conversions_are_accepted_and_nothing_else_is() {
+        assert!(check_main("print(int('a'));").is_ok());
+        assert!(check_main("print(char(65));").is_ok());
+        assert!(check_main("print(string('a'));").is_ok());
+        assert!(check_main("print(string(65));").is_ok());
+
+        let errors = errors_in_main("print(int(true));");
+        assert!(errors[0].message.contains("no conversion from `bool`"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_conversion_to_its_own_type_is_refused_rather_than_ignored() {
+        let errors = errors_in_main("print(int(1));");
+        assert!(errors[0].message.contains("already an `int`"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_constant_that_names_no_character_is_settled_at_compile_time() {
+        // The same bargain a constant index strikes: what reaches the emitted
+        // code is only ever a value the running program alone knows.
+        for bad in ["1114112", "55296", "0 - 1"] {
+            let errors = errors_in_main(&format!("print(char({bad}));"));
+            assert!(errors[0].message.contains("not a character"), "{bad}: {}", errors[0].message);
+        }
+        assert!(check_main("print(char(1114111));").is_ok());
     }
 
     #[test]

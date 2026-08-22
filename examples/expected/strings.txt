@@ -1,0 +1,24 @@
+5
+5
+héllo wörld
+11
+héllo
+true
+false
+true
+é
+d
+true
+true
+65
+☃
+x
+count = 11
+hello, world
+HéLLO WöRLD
+héllo wörld
+héllo wörld!
+11
+0
+true
+true
