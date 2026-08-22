@@ -67,6 +67,55 @@ impl BinOp {
         matches!(self, BinOp::Div | BinOp::Rem)
     }
 
+    /// The English name of the operation, for a diagnostic that talks about it.
+    pub fn noun(self) -> &'static str {
+        match self {
+            BinOp::Add => "addition",
+            BinOp::Sub => "subtraction",
+            BinOp::Mul => "multiplication",
+            BinOp::Div => "division",
+            BinOp::Rem => "remainder",
+        }
+    }
+
+    /// This operator's answer for two known operands, or `None` when the
+    /// machine would refuse to produce one.
+    ///
+    /// **The one place TinyC's arithmetic is defined.** [`crate::sema`] rejects
+    /// with it and [`crate::ir`] folds with it, so the two cannot come to
+    /// different conclusions about what `MAX + 1` means — which they would
+    /// eventually, kept apart.
+    ///
+    /// `Rem` refuses `MIN % -1` even though the answer is 0, because the machine
+    /// reaches that 0 through the `idiv` whose *quotient* does not fit.
+    pub fn apply(self, a: i64, b: i64) -> Option<i64> {
+        match self {
+            BinOp::Add => a.checked_add(b),
+            BinOp::Sub => a.checked_sub(b),
+            BinOp::Mul => a.checked_mul(b),
+            BinOp::Div => a.checked_div(b),
+            BinOp::Rem => a.checked_rem(b),
+        }
+    }
+
+    /// The answer an integer of unlimited width would give.
+    ///
+    /// Only a diagnostic wants this: it is how "`9223372036854775808` does not
+    /// fit in an `int`" gets to name the value that did not fit. `None` is a
+    /// division by zero, which has no answer at any width.
+    pub fn apply_exact(self, a: i64, b: i64) -> Option<i128> {
+        // Two `i64`s cannot overflow an `i128` under any of these, so the plain
+        // operators are safe here in a way they are not above.
+        let (a, b) = (i128::from(a), i128::from(b));
+        match self {
+            BinOp::Add => Some(a + b),
+            BinOp::Sub => Some(a - b),
+            BinOp::Mul => Some(a * b),
+            BinOp::Div => a.checked_div(b),
+            BinOp::Rem => a.checked_rem(b),
+        }
+    }
+
     /// Whether the operands may be exchanged, which lets a backend pick
     /// whichever order needs fewer moves.
     pub fn commutes(self) -> bool {

@@ -101,8 +101,9 @@ NASM and the Microsoft linker work together without anything in between.
 `print` is compiled into a call to the C runtime's `printf`, which is why the
 CRT is linked in. `legacy_stdio_definitions.lib` provides `printf` as a real
 symbol, since the UCRT headers normally supply it as an inline function. A
-program containing a division that has to be guarded also reaches for `_write`
-and `exit`, both from the same library — see [Runtime failures](#runtime-failures).
+program containing guarded arithmetic also reaches for `_write` and `exit`, both
+from the same library — see
+[Arithmetic never answers wrongly](#arithmetic-never-answers-wrongly).
 
 ## The language
 
@@ -141,7 +142,9 @@ deliberately no arrays yet.
 
 There is no implicit truth test either, so `!n` on an `int` is a type error
 rather than a comparison against zero. `%` takes its sign from the dividend, as
-in C: `-7 % 2` is `-1`.
+in C: `-7 % 2` is `-1`. Arithmetic that has no answer stops the program rather
+than wrapping — see
+[Arithmetic never answers wrongly](#arithmetic-never-answers-wrongly).
 
 ### Functions
 
@@ -476,32 +479,86 @@ the runtime's abort — has no call to align the stack for and no callee to leav
 shadow space for, so it reserves room for its spills and nothing else. Most
 leaves spill nothing and get no frame at all.
 
-## Runtime failures
+## Arithmetic never answers wrongly
 
-`idiv` does not answer `x / 0`, and it does not answer `i64::MIN / -1` either:
-the quotient does not fit, so the CPU faults exactly as it does on a zero
-divisor. Left alone that is a silent `0xC0000094` with nothing printed.
+**No operation on an `int` ever produces a value that is not the answer.** When
+one cannot, the program stops and says so; it never hands on a wrong number as
+if it were right.
 
-`%` is the same instruction read from a different register — `idiv` produces the
-quotient in `rax` and the remainder in `rdx` at once — so it carries the same two
-guards. It needs them both: `i64::MIN % -1` is 0 on paper, but the machine still
-reaches that 0 through the `idiv` whose *quotient* does not fit.
+Three things can go wrong, and all three are caught:
 
-Each division is guarded, and each guard a literal operand already answers is
-left out — `n / 7` carries no check at all, `n / (0 - 1)` checks only for
-overflow. When a check does fire, control jumps to an out-of-line stub that
-writes a message to standard error and leaves with a non-zero status:
+| | |
+|---|---|
+| `x / 0`, `x % 0` | `idiv` faults |
+| `i64::MIN / -1`, `i64::MIN % -1` | the quotient does not fit, so `idiv` faults again — even for `%`, whose answer is 0 on paper |
+| `a + b`, `a - b`, `a * b` past the range | the result does not fit |
+
+The first two the CPU refuses outright; left alone that is a silent
+`0xC0000094` with nothing printed. The third it performs happily, wrapping
+around to a number of the wrong sign — which is worse, because nothing marks it.
+
+The rule is checked in whichever of two places can see it:
+
+**At compile time, when the operands are known.** `sema` evaluates constant
+arithmetic through the same `BinOp::apply` the folder uses, so the two can never
+disagree, and rejects what has no answer:
 
 ```
-$ ./divide_by_zero.exe
-runtime error: division by zero
+error: this multiplication overflows an `int`
+ --> big.tc:2:9
+  |
+2 |   print(2 * 2 * 4611686018427387904);
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `18446744073709551616` does not fit in an `int`
+  = note: `int` values must fit in -9223372036854775808..=9223372036854775807
+```
+
+It reaches through nesting — the left operand above is itself an expression —
+but never looks a variable up, because a variable's value is not that stage's
+business.
+
+**At runtime otherwise.** `add`, `sub` and `imul` each get a `jo`, and each
+division the guards a literal operand cannot already answer: `n / 7` carries no
+division check at all, `n / (0 - 1)` checks only for overflow. A check that
+fires jumps to an out-of-line routine that writes to standard error and exits
+non-zero:
+
+```
+$ ./overflow.exe
+runtime error: arithmetic overflows an int
 $ echo $?
 1
 ```
 
-The stub is reached by `jmp`, not `call`, so it runs on the frame of whoever
-jumped to it — which is why a function containing a guarded division is never
-treated as a leaf.
+The cost is one never-taken conditional branch per operation, which a modern
+predictor makes free, and one instruction of code.
+
+That routine is reached by `jmp`, not `call`, so `rsp` on arrival is whatever
+the failing function happened to be using. Rather than oblige every function
+that can fail to keep a frame a call could be made from — nearly all of them,
+now that any addition can fail — the routine builds one out of thin air:
+
+```nasm
+tc$rt$abort:
+    and  rsp, -16      ; force the alignment a call needs
+    sub  rsp, 32       ; shadow space
+    mov  rcx, 2
+    call _write
+```
+
+It can afford to destroy `rsp` because it never returns. So a leaf full of
+guarded arithmetic is still a leaf, and reserves nothing.
+
+### Why not wrap
+
+Wrapping is what C, Go and Java do, and `int` really is a 64-bit machine word,
+so it would have been defensible. It is not what TinyC does, because it is the
+one place the language would quietly hand back something other than what the
+program asked for — and TinyC refuses that everywhere else: no implicit
+conversion, no truth test on an integer, no variable without an initialiser. C's
+syntax does not oblige anyone to C's semantics.
+
+There is deliberately no escape hatch. If wrapping is ever wanted on purpose it
+should be spelled out at the operator, not switched on for a whole program.
 
 ## Symbol names
 

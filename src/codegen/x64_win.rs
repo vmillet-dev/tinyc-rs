@@ -96,15 +96,18 @@ const SYMBOL_PREFIX: &str = "tc$";
 /// function called `rt` becomes `tc$rt`, not `tc$rt$anything`.
 const RUNTIME_PREFIX: &str = "tc$rt$";
 
-/// Where a division that cannot be performed lands.
+/// Where arithmetic that cannot be performed lands.
 const ABORT_DIV_ZERO: &str = "tc$rt$div_by_zero";
 const ABORT_DIV_OVERFLOW: &str = "tc$rt$div_overflow";
+const ABORT_OVERFLOW: &str = "tc$rt$overflow";
 const ABORT_REPORT: &str = "tc$rt$abort";
 const MSG_DIV_ZERO: &str = "tc$rt$msg_div_zero";
 const MSG_DIV_OVERFLOW: &str = "tc$rt$msg_div_overflow";
+const MSG_OVERFLOW: &str = "tc$rt$msg_overflow";
 
 const DIV_ZERO_TEXT: &str = "runtime error: division by zero\n";
 const DIV_OVERFLOW_TEXT: &str = "runtime error: division overflows an int\n";
+const OVERFLOW_TEXT: &str = "runtime error: arithmetic overflows an int\n";
 
 /// The file descriptor `_write` should report a runtime failure on.
 const STDERR: u32 = 2;
@@ -192,10 +195,20 @@ impl DivGuards {
     }
 }
 
-/// Whether an instruction may jump to a runtime abort, and so needs a frame it
-/// can make a call from.
+/// Whether an instruction may jump to a runtime abort, and so whether the
+/// program needs the abort routine emitted at all.
+///
+/// Guarded arithmetic is nearly everything now: only a division both of whose
+/// faults a literal operand rules out escapes, and the operators that cannot
+/// fail at all.
 fn may_abort(instr: &Instr) -> bool {
-    matches!(instr, Instr::Bin { op, lhs, rhs, .. } if op.divides() && DivGuards::of(lhs, rhs).any())
+    match instr {
+        Instr::Bin { op, lhs, rhs, .. } if op.divides() => DivGuards::of(lhs, rhs).any(),
+        // `add`, `sub` and `imul` are all guarded; a folded result never
+        // reaches an instruction in the first place.
+        Instr::Bin { .. } => true,
+        _ => false,
+    }
 }
 
 pub struct X64Windows {
@@ -364,6 +377,7 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
         // No NUL: `_write` is given a length, not a C string.
         asm.asm(&format!("{MSG_DIV_ZERO}: db {}", bytes_of(DIV_ZERO_TEXT)));
         asm.asm(&format!("{MSG_DIV_OVERFLOW}: db {}", bytes_of(DIV_OVERFLOW_TEXT)));
+        asm.asm(&format!("{MSG_OVERFLOW}: db {}", bytes_of(OVERFLOW_TEXT)));
     }
     for (index, bytes) in program.strings.iter().enumerate() {
         // Emitting raw bytes avoids every string-quoting corner case.
@@ -382,11 +396,13 @@ fn bytes_of(text: &str) -> String {
     text.bytes().map(|b| b.to_string()).collect::<Vec<_>>().join(", ")
 }
 
-/// The out-of-line ends every failing division jumps to.
+/// The out-of-line ends every failing operation jumps to.
 ///
-/// They are reached by `jmp`, not `call`, so the frame in place is the one the
-/// dividing function set up — which is why a function that can abort is never
-/// treated as a leaf.
+/// They are reached by `jmp`, not `call`, so `rsp` on arrival is whatever the
+/// failing function happened to be using. Rather than oblige every one of those
+/// functions to keep a frame a call could be made from — which, now that any
+/// addition can fail, would be nearly all of them — the report builds its own
+/// out of thin air. It can: it never returns, so `rsp` is not worth preserving.
 fn abort_stubs(asm: &mut Asm) {
     asm.blank();
     asm.comment("runtime failures: report on stderr, then leave with a non-zero status");
@@ -399,8 +415,19 @@ fn abort_stubs(asm: &mut Asm) {
     asm.line(&format!("{ABORT_DIV_OVERFLOW}:"));
     asm.asm(&format!("lea  {RDX}, [{MSG_DIV_OVERFLOW}]"));
     asm.asm(&format!("mov  r8d, {}", DIV_OVERFLOW_TEXT.len()));
+    asm.asm(&format!("jmp  {ABORT_REPORT}"));
+
+    asm.line(&format!("{ABORT_OVERFLOW}:"));
+    asm.asm(&format!("lea  {RDX}, [{MSG_OVERFLOW}]"));
+    asm.asm(&format!("mov  r8d, {}", OVERFLOW_TEXT.len()));
 
     asm.line(&format!("{ABORT_REPORT}:"));
+    asm.comment("a frame of its own, so nothing that jumps here owes one");
+    // `and` forces the alignment a `call` needs whatever the jumper's `rsp`
+    // was, and `sub` buys the shadow space. Both destroy `rsp`, which costs
+    // nothing at all: this routine never returns.
+    asm.asm("and  rsp, -16");
+    asm.asm(&format!("sub  rsp, {SHADOW_SPACE}"));
     asm.comment("_write(2, message, length), then exit(1)");
     asm.asm(&format!("mov  {RCX}, {STDERR}"));
     asm.asm("call _write");
@@ -429,13 +456,15 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         registers: &'a RegisterFile,
         asm: &'o mut Asm,
     ) -> FnEmitter<'a, 'o> {
-        // A leaf makes no call — not to another function, and not to the
-        // runtime's abort — so it owes neither shadow space nor alignment.
+        // A leaf makes no call, so it owes neither shadow space nor alignment.
+        // Jumping to a runtime abort does not count: that routine builds its
+        // own frame, precisely so a function full of guarded arithmetic does
+        // not have to carry one for a path it almost never takes.
         let leaf = !function
             .blocks
             .iter()
             .flat_map(|block| &block.instrs)
-            .any(|instr| instr.is_call() || may_abort(instr));
+            .any(|instr| instr.is_call());
 
         let frame = FrameLayout::new(allocation, leaf);
         FnEmitter { program, function, allocation, registers, frame, asm, next_label: 0 }
@@ -706,6 +735,11 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                     BinOp::Mul => self.asm.asm(&format!("imul {work}, {rhs}")),
                     BinOp::Div | BinOp::Rem => unreachable!("handled above"),
                 }
+                // `add`, `sub` and `imul` all set the overflow flag on a result
+                // that does not fit, and set it on nothing else. One
+                // never-taken branch is what keeps a wrong answer from being
+                // handed on as if it were right.
+                self.asm.asm(&format!("jo   {ABORT_OVERFLOW}"));
                 self.store_back(*dst, &work);
             }
             // No source of these moves can be an argument register, because the
@@ -771,14 +805,11 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
     /// `%` inherits the guards below unchanged. It needs them: `i64::MIN % -1`
     /// is 0 mathematically, but the machine still reaches it through the `idiv`
     /// whose *quotient* does not fit.
+    /// A divisor this stage can see to be zero never arrives: `sema` evaluates
+    /// constant arithmetic and rejects the program first, so what is guarded
+    /// here is only ever a divisor the running program alone knows.
     fn division(&mut self, dst: VReg, result: &str, lhs: &Value, rhs: &Value) {
         let guards = DivGuards::of(lhs, rhs);
-
-        // A literal zero divisor can do nothing but fault.
-        if matches!(rhs, Value::Const(0)) {
-            self.asm.asm(&format!("jmp  {ABORT_DIV_ZERO}"));
-            return;
-        }
 
         let dividend = self.value(lhs);
         self.asm.mov(RAX, &dividend);
@@ -1343,25 +1374,46 @@ mod tests {
     }
 
     #[test]
-    fn a_division_by_a_literal_zero_can_only_fail() {
-        // Lowering refuses to fold it, so the backend has to say what happens.
-        let asm = compile("int n = 1;\nprint(n / (3 - 3));");
-        assert!(asm.contains("jmp  tc$rt$div_by_zero"), "{asm}");
-        assert!(!asm.contains("idiv"), "there is nothing to divide: {asm}");
+    fn a_divisor_only_the_running_program_knows_is_guarded() {
+        // A divisor this stage could see to be zero never reaches it — `sema`
+        // evaluates constant arithmetic and rejects the program. What is left
+        // is a value that has to be tested where it lands.
+        let asm = compile_src(
+            "fn zero() -> int {\n  return 0;\n}\nfn main() {\n  int n = 1;\n  print(n / zero());\n}",
+        );
+        assert!(asm.contains("idiv"), "{asm}");
+        assert!(asm.contains(&format!("jz   {ABORT_DIV_ZERO}")), "{asm}");
     }
 
     #[test]
-    fn a_function_that_can_abort_still_gets_a_frame_to_call_from() {
-        // The abort stub is jumped to, not called, so it runs on the frame of
-        // whoever jumped — which therefore has to have one.
+    fn a_function_that_can_abort_is_still_a_leaf() {
+        // The abort routine is jumped to, not called, and builds its own frame
+        // on arrival. So a function whose only way out to the runtime is a
+        // failed check owes nothing — which matters now that every addition has
+        // one.
         let asm = compile_src(
-            "fn d(int a, int b) -> int {\n  return a / b;\n}\nfn main() {\n  print(d(6, 3));\n}",
+            "fn d(int a, int b) -> int {\n  return a / b + 1;\n}\nfn main() {\n  print(d(6, 3));\n}",
         );
         let (name, body) = functions_in(&asm)
             .into_iter()
             .find(|(name, _)| *name == "tc$d")
             .expect("the dividing function");
-        assert!(body.contains("sub  rsp,"), "{name}: {body}");
+        assert!(body.contains("jo   "), "{name} should be guarded: {body}");
+        assert!(body.contains(ABORT_DIV_ZERO), "{name} should be guarded: {body}");
+        assert!(!body.contains("sub  rsp,"), "{name} should still be a leaf: {body}");
+    }
+
+    #[test]
+    fn the_abort_routine_builds_the_frame_its_calls_need() {
+        // It arrives by `jmp` with somebody else's `rsp`, so it aligns and
+        // reserves shadow space itself. Destroying `rsp` is free: it exits.
+        let asm = compile("int n = 1;\nprint(n + 1);");
+        let (_, body) = functions_in(&asm)
+            .into_iter()
+            .find(|(name, _)| *name == ABORT_REPORT)
+            .expect("the abort routine");
+        assert!(body.contains("and  rsp, -16"), "{body}");
+        assert!(body.contains(&format!("sub  rsp, {SHADOW_SPACE}")), "{body}");
     }
 
     // -- frames ------------------------------------------------------------

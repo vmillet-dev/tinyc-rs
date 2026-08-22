@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ast::{Block, Expr, ExprKind, FnDecl, NodeId, Program, Stmt, Ty};
+use crate::ast::{BinOp, Block, Expr, ExprKind, FnDecl, NodeId, Program, Stmt, Ty};
 use crate::diag::{Diagnostic, Result, Span};
 
 /// The name of the entry point.
@@ -183,6 +183,27 @@ fn check_entry_point(
             .with_label(format!("expected no return type, found {}", ty.name()))
             .with_note("the process exit code is always 0", None),
         );
+    }
+}
+
+/// The value of an expression the compiler can work out for itself, or `None`
+/// when it depends on something only the running program knows.
+///
+/// Deliberately shallow: no variable is ever looked up, because a variable's
+/// value is not this stage's business. What it does cover is arithmetic on
+/// literals, at any depth — which is exactly the arithmetic that can be
+/// *rejected* rather than merely guarded, and the reason `2 * 2 * BIG` is a
+/// compile error rather than a crash.
+///
+/// It answers `None` for an operation that has no answer too, so a mistake
+/// inside a larger expression is reported once, at the operator that made it,
+/// instead of again at every operator above.
+fn const_int(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Int(v) => Some(*v),
+        ExprKind::Neg(operand) => const_int(operand)?.checked_neg(),
+        ExprKind::Bin { op, lhs, rhs } => op.apply(const_int(lhs)?, const_int(rhs)?),
+        _ => None,
     }
 }
 
@@ -449,6 +470,54 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         }
     }
 
+    /// Reject arithmetic the machine could not perform, when the operands are
+    /// known here and now.
+    ///
+    /// This is the compile-time half of a pair. What it catches, it catches
+    /// before the program is ever built; what it cannot see — an operand that
+    /// is a variable, a parameter or a call — becomes a guard in the emitted
+    /// code instead, and reports at the same moment with the same wording. The
+    /// language has one rule, checked in whichever of the two places can.
+    fn check_arithmetic(&mut self, expr: &Expr, op: BinOp, lhs: &Expr, rhs: &Expr) {
+        // A zero divisor is knowable from the right operand on its own —
+        // whatever is being divided, there is no answer — and it is a different
+        // mistake from a result that came out too large, so it is said
+        // differently and pointed at the divisor rather than the whole
+        // operation.
+        if op.divides() && const_int(rhs) == Some(0) {
+            self.error(
+                Diagnostic::new("division by zero", rhs.span)
+                    .with_label("this divisor is always zero"),
+            );
+            return;
+        }
+
+        // Anything else needs both operands. An operand that is itself a
+        // mistake was reported where it was made, and answers `None` here, so
+        // nothing is said twice.
+        let (Some(a), Some(b)) = (const_int(lhs), const_int(rhs)) else { return };
+        if op.apply(a, b).is_some() {
+            return;
+        }
+
+        let label = match op.apply_exact(a, b) {
+            Some(exact) if i64::try_from(exact).is_err() => {
+                format!("`{exact}` does not fit in an `int`")
+            }
+            // `MIN % -1` is 0 on paper, and lands here anyway: the machine
+            // reaches that 0 through the division whose quotient does not fit.
+            _ => "the machine cannot perform this operation".to_string(),
+        };
+        self.error(
+            Diagnostic::new(format!("this {} overflows an `int`", op.noun()), expr.span)
+                .with_label(label)
+                .with_note(
+                    format!("`int` values must fit in {}..={}", i64::MIN, i64::MAX),
+                    None,
+                ),
+        );
+    }
+
     /// A loop's body, checked with one more loop open around it.
     fn loop_body(&mut self, body: &Block) {
         self.loop_depth += 1;
@@ -649,14 +718,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     }
                 }
 
-                // `%` divides too, and traps on a zero divisor exactly as `/`
-                // does — it is the same instruction underneath.
-                if op.divides() && matches!(rhs.kind, ExprKind::Int(0)) {
-                    self.error(
-                        Diagnostic::new("division by zero", rhs.span)
-                            .with_label("this divisor is always zero"),
-                    );
-                }
+                self.check_arithmetic(expr, *op, lhs, rhs);
                 Ty::Int
             }
             ExprKind::Cmp { op, lhs, rhs } => {
@@ -1067,6 +1129,70 @@ mod tests {
     #[test]
     fn rejects_division_by_zero() {
         assert!(errors_in_main("print(1 / 0);")[0].message.contains("division by zero"));
+        // The divisor alone settles it, however unknown the dividend is.
+        assert!(errors_in_main("int n = 1;\nprint(n / 0);")[0].message.contains("division by zero"));
+        assert!(errors_in_main("int n = 1;\nprint(n % 0);")[0].message.contains("division by zero"));
+    }
+
+    // -- arithmetic that has no answer -------------------------------------
+
+    #[test]
+    fn rejects_arithmetic_that_overflows_an_int() {
+        for (body, noun) in [
+            ("print(9223372036854775807 + 1);", "addition"),
+            ("print(0 - 9223372036854775807 - 1 - 1);", "subtraction"),
+            ("print(9223372036854775807 * 2);", "multiplication"),
+        ] {
+            let errors = errors_in_main(body);
+            assert!(
+                errors[0].message.contains(&format!("this {noun} overflows")),
+                "{body}: {}",
+                errors[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn an_overflow_diagnostic_names_the_value_that_did_not_fit() {
+        let errors = errors_in_main("print(9223372036854775807 + 1);");
+        assert!(
+            errors[0].label.as_deref().unwrap().contains("9223372036854775808"),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn an_overflow_is_caught_however_deeply_the_constants_are_nested() {
+        // A check that only looked at the two literals either side of one
+        // operator would miss this: the left operand is itself an expression.
+        let errors = errors_in_main("print(2 * 2 * 4611686018427387904);");
+        assert!(errors[0].message.contains("overflows"), "{}", errors[0].message);
+        // The same reach makes a hidden zero divisor visible too.
+        assert!(errors_in_main("print(1 / (3 - 3));")[0].message.contains("division by zero"));
+    }
+
+    #[test]
+    fn one_overflow_is_reported_once_however_much_is_built_on_it() {
+        // The operators above an impossible one cannot evaluate it either, so
+        // they say nothing rather than repeating the complaint.
+        let errors = errors_in_main("print(9223372036854775807 + 1 + 1 + 1);");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+    }
+
+    #[test]
+    fn arithmetic_that_fits_is_left_alone() {
+        // Including right up to the edge, which a check written with the wrong
+        // comparison would reject.
+        assert!(check_main("print(9223372036854775806 + 1);").is_ok());
+        assert!(check_main("print(0 - 9223372036854775807 - 1);").is_ok());
+        assert!(check_main("print(4611686018427387903 * 2);").is_ok());
+    }
+
+    #[test]
+    fn an_overflow_that_depends_on_a_variable_is_left_to_the_runtime() {
+        // `sema` never looks a variable up, so this compiles — and the emitted
+        // code carries the guard that catches it instead.
+        assert!(check_main("int n = 9223372036854775807;\nprint(n + 1);").is_ok());
     }
 
     #[test]

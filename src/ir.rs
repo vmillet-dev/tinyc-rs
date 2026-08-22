@@ -1106,23 +1106,17 @@ impl Lowering<'_> {
 
 /// Evaluate `lhs op rhs` now, when both are already known.
 ///
-/// Answers `None` whenever the machine would not agree with the answer: a
-/// division the CPU would trap on stays an instruction, so the program still
-/// fails where it was written to instead of in the compiler.
+/// Answers `None` whenever the machine would not agree with the answer: an
+/// operation the CPU would trap on stays an instruction, so the program still
+/// fails where it was written instead of in the compiler.
+///
+/// [`crate::sema`] has usually rejected such a program already — it evaluates
+/// the same constants through the same [`BinOp::apply`]. What reaches here is
+/// what sema could not see, such as an operand that only became a constant
+/// during lowering.
 fn fold_bin(op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
     let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else { return None };
-    match op {
-        // Wrapping, because that is what the hardware does with these operands.
-        BinOp::Add => Some(a.wrapping_add(b)),
-        BinOp::Sub => Some(a.wrapping_sub(b)),
-        BinOp::Mul => Some(a.wrapping_mul(b)),
-        // `checked_div` answers `None` for both `x / 0` and `MIN / -1`, which
-        // are exactly the two divisions `idiv` refuses. `checked_rem` refuses
-        // the same pair, and has to: `MIN % -1` is 0 mathematically, but the
-        // machine still computes it with the `idiv` whose *quotient* overflows.
-        BinOp::Div => a.checked_div(b),
-        BinOp::Rem => a.checked_rem(b),
-    }
+    op.apply(a, b)
 }
 
 /// What a short-circuiting operator answers when its left operand alone decides.
@@ -1307,17 +1301,21 @@ mod tests {
     }
 
     #[test]
-    fn a_remainder_the_machine_would_refuse_is_never_folded() {
-        // `checked_rem` refuses the same pair `checked_div` does, and has to:
-        // `MIN % -1` is 0 mathematically, but the machine reaches it through an
-        // `idiv` whose quotient does not fit.
-        for source in ["print(1 % (3 - 3));", "print((0 - 9223372036854775807 - 1) % (0 - 1));"] {
+    fn an_operation_on_something_unknown_stays_an_instruction() {
+        // The other half: what the folder cannot answer becomes a guarded
+        // instruction, and the program fails where it was written.
+        for (source, op) in [
+            ("int z = 0;\nprint(1 / z);", BinOp::Div),
+            ("int z = 0;\nprint(1 % z);", BinOp::Rem),
+            ("int n = 1;\nprint(n + 9223372036854775807);", BinOp::Add),
+        ] {
             let ir = lower_main(source);
             assert!(
-                ir.functions[0].blocks[0]
-                    .instrs
+                ir.functions[0]
+                    .blocks
                     .iter()
-                    .any(|i| matches!(i, Instr::Bin { op: BinOp::Rem, .. })),
+                    .flat_map(|b| &b.instrs)
+                    .any(|i| matches!(i, Instr::Bin { op: found, .. } if *found == op)),
                 "{source}: {}",
                 ir.dump()
             );
@@ -1521,18 +1519,48 @@ mod tests {
     }
 
     #[test]
-    fn a_division_the_machine_would_refuse_is_never_folded() {
-        // `checked_div` answers `None` for both, so the instruction survives and
-        // the program fails where it was written rather than in the compiler.
-        for source in ["print(1 / (3 - 3));", "print((0 - 9223372036854775807 - 1) / (0 - 1));"] {
-            let ir = lower_main(source);
-            assert!(
-                ir.functions[0].blocks[0]
-                    .instrs
-                    .iter()
-                    .any(|i| matches!(i, Instr::Bin { op: BinOp::Div, .. })),
-                "{source}: {}",
-                ir.dump()
+    fn the_folder_refuses_every_answer_the_machine_would_refuse() {
+        // Today `sema` rejects all of these before lowering is ever reached, so
+        // this is a unit test rather than a program: it keeps the folder from
+        // becoming the stage that invents an answer, should the two ever come
+        // to see a different set of constants.
+        for (op, a, b) in [
+            (BinOp::Add, i64::MAX, 1),
+            (BinOp::Sub, i64::MIN, 1),
+            (BinOp::Mul, i64::MAX, 2),
+            (BinOp::Div, 1, 0),
+            (BinOp::Rem, 1, 0),
+            (BinOp::Div, i64::MIN, -1),
+            // 0 on paper, and still refused: the machine gets there through the
+            // division whose quotient does not fit.
+            (BinOp::Rem, i64::MIN, -1),
+        ] {
+            assert_eq!(
+                fold_bin(op, Value::Const(a), Value::Const(b)),
+                None,
+                "{} {a}, {b}",
+                op.symbol()
+            );
+        }
+    }
+
+    #[test]
+    fn an_operation_the_machine_accepts_is_still_folded() {
+        for (op, a, b, expected) in [
+            (BinOp::Add, 2, 3, 5),
+            (BinOp::Sub, 2, 3, -1),
+            (BinOp::Mul, 6, 7, 42),
+            (BinOp::Div, 17, 5, 3),
+            (BinOp::Rem, 17, 5, 2),
+            // The largest each operator can produce, one step short of refusing.
+            (BinOp::Add, i64::MAX - 1, 1, i64::MAX),
+            (BinOp::Sub, i64::MIN + 1, 1, i64::MIN),
+        ] {
+            assert_eq!(
+                fold_bin(op, Value::Const(a), Value::Const(b)),
+                Some(expected),
+                "{} {a}, {b}",
+                op.symbol()
             );
         }
     }

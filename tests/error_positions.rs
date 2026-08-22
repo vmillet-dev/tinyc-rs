@@ -69,6 +69,13 @@ fn division_by_zero_points_at_the_divisor() {
 }
 
 #[test]
+fn an_overflow_points_at_the_whole_operation_not_one_operand() {
+    // Neither operand is wrong on its own — it is putting them together that
+    // has no answer, so the caret covers both.
+    assert_error_at("overflow.tc", "4:9");
+}
+
+#[test]
 fn an_int_initializer_for_a_bool_points_at_the_initializer() {
     assert_error_at("bool_type_mismatch.tc", "2:16");
 }

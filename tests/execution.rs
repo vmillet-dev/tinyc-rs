@@ -134,6 +134,37 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
              fn main() {\n  int m = 0 - 9223372036854775807 - 1;\n  print(m % neg());\n}",
             "overflows",
         ),
+        // Overflow the compiler cannot see, because the value comes back from a
+        // call. Each of the three guarded operators, plus unary minus, which is
+        // a subtraction and inherits the guard.
+        (
+            "fn big() -> int {\n  return 9223372036854775807;\n}\n\
+             fn main() {\n  print(big() + 1);\n}",
+            "arithmetic overflows",
+        ),
+        (
+            "fn small() -> int {\n  return 0 - 9223372036854775807 - 1;\n}\n\
+             fn main() {\n  print(small() - 1);\n}",
+            "arithmetic overflows",
+        ),
+        (
+            "fn big() -> int {\n  return 9223372036854775807;\n}\n\
+             fn main() {\n  print(big() * 2);\n}",
+            "arithmetic overflows",
+        ),
+        (
+            "fn small() -> int {\n  return 0 - 9223372036854775807 - 1;\n}\n\
+             fn main() {\n  print(-small());\n}",
+            "arithmetic overflows",
+        ),
+        // The case the abort routine's own frame exists for: `bump` makes no
+        // call, so it is a leaf and reserves nothing. Whatever `rsp` it hands
+        // over, the report has to be able to call `_write` from it.
+        (
+            "fn bump(int n) -> int {\n  return n + 9223372036854775807;\n}\n\
+             fn main() {\n  print(bump(2));\n}",
+            "arithmetic overflows",
+        ),
     ];
 
     for (index, (program, expected)) in cases.iter().enumerate() {
