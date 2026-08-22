@@ -13,6 +13,7 @@
 //!
 //! 0. **Enums**, because a signature may mention one and a declaration may.
 //!    Nothing in an enum refers to anything else, so one sweep settles them.
+//!    Array types join the same table later, as the program writes them.
 //! 1. **Signatures**, before any body. That is what lets a function call
 //!    another declared further down the file, and what lets a function call
 //!    *itself* — by the time `fib`'s body is checked, `fib` is in the table.
@@ -21,9 +22,8 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    ArmBody, BinOp, Block, EnumId, EnumInfo, Expr, ExprKind, FnDecl, MatchArm, NodeId, Program,
-    Stmt, Ty,
-    TypeRef,
+    ArmBody, ArrayId, ArrayInfo, BinOp, Block, EnumId, EnumInfo, Expr, ExprKind, FnDecl, MatchArm,
+    NodeId, Place, Program, Stmt, Ty, TypeRef, TypeTable,
 };
 use crate::diag::{Diagnostic, Result, Span};
 
@@ -40,7 +40,9 @@ pub struct Types {
     expr_ty: Vec<Ty>,
     /// Resolved return type per function, in declaration order.
     fn_ret: Vec<Option<Ty>>,
-    enums: Vec<EnumInfo>,
+    /// Resolved parameter types per function, likewise.
+    fn_params: Vec<Vec<Ty>>,
+    table: TypeTable,
 }
 
 impl Types {
@@ -53,27 +55,50 @@ impl Types {
         self.fn_ret[function]
     }
 
-    pub fn enums(&self) -> &[EnumInfo] {
-        &self.enums
+    /// The parameter types of a function, by its position in the program.
+    pub fn params_of(&self, function: usize) -> &[Ty] {
+        &self.fn_params[function]
+    }
+
+    /// Every type the program has, which is what naming one takes.
+    pub fn table(&self) -> &TypeTable {
+        &self.table
     }
 }
 
-/// The declared enums, and everything asked about them after pass 0.
-struct Enums {
-    /// Shared onward with [`crate::ir`]: names, and variant names in order.
-    infos: Vec<EnumInfo>,
-    /// Where each was declared, for "declared here" notes.
-    spans: Vec<Span>,
-    by_name: HashMap<String, EnumId>,
+/// Every type the program has, and everything asked about one.
+///
+/// Enums arrive whole from pass 0. Array types instead appear as they are
+/// *written*, and are interned so that two `int[3]`s written apart get the same
+/// [`ArrayId`] — without which `Ty`'s equality, an integer comparison, would say
+/// two identical types differ.
+struct Declared {
+    /// Shared onward with [`crate::ir`].
+    table: TypeTable,
+    /// Where each enum was declared, for "declared here" notes.
+    enum_spans: Vec<Span>,
+    enums_by_name: HashMap<String, EnumId>,
+    arrays_by_shape: HashMap<(Ty, u32), ArrayId>,
 }
 
-impl Enums {
-    fn id(&self, name: &str) -> Option<EnumId> {
-        self.by_name.get(name).copied()
+impl Declared {
+    fn enum_id(&self, name: &str) -> Option<EnumId> {
+        self.enums_by_name.get(name).copied()
     }
 
     fn info(&self, id: EnumId) -> &EnumInfo {
-        &self.infos[id.0 as usize]
+        self.table.enum_info(id)
+    }
+
+    /// The type of an array of `len` `elem`s, made if this is the first time
+    /// the program has asked for one.
+    fn array_of(&mut self, elem: Ty, len: u32) -> Ty {
+        let id = *self.arrays_by_shape.entry((elem, len)).or_insert_with(|| {
+            let id = ArrayId(self.table.arrays.len() as u32);
+            self.table.arrays.push(ArrayInfo { elem, len });
+            id
+        });
+        Ty::Array(id)
     }
 }
 
@@ -82,8 +107,13 @@ impl Enums {
 /// Enums come before signatures because a signature may mention one, and before
 /// bodies because a declaration may. Nothing in an enum can refer to anything
 /// else, so one pass over them is enough.
-fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Enums {
-    let mut enums = Enums { infos: Vec::new(), spans: Vec::new(), by_name: HashMap::new() };
+fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
+    let mut enums = Declared {
+        table: TypeTable::default(),
+        enum_spans: Vec::new(),
+        enums_by_name: HashMap::new(),
+        arrays_by_shape: HashMap::new(),
+    };
 
     for declaration in &program.enums {
         if declaration.variants.is_empty() {
@@ -114,8 +144,8 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Enums {
             variants.push(variant.name.clone());
         }
 
-        if let Some(&previous) = enums.by_name.get(&declaration.name) {
-            let previous = enums.spans[previous.0 as usize];
+        if let Some(&previous) = enums.enums_by_name.get(&declaration.name) {
+            let previous = enums.enum_spans[previous.0 as usize];
             errors.push(
                 Diagnostic::new(
                     format!("`{}` is already declared", declaration.name),
@@ -127,9 +157,10 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Enums {
             continue;
         }
 
-        enums.by_name.insert(declaration.name.clone(), EnumId(enums.infos.len() as u32));
-        enums.infos.push(EnumInfo { name: declaration.name.clone(), variants });
-        enums.spans.push(declaration.name_span);
+        let id = EnumId(enums.table.enums.len() as u32);
+        enums.enums_by_name.insert(declaration.name.clone(), id);
+        enums.table.enums.push(EnumInfo { name: declaration.name.clone(), variants });
+        enums.enum_spans.push(declaration.name_span);
     }
 
     enums
@@ -139,12 +170,12 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Enums {
 ///
 /// `None` means the name does not name a type at all — reported here, so a
 /// caller can fall back on the recovery type without saying anything further.
-fn resolve_type(enums: &Enums, ty: &TypeRef, errors: &mut Vec<Diagnostic>) -> Option<Ty> {
-    match ty.name.as_str() {
+fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnostic>) -> Option<Ty> {
+    let element = match ty.name.as_str() {
         "int" => Some(Ty::Int),
         "string" => Some(Ty::Str),
         "bool" => Some(Ty::Bool),
-        name => enums.id(name).map(Ty::Enum).or_else(|| {
+        name => declared.enum_id(name).map(Ty::Enum).or_else(|| {
             errors.push(
                 Diagnostic::new(format!("unknown type `{name}`"), ty.span)
                     .with_label("no built-in type and no enum goes by this name")
@@ -152,8 +183,33 @@ fn resolve_type(enums: &Enums, ty: &TypeRef, errors: &mut Vec<Diagnostic>) -> Op
             );
             None
         }),
+    }?;
+
+    let Some((len, len_span)) = ty.array_len else { return Some(element) };
+
+    // A length is part of the type, so it has to be a length a type could have.
+    // `MAX_ARRAY_LEN` is a limit on the *generated code*: an array literal is
+    // unrolled into one store per element.
+    if len <= 0 || len > MAX_ARRAY_LEN {
+        errors.push(
+            Diagnostic::new(format!("`{len}` is not a valid array length"), len_span)
+                .with_label(if len <= 0 {
+                    "an array needs at least one element".to_string()
+                } else {
+                    format!("at most {MAX_ARRAY_LEN} are supported")
+                }),
+        );
+        return None;
     }
+    Some(declared.array_of(element, len as u32))
 }
+
+/// How many elements an array may hold.
+///
+/// Not a limit of the representation but of the *code*: an array is built by
+/// storing every element, so a huge one would emit a huge function. A repeat
+/// form like `[0; 1000]` lowered to a loop is what would lift it.
+pub const MAX_ARRAY_LEN: i64 = 1024;
 
 /// `` `A` is `` / `` `A` and `B` are ``, so the label agrees with its subject.
 fn missing_verb(missing: &[&str]) -> String {
@@ -190,29 +246,36 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
     let mut errors = Vec::new();
 
     // Pass 0: the declared types, before anything can mention one.
-    let enums = collect_enums(program, &mut errors);
+    let mut declared = collect_enums(program, &mut errors);
 
     // Pass 1: every signature, before any body.
-    let signatures = collect_signatures(program, &enums, max_params, &mut errors);
-    check_entry_point(program, &signatures, &enums, &mut errors);
+    let signatures = collect_signatures(program, &mut declared, max_params, &mut errors);
+    check_entry_point(program, &signatures, &declared, &mut errors);
 
     // Pass 2: the bodies, each with the whole table visible.
     let fn_ret = program.functions.iter().map(|f| signatures[&f.name].ret).collect();
+    let fn_params =
+        program.functions.iter().map(|f| signatures[&f.name].params.clone()).collect();
     let mut checker = Checker {
         // `Int` is the recovery type: an expression that failed to check is
         // treated as an int so a single mistake does not cascade.
         types: Types {
             expr_ty: vec![Ty::Int; program.node_count],
             fn_ret,
-            enums: enums.infos.clone(),
+            fn_params,
+            table: TypeTable::default(),
         },
         signatures: &signatures,
-        enums: &enums,
+        declared,
         errors,
     };
     for function in &program.functions {
         FnChecker::new(&mut checker, function).run(function);
     }
+
+    // The table is finished only now: a body may have written an array type
+    // nothing before it mentioned.
+    checker.types.table = checker.declared.table;
 
     if checker.errors.is_empty() {
         return Ok(checker.types);
@@ -230,7 +293,7 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
 /// Pass 1: one entry per function name, with the first declaration winning.
 fn collect_signatures(
     program: &Program,
-    enums: &Enums,
+    declared: &mut Declared,
     max_params: usize,
     errors: &mut Vec<Diagnostic>,
 ) -> HashMap<String, Signature> {
@@ -275,20 +338,36 @@ fn collect_signatures(
 
         // A type that does not resolve was reported by `resolve_type`; `Int`
         // stands in so the rest of the signature still checks.
+        let params = function
+            .params
+            .iter()
+            .map(|p| resolve_type(declared, &p.ty, errors).unwrap_or(Ty::Int))
+            .collect();
+        let ret = function.ret.as_ref().map(|ty| {
+            let resolved = resolve_type(declared, ty, errors).unwrap_or(Ty::Int);
+            // An array lives in the frame of the function that declared it, so
+            // returning one would hand back an address to room that is about to
+            // be reused. Refusing outright is what makes passing one *safe*:
+            // an array reference can be borrowed but never kept.
+            if !resolved.fits_in_a_register() {
+                errors.push(
+                    Diagnostic::new(
+                        format!("`{}` cannot return an array", function.name),
+                        ty.span,
+                    )
+                    .with_label("an array lives in the frame of the function that made it")
+                    .with_note(
+                        "pass one in to be filled instead; that address cannot outlive its array",
+                        None,
+                    ),
+                );
+            }
+            resolved
+        });
+
         signatures.insert(
             function.name.clone(),
-            Signature {
-                params: function
-                    .params
-                    .iter()
-                    .map(|p| resolve_type(enums, &p.ty, errors).unwrap_or(Ty::Int))
-                    .collect(),
-                ret: function
-                    .ret
-                    .as_ref()
-                    .map(|ty| resolve_type(enums, ty, errors).unwrap_or(Ty::Int)),
-                name_span: function.name_span,
-            },
+            Signature { params, ret, name_span: function.name_span },
         );
     }
 
@@ -300,7 +379,7 @@ fn collect_signatures(
 fn check_entry_point(
     program: &Program,
     signatures: &HashMap<String, Signature>,
-    enums: &Enums,
+    declared: &Declared,
     errors: &mut Vec<Diagnostic>,
 ) {
     let Some(main) = signatures.get(ENTRY_POINT) else {
@@ -338,7 +417,7 @@ fn check_entry_point(
                 format!("`{ENTRY_POINT}` must not return a value"),
                 decl.ret_span,
             )
-            .with_label(format!("expected no return type, found {}", ty.name(&enums.infos)))
+            .with_label(format!("expected no return type, found {}", ty.name(&declared.table)))
             .with_note("the process exit code is always 0", None),
         );
     }
@@ -433,7 +512,7 @@ struct Checker<'a> {
     /// Every signature in the program, immutable once pass 1 is done.
     signatures: &'a HashMap<String, Signature>,
     /// Every declared enum, immutable once pass 0 is done.
-    enums: &'a Enums,
+    declared: Declared,
     errors: Vec<Diagnostic>,
 }
 
@@ -483,18 +562,18 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     /// Resolve a written type, falling back on the recovery type when it names
     /// nothing. The mistake is reported by [`resolve_type`] itself.
     fn resolve(&mut self, ty: &TypeRef) -> Ty {
-        resolve_type(self.shared.enums, ty, &mut self.shared.errors).unwrap_or(Ty::Int)
+        resolve_type(&mut self.shared.declared, ty, &mut self.shared.errors).unwrap_or(Ty::Int)
     }
 
     /// A type's name. [`Ty`] cannot answer this alone — an enum's name is the
     /// program's, not the compiler's — so every diagnostic asks here.
     fn ty_name(&self, ty: Ty) -> String {
-        ty.name(&self.shared.enums.infos).to_string()
+        ty.name(&self.shared.declared.table).to_string()
     }
 
     /// The same with its indefinite article, for prose.
     fn ty_article(&self, ty: Ty) -> String {
-        ty.with_article(&self.shared.enums.infos)
+        ty.with_article(&self.shared.declared.table)
     }
 
     /// The signature of a function anywhere in the program.
@@ -621,49 +700,21 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 }
                 self.declare(name, declared, *name_span, "a variable");
             }
-            Stmt::Assign { name, name_span, value } => {
-                // The target is looked up *before* the value is checked, so
-                // that `y = y + 1` reports the assignment rather than the use
-                // inside it — the assignment is the better place to point.
-                let target = self.lookup(name);
-                if target.is_none() {
-                    let (name, span) = (name.clone(), *name_span);
-                    self.report_undeclared(&name, || {
-                        Diagnostic::new(format!("undeclared variable `{name}`"), span)
-                            .with_label("assign to it after declaring it")
-                            .with_note(
-                                format!("a declaration gives it a type, as in `int {name} = 0;`"),
-                                None,
-                            )
-                    });
-                }
-
-                let actual = self.expr(value);
-                // A variable keeps the type it was declared with. An undeclared
-                // one has no type to disagree with, and was reported above.
-                if let Some((declared, declared_span)) = target
-                    && actual != declared
-                {
+            Stmt::Assign { target, value } => self.assign(target, value),
+            Stmt::Print { value, .. } => {
+                let ty = self.expr(value);
+                // An array has no rendering, and printing its address would
+                // answer a question nobody asked.
+                if !ty.fits_in_a_register() {
                     self.error(
                         Diagnostic::new(
-                            format!(
-                                "cannot assign {} value to {} variable",
-                                self.ty_article(actual),
-                                self.ty_article(declared)
-                            ),
+                            format!("cannot print {}", self.ty_article(ty)),
                             value.span,
                         )
-                        .with_label(format!(
-                            "expected {}, found {}",
-                            self.ty_name(declared),
-                            self.ty_name(actual)
-                        ))
-                        .with_note(format!("`{name}` was declared here"), Some(declared_span)),
+                        .with_label("`print` takes one value, and an array is many")
+                        .with_note("print the elements in a loop instead", None),
                     );
                 }
-            }
-            Stmt::Print { value, .. } => {
-                self.expr(value);
             }
             Stmt::If { cond, then_block, else_block } => {
                 self.condition(cond, "if");
@@ -760,7 +811,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     /// Both halves can be wrong independently, and are reported separately: the
     /// enum name underlines one, the variant the other.
     fn variant(&mut self, name: &str, span: Span, variant: &str, variant_span: Span) -> Ty {
-        let Some(id) = self.shared.enums.id(name) else {
+        let Some(id) = self.shared.declared.enum_id(name) else {
             self.error(
                 Diagnostic::new(format!("unknown enum `{name}`"), span)
                     .with_label("no enum goes by this name")
@@ -769,8 +820,8 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             return Ty::Int;
         };
 
-        if self.shared.enums.info(id).tag(variant).is_none() {
-            let info = self.shared.enums.info(id);
+        if self.shared.declared.info(id).tag(variant).is_none() {
+            let info = self.shared.declared.info(id);
             let known: Vec<&str> = info.variants.iter().map(String::as_str).collect();
             let note = format!("`{name}` has {}", list(&known));
             self.error(
@@ -821,7 +872,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
 
         // Where the first arm for each variant was, in declaration order, which
         // is the order both diagnostics below want to talk about them in.
-        let variants = self.shared.enums.info(id).variants.clone();
+        let variants = self.shared.declared.info(id).variants.clone();
         let mut covered: Vec<Option<Span>> = vec![None; variants.len()];
 
         // An arm whose pattern named nothing leaves a hole that is not the
@@ -856,6 +907,189 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         }
 
         self.match_value(span, arms, as_statement)
+    }
+
+    /// Check `x = value` and `xs[i] = value`.
+    ///
+    /// The two differ only in what type the target has: a variable's own, or
+    /// the element type of the array it names. Everything else — that the name
+    /// exists, that the value agrees — is the same question asked once.
+    fn assign(&mut self, target: &Place, value: &Expr) {
+        // The target is looked up *before* the value is checked, so that
+        // `y = y + 1` reports the assignment rather than the use inside it.
+        let (name, name_span) = (target.name().to_string(), target.name_span());
+        let declared = self.lookup(&name);
+        if declared.is_none() {
+            let reported = name.clone();
+            self.report_undeclared(&name, || {
+                Diagnostic::new(format!("undeclared variable `{reported}`"), name_span)
+                    .with_label("assign to it after declaring it")
+                    .with_note(
+                        format!("a declaration gives it a type, as in `int {reported} = 0;`"),
+                        None,
+                    )
+            });
+        }
+
+        // What the assignment must produce: the whole variable's type, or one
+        // element of it.
+        let expected = match target {
+            Place::Var { .. } => declared,
+            Place::Element { index, .. } => {
+                let element = declared.and_then(|(ty, span)| {
+                    self.element_type(ty, span, &name, name_span).map(|elem| (elem, span))
+                });
+                self.index(declared.map(|(ty, _)| ty), index);
+                element
+            }
+        };
+
+        let actual = self.expr(value);
+        // A variable keeps the type it was declared with. An undeclared one has
+        // no type to disagree with, and was reported above.
+        if let Some((expected, declared_span)) = expected
+            && actual != expected
+        {
+            self.error(
+                Diagnostic::new(
+                    format!(
+                        "cannot assign {} value to {}",
+                        self.ty_article(actual),
+                        match target {
+                            Place::Var { .. } => format!("{} variable", self.ty_article(expected)),
+                            Place::Element { .. } => format!("{} element", self.ty_article(expected)),
+                        }
+                    ),
+                    value.span,
+                )
+                .with_label(format!(
+                    "expected {}, found {}",
+                    self.ty_name(expected),
+                    self.ty_name(actual)
+                ))
+                .with_note(format!("`{name}` was declared here"), Some(declared_span)),
+            );
+        }
+    }
+
+    /// Check `[1, 2, 3]` and answer the array type it has.
+    ///
+    /// Its length is its element count — there is nothing to infer and nothing
+    /// to declare. What a declaration does is *agree* with it, and the mismatch
+    /// is caught where the two meet.
+    fn array_literal(&mut self, elements: &[Expr], span: Span) -> Ty {
+        if elements.is_empty() {
+            self.error(
+                Diagnostic::new("this array has no elements", span)
+                    .with_label("an array needs at least one")
+                    .with_note("its element type is read off them, so there is nothing to go on", None),
+            );
+            return Ty::Int;
+        }
+
+        // The first element sets the type, and is where a disagreement points
+        // back to — the same rule a `match`'s arms follow.
+        let first = self.expr(&elements[0]);
+        for element in &elements[1..] {
+            let ty = self.expr(element);
+            if ty != first {
+                self.error(
+                    Diagnostic::new(
+                        format!(
+                            "this element is {}, but the first is {}",
+                            self.ty_article(ty),
+                            self.ty_article(first)
+                        ),
+                        element.span,
+                    )
+                    .with_label(format!(
+                        "expected {}, found {}",
+                        self.ty_name(first),
+                        self.ty_name(ty)
+                    ))
+                    .with_note("every element of an array has to agree", Some(elements[0].span)),
+                );
+            }
+        }
+
+        if !first.fits_in_a_register() {
+            // Pointed at the whole literal rather than at one element: what
+            // follows is a declaration complaining that the type it got is not
+            // the type it wanted, and the two sort together with the real
+            // mistake first.
+            self.error(
+                Diagnostic::new(
+                    format!("cannot make an array of {}", self.ty_article(first)),
+                    span,
+                )
+                .with_label("an array's elements are single values")
+                .with_note("arrays do not nest yet", None),
+            );
+            return Ty::Int;
+        }
+
+        if elements.len() as i64 > MAX_ARRAY_LEN {
+            self.error(
+                Diagnostic::new("this array has too many elements", span)
+                    .with_label(format!("at most {MAX_ARRAY_LEN} are supported")),
+            );
+            return Ty::Int;
+        }
+        self.shared.declared.array_of(first, elements.len() as u32)
+    }
+
+    /// The element type of what a name holds, or `None` when it is not an array
+    /// — reported here, because indexing something that is not one is the
+    /// mistake worth naming.
+    fn element_type(&mut self, ty: Ty, declared_span: Span, name: &str, at: Span) -> Option<Ty> {
+        match ty {
+            Ty::Array(id) => Some(self.shared.declared.table.array(id).elem),
+            other => {
+                self.error(
+                    Diagnostic::new(
+                        format!("cannot index {}", self.ty_article(other)),
+                        at,
+                    )
+                    .with_label("only an array has elements")
+                    .with_note(format!("`{name}` was declared here"), Some(declared_span)),
+                );
+                None
+            }
+        }
+    }
+
+    /// Check an index expression: it must be an `int`, and when it is a
+    /// constant it must be one the array has.
+    ///
+    /// This is where the safety is bought. A literal index is settled now and
+    /// costs nothing at run time; anything else becomes a check in the emitted
+    /// code. Neither can reach past the end.
+    fn index(&mut self, array: Option<Ty>, index: &Expr) {
+        let ty = self.expr(index);
+        if ty != Ty::Int {
+            self.error(
+                Diagnostic::new(
+                    format!("cannot index with {}", self.ty_article(ty)),
+                    index.span,
+                )
+                .with_label(format!("expected int, found {}", self.ty_name(ty))),
+            );
+            return;
+        }
+
+        let Some(Ty::Array(id)) = array else { return };
+        let len = self.shared.declared.table.array(id).len;
+        let Some(at) = const_int(index) else { return };
+        if at < 0 || at >= i64::from(len) {
+            self.error(
+                Diagnostic::new(format!("index `{at}` is out of bounds"), index.span)
+                    .with_label(format!(
+                        "this array holds {len}, so the last index is {}",
+                        len - 1
+                    ))
+                    .with_note("an index the compiler can see is checked here rather than guarded at run time", None),
+            );
+        }
     }
 
     /// Check an arm's body, whichever of the two shapes it has.
@@ -986,7 +1220,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     /// The tag an arm's pattern selects, or `None` when the pattern does not
     /// name a variant of this enum — reported here.
     fn arm_tag(&mut self, id: EnumId, arm: &MatchArm, variants: &[String]) -> Option<i64> {
-        let expected = self.shared.enums.info(id).name.clone();
+        let expected = self.shared.declared.info(id).name.clone();
         if arm.enum_name != expected {
             self.error(
                 Diagnostic::new(
@@ -998,7 +1232,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             return None;
         }
 
-        let tag = self.shared.enums.info(id).tag(&arm.variant);
+        let tag = self.shared.declared.info(id).tag(&arm.variant);
         if tag.is_none() {
             let known: Vec<&str> = variants.iter().map(String::as_str).collect();
             self.error(
@@ -1291,6 +1525,45 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             }
             ExprKind::Variant { enum_name, enum_span, variant, variant_span } => {
                 self.variant(enum_name, *enum_span, variant, *variant_span)
+            }
+            ExprKind::Array { elements, span } => self.array_literal(elements, *span),
+            ExprKind::Index { array, name_span, index } => {
+                let declared = self.lookup(array);
+                if declared.is_none() {
+                    let (name, at) = (array.clone(), *name_span);
+                    self.report_undeclared(&name, || {
+                        Diagnostic::new(format!("undeclared variable `{name}`"), at)
+                            .with_label("not declared anywhere above this point")
+                    });
+                }
+                let element = declared.and_then(|(ty, span)| {
+                    self.element_type(ty, span, array, *name_span)
+                });
+                self.index(declared.map(|(ty, _)| ty), index);
+                element.unwrap_or(Ty::Int)
+            }
+            ExprKind::Len { array, name_span } => {
+                // The answer is a fact about the *type*, so the only thing to
+                // check is that the name has one with a length.
+                match self.lookup(array) {
+                    Some((Ty::Array(_), _)) => {}
+                    Some((other, declared_span)) => self.error(
+                        Diagnostic::new(
+                            format!("`len` needs an array, but `{array}` is {}", self.ty_article(other)),
+                            *name_span,
+                        )
+                        .with_label("only an array has a length")
+                        .with_note(format!("`{array}` was declared here"), Some(declared_span)),
+                    ),
+                    None => {
+                        let (name, at) = (array.clone(), *name_span);
+                        self.report_undeclared(&name, || {
+                            Diagnostic::new(format!("undeclared variable `{name}`"), at)
+                                .with_label("not declared anywhere above this point")
+                        });
+                    }
+                }
+                Ty::Int
             }
             // A call in expression position must produce a value; `Int` is the
             // recovery type when it does not.
@@ -1704,6 +1977,134 @@ mod tests {
     #[test]
     fn collects_several_errors() {
         assert_eq!(errors_in_main("print(a);\nprint(b);").len(), 2);
+    }
+
+    // -- arrays ------------------------------------------------------------
+
+    #[test]
+    fn accepts_an_array_declared_read_written_and_passed() {
+        assert!(
+            check_src(
+                "fn total(int[3] xs) -> int {\n  int sum = 0;\n  \
+                 for (int i = 0; i < len(xs); i = i + 1) {\n    sum = sum + xs[i];\n  }\n  \
+                 return sum;\n}\n\
+                 fn main() {\n  int[3] xs = [1, 2, 3];\n  xs[0] = 9;\n  print(total(xs));\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_length_is_part_of_the_type() {
+        // So two arrays of different lengths are different types, and a
+        // declaration and its literal have to agree.
+        assert!(errors_in_main("int[2] xs = [1, 2, 3];")[0].message.contains("cannot initialize"));
+        let errors = check_src(
+            "fn f(int[3] xs) {\n}\nfn main() {\n  int[4] xs = [1, 2, 3, 4];\n  f(xs);\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("cannot pass"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn every_element_of_a_literal_has_to_agree() {
+        let errors = errors_in_main("int[3] xs = [1, true, 3];");
+        assert!(errors[0].message.contains("but the first is"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().unwrap().1.is_some(), "and points at the first");
+    }
+
+    #[test]
+    fn arrays_of_every_element_type_work() {
+        assert!(check_main("string[2] ws = [\"a\", \"b\"];\nprint(ws[0]);").is_ok());
+        assert!(check_main("bool[2] bs = [true, false];\nprint(bs[1]);").is_ok());
+        assert!(
+            check_src("enum A { X, Y }\nfn main() {\n  A[2] as = [A::X, A::Y];\n  print(as[0]);\n}")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn arrays_do_not_nest_yet() {
+        let errors = errors_in_main("int[2] a = [1, 2];\nint[1] b = [a];");
+        assert!(errors[0].message.contains("cannot make an array of"), "{}", errors[0].message);
+    }
+
+    // -- what arrays are not allowed to do ---------------------------------
+
+    #[test]
+    fn rejects_returning_an_array() {
+        // The whole reason passing one is safe: an address that cannot be kept
+        // cannot outlive what it points at.
+        let errors =
+            check_src("fn make() -> int[2] {\n  int[2] xs = [1, 2];\n  return xs;\n}\nfn main() {\n}")
+                .unwrap_err();
+        assert!(errors[0].message.contains("cannot return an array"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_printing_an_array() {
+        let errors = errors_in_main("int[2] xs = [1, 2];\nprint(xs);");
+        assert!(errors[0].message.contains("cannot print"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn arrays_answer_no_comparison_and_no_arithmetic() {
+        assert!(errors_in_main("int[2] a = [1, 2];\nprint(a == a);")[0]
+            .message
+            .contains("cannot be compared"));
+        assert!(errors_in_main("int[2] a = [1, 2];\nprint(a + 1);")[0]
+            .message
+            .contains("cannot apply `+`"));
+    }
+
+    #[test]
+    fn rejects_indexing_something_that_is_not_an_array() {
+        for body in ["int n = 1;\nprint(n[0]);", "int n = 1;\nn[0] = 1;"] {
+            let errors = errors_in_main(body);
+            assert!(errors[0].message.contains("cannot index"), "{body}: {}", errors[0].message);
+        }
+        assert!(errors_in_main("int n = 1;\nprint(len(n));")[0].message.contains("`len` needs an array"));
+    }
+
+    #[test]
+    fn an_index_must_be_an_int() {
+        let errors = errors_in_main("int[2] xs = [1, 2];\nprint(xs[true]);");
+        assert!(errors[0].message.contains("cannot index with"), "{}", errors[0].message);
+    }
+
+    // -- bounds ------------------------------------------------------------
+
+    #[test]
+    fn an_index_the_compiler_can_see_is_checked_at_compile_time() {
+        for body in [
+            "int[3] xs = [1, 2, 3];\nprint(xs[3]);",
+            "int[3] xs = [1, 2, 3];\nprint(xs[-1]);",
+            "int[3] xs = [1, 2, 3];\nxs[9] = 1;",
+            // Reaches through arithmetic, as the overflow check does.
+            "int[3] xs = [1, 2, 3];\nprint(xs[1 + 2]);",
+        ] {
+            let errors = errors_in_main(body);
+            assert!(errors[0].message.contains("out of bounds"), "{body}: {}", errors[0].message);
+        }
+    }
+
+    #[test]
+    fn every_index_the_array_really_has_is_accepted() {
+        assert!(check_main("int[3] xs = [1, 2, 3];\nprint(xs[0]);\nprint(xs[2]);").is_ok());
+    }
+
+    #[test]
+    fn an_index_that_depends_on_a_variable_is_left_to_the_runtime() {
+        // `sema` never looks a variable up, so this compiles — and the emitted
+        // code carries the check that catches it.
+        assert!(check_main("int[3] xs = [1, 2, 3];\nint i = 9;\nprint(xs[i]);").is_ok());
+    }
+
+    #[test]
+    fn rejects_a_length_no_array_could_have() {
+        assert!(errors_in_main("int[0] xs = [1];")[0].message.contains("not a valid array length"));
+        let errors = errors_in_main("int[99999] xs = [1];");
+        assert!(errors[0].message.contains("not a valid array length"), "{}", errors[0].message);
     }
 
     // -- enums -------------------------------------------------------------

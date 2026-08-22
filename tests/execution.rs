@@ -27,7 +27,7 @@ use tinyc::codegen::Target;
 
 /// Programs that must keep printing exactly what `examples/expected/<name>.txt`
 /// says, and the source of truth for what a working TinyC program looks like.
-const EXAMPLES: [&str; 8] = [
+const EXAMPLES: [&str; 9] = [
     "hello.tc",
     "arith.tc",
     "spill.tc",
@@ -36,6 +36,7 @@ const EXAMPLES: [&str; 8] = [
     "control_flow.tc",
     "functions.tc",
     "enums.tc",
+    "arrays.tc",
 ];
 
 #[test]
@@ -255,6 +256,94 @@ fn short_circuits_and_loop_jumps_do_what_they_promise() {
         let run = tools.build_and_run(&source, &format!("logic{index}"));
         assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
+}
+
+/// Arrays really read and write the memory they claim to.
+///
+/// The only feature whose values live outside registers, so this is the one
+/// place a wrong offset or a clobbered base register shows up — as a wrong
+/// number rather than as anything the assembly looks guilty about.
+#[test]
+fn arrays_address_the_elements_they_promise() {
+    let Some(tools) = Tools::find() else { return };
+
+    let prelude = "fn fill(int[4] xs) {\n  for (int i = 0; i < len(xs); i = i + 1) {\n    \
+                   xs[i] = i * 10;\n  }\n}\n";
+    let cases: [(&str, &str); 9] = [
+        // Every element in turn, so an off-by-one in the offset is caught.
+        ("int[4] xs = [7, 8, 9, 10];\nprint(xs[0]);", "7"),
+        ("int[4] xs = [7, 8, 9, 10];\nprint(xs[3]);", "10"),
+        // The same through an index the compiler cannot fold.
+        ("int[4] xs = [7, 8, 9, 10];\nint i = 3;\nprint(xs[i]);", "10"),
+        // Writing, then reading back through a different index expression.
+        ("int[4] xs = [0, 0, 0, 0];\nxs[2] = 42;\nint i = 2;\nprint(xs[i]);", "42"),
+        // A callee writing through the caller's array.
+        (
+            "int[4] xs = [0, 0, 0, 0];\nfill(xs);\nprint(xs[3]);",
+            "30",
+        ),
+        // Two arrays at once, so their frame regions must not overlap.
+        (
+            "int[2] a = [1, 2];\nint[2] b = [3, 4];\na[0] = 99;\nprint(b[0] + a[0]);",
+            "102",
+        ),
+        // An array live across a call: the base register has to survive it.
+        (
+            "int[2] a = [5, 6];\nfill([0, 0, 0, 0]);\nprint(a[1]);",
+            "6",
+        ),
+        // Enough other values to force spills, with the array still readable.
+        (
+            "int[2] xs = [1, 2];\nint a = 1; int b = 2; int c = 3; int d = 4; int e = 5;\n\
+             int f = 6; int g = 7; int h = 8; int i = 9; int j = 10;\n\
+             print(xs[1] + a + b + c + d + e + f + g + h + i + j);",
+            "57",
+        ),
+        // Strings and bools live in arrays too.
+        ("string[2] w = [\"no\", \"yes\"];\nprint(w[1]);", "yes"),
+    ];
+
+    for (index, (body, expected)) in cases.iter().enumerate() {
+        let source = tools.scratch.join(format!("array{index}.tc"));
+        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
+
+        let run = tools.build_and_run(&source, &format!("array{index}"));
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
+}
+
+/// An index the compiler could not check must be checked where it lands.
+#[test]
+fn an_index_out_of_bounds_reports_and_exits() {
+    let Some(tools) = Tools::find() else { return };
+
+    let cases = [
+        // Past the end, and negative — one unsigned comparison catches both.
+        "fn at() -> int {\n  return 3;\n}\n\
+         fn main() {\n  int[3] xs = [1, 2, 3];\n  print(xs[at()]);\n}",
+        "fn at() -> int {\n  return 0 - 1;\n}\n\
+         fn main() {\n  int[3] xs = [1, 2, 3];\n  print(xs[at()]);\n}",
+        // Writing is guarded exactly as reading is.
+        "fn at() -> int {\n  return 9;\n}\n\
+         fn main() {\n  int[3] xs = [1, 2, 3];\n  xs[at()] = 1;\n}",
+        // And through a parameter, where the length comes from the type.
+        "fn set(int[2] xs, int i) {\n  xs[i] = 1;\n}\n\
+         fn main() {\n  int[2] xs = [1, 2];\n  set(xs, 5);\n}",
+    ];
+
+    for (index, program) in cases.iter().enumerate() {
+        let source = tools.scratch.join(format!("bounds{index}.tc"));
+        std::fs::write(&source, program).unwrap();
+
+        let run = tools.build_and_run(&source, &format!("bounds{index}"));
+        assert!(!run.status.success(), "case {index} was expected to fail: {}", run.stdout);
+        assert!(
+            run.stderr.contains("out of bounds"),
+            "case {index} should have said so, said: {}",
+            run.stderr
+        );
     }
 }
 

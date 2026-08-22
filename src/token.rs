@@ -27,6 +27,7 @@ pub enum TokenKind {
     KwContinue,
     KwEnum,
     KwMatch,
+    KwLen,
 
     // Punctuation.
     LParen,
@@ -47,6 +48,8 @@ pub enum TokenKind {
     FatArrow,
     /// `::`, which qualifies a variant with the enum it belongs to.
     ColonColon,
+    LBracket,
+    RBracket,
 
     // Comparison.
     EqEq,
@@ -100,6 +103,7 @@ impl TokenKind {
             TokenKind::KwContinue => "continue",
             TokenKind::KwEnum => "enum",
             TokenKind::KwMatch => "match",
+            TokenKind::KwLen => "len",
 
             // Punctuation.
             TokenKind::LParen => "(",
@@ -118,6 +122,8 @@ impl TokenKind {
             TokenKind::Bang => "!",
             TokenKind::FatArrow => "=>",
             TokenKind::ColonColon => "::",
+            TokenKind::LBracket => "[",
+            TokenKind::RBracket => "]",
 
             // Comparison.
             TokenKind::EqEq => "==",

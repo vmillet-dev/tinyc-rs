@@ -113,11 +113,12 @@ enum    := "enum" IDENT "{" IDENT ("," IDENT)* "}"
 fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 params  := param ("," param)*
 param   := type IDENT
-type    := "int" | "string" | "bool" | IDENT
+type    := ("int" | "string" | "bool" | IDENT) ("[" INT "]")?
 stmt    := decl | assign | print | if | while | for | match | return
          | break | continue | call ";"
 decl    := type IDENT "=" expr ";"
-assign  := IDENT "=" expr ";"
+assign  := place "=" expr ";"
+place   := IDENT ("[" expr "]")?
 print   := "print" "(" expr ")" ";"
 if      := "if" "(" expr ")" block ("else" (block | if))?
 while   := "while" "(" expr ")" block
@@ -132,19 +133,22 @@ cmp     := sum (("==" | "!=" | "<" | "<=" | ">" | ">=") sum)*
 sum     := term (("+" | "-") term)*
 term    := unary (("*" | "/" | "%") unary)*
 unary   := ("-" | "!") unary | primary
-primary := INT | STRING | BOOL | IDENT | variant | call | match
-         | "(" expr ")"
+primary := INT | STRING | BOOL | IDENT | variant | call | match | array
+         | index | len | "(" expr ")"
 variant := IDENT "::" IDENT
+array   := "[" (expr ("," expr)*)? "]"
+index   := IDENT "[" expr "]"
+len     := "len" "(" IDENT ")"
 call    := IDENT "(" (expr ("," expr)*)? ")"
 match   := "match" "(" expr ")" "{" arm* "}"
 arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
 ```
 
 `int` is a 64-bit signed integer, `string` is a pointer to static bytes, `bool`
-is `true` or `false`, and an `enum` declares a type of its own with a fixed set
-of values. Arithmetic is `int`-only, `&&`, `||` and `!` are `bool`-only, `//`
-starts a comment, and a variable keeps the type it was declared with — assigning
-a `string` to an `int` is an error. There are deliberately no arrays yet.
+is `true` or `false`, an `enum` declares a type of its own with a fixed set of
+values, and `int[3]` is a fixed-length array of them. Arithmetic is `int`-only,
+`&&`, `||` and `!` are `bool`-only, `//` starts a comment, and a variable keeps
+the type it was declared with — assigning a `string` to an `int` is an error.
 
 There is no implicit truth test either, so `!n` on an `int` is a type error
 rather than a comparison against zero. `%` takes its sign from the dividend, as
@@ -219,6 +223,94 @@ entry0:
   2  %t2 = add %a, %b
   3  return %t2
 ```
+
+### Arrays
+
+The **length is part of the type**, so `int[3]` and `int[4]` are different types
+and every length is known at compile time
+([`examples/arrays.tc`](examples/arrays.tc)):
+
+```c
+fn total(int[5] xs) -> int {
+  int sum = 0;
+  for (int i = 0; i < len(xs); i = i + 1) {
+    sum = sum + xs[i];
+  }
+  return sum;
+}
+```
+
+That is what pays for the safety. An index the compiler can work out is settled
+before the program is built, and costs nothing at run time:
+
+```
+error: index `3` is out of bounds
+3 |   print(xs[3]);
+  |            ^ this array holds 3, so the last index is 2
+  = note: an index the compiler can see is checked here rather than guarded at run time
+```
+
+Only an index it cannot see becomes a check in the emitted code — and a single
+one, because the comparison is *unsigned*: a negative index read as unsigned is
+enormous, so it fails the same test that catches one past the end.
+
+```nasm
+cmp  rdi, 3
+jae  tc$rt$bounds
+lea  r12, [rbx+rdi*8]
+```
+
+`len(xs)` is a fact about the type, so it folds to a literal: the loop above
+compares against `5`, and nothing computes it.
+
+**Arrays may be passed to a function but never returned from one.** That pair of
+rules is what makes passing one by address *safe* rather than a way to make a
+dangling pointer. An array lives in the frame of the function that declared it,
+so returning one would hand back room about to be reused — and since there is no
+pointer type, no globals, and no nesting, an address a callee receives has
+nowhere to be kept. It cannot outlive what it points at.
+
+```
+error: `make` cannot return an array
+1 | fn make() -> int[3] {
+  |              ^^^^^^ an array lives in the frame of the function that made it
+  = note: pass one in to be filled instead; that address cannot outlive its array
+```
+
+The rest of the rules fall out of the same reasoning: an array literal's length
+is its element count and the declaration must agree with it; every element must
+have the same type; arrays answer no comparison and no arithmetic; and `print`
+takes one value, so it refuses an array.
+
+### What arrays changed underneath
+
+**The IR learned about memory.** Until now every value lived in a virtual
+register or in a spill slot the backend owned, and nothing in `ir.rs` named a
+*place*. Arrays add four instructions that do:
+
+```
+  0  %xs = frame 0          ; the address of room this function owns
+  1  %t1 = elem %xs[0] of 3 ; base + index * 8, with the length for the check
+  2  store %t1, 10
+  8  %t5 = load %t4
+```
+
+Two of them cost nothing they look like they should. `elem` is a `lea`, because
+`base + index * 8` is an x86 addressing mode rather than arithmetic — which is
+also why it picks up none of the overflow guards `Bin` carries. And `frame` is a
+`lea` off `rsp`: the room is reserved once in the prologue, above the spill
+slots, so nothing between an array and `rsp` moves for the life of the call.
+
+**A type can no longer name itself.** `Ty` stays `Copy` and compares as an
+integer, so `Ty::Array` holds an *index* exactly as `Ty::Enum` does. Array types
+are interned as the program writes them, so that two `int[3]`s written apart get
+the same id — without which `Ty`'s equality would say two identical types
+differ.
+
+**A declaration may now begin with a length.** `Colour[3] cs = ...` and
+`cs[3] = 1` agree for three tokens and part at the fourth, so `starts_declaration`
+looks that far: a type's length is a literal, and what follows the `]` is a name
+in a declaration and an `=` in an assignment.
 
 ### Enums and exhaustive matching
 
@@ -639,6 +731,11 @@ Three things can go wrong, and all three are caught:
 The first two the CPU refuses outright; left alone that is a silent
 `0xC0000094` with nothing printed. The third it performs happily, wrapping
 around to a number of the wrong sign — which is worse, because nothing marks it.
+
+An array index is the fourth thing, and follows the same pattern for the same
+reason: reaching past the end is something the machine would do without
+complaint, so the compiler settles what it can and guards the rest. It is
+described under [Arrays](#arrays).
 
 The rule is checked in whichever of two places can see it:
 

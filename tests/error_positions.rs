@@ -12,7 +12,7 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 7] = [
+const EXAMPLES: [&str; 8] = [
     "arith.tc",
     "spill.tc",
     "reassign.tc",
@@ -20,6 +20,7 @@ const EXAMPLES: [&str; 7] = [
     "control_flow.tc",
     "functions.tc",
     "enums.tc",
+    "arrays.tc",
 ];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
@@ -192,6 +193,24 @@ fn an_arm_with_no_value_points_at_its_pattern() {
     // The block itself is not wrong — it is wrong *for this match*, so the
     // caret goes on the arm rather than inside it.
     assert_error_at("match_arm_without_value.tc", "6:13");
+}
+
+// -- arrays ---------------------------------------------------------------
+
+#[test]
+fn an_index_the_compiler_can_see_points_at_the_index() {
+    assert_error_at("index_out_of_bounds.tc", "3:12");
+}
+
+#[test]
+fn returning_an_array_points_at_the_return_type() {
+    // Not at the `return`: the signature is what promises the impossible.
+    assert_error_at("array_returned.tc", "1:14");
+}
+
+#[test]
+fn a_length_that_disagrees_points_at_the_literal() {
+    assert_error_at("array_length_mismatch.tc", "2:15");
 }
 
 // -- functions ------------------------------------------------------------

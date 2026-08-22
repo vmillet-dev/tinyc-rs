@@ -1,0 +1,65 @@
+// Arrays: the first values that do not fit in a register.
+//
+// A length is part of the type, so `int[3]` and `int[4]` are different types
+// and the compiler knows how long every array is. That is what pays for the
+// safety below: an index it can see is checked before the program is built,
+// and only one it cannot see costs anything at run time.
+
+fn total(int[5] xs) -> int {
+  int sum = 0;
+  // `len` is a fact about the type, so this compares against a literal.
+  for (int i = 0; i < len(xs); i = i + 1) {
+    sum = sum + xs[i];
+  }
+  return sum;
+}
+
+// An array is passed by address, so the callee sees the caller's own. There is
+// no way to keep that address — arrays cannot be returned, stored in anything,
+// or nested — so it cannot outlive what it points at.
+fn double_each(int[5] xs) {
+  for (int i = 0; i < len(xs); i = i + 1) {
+    xs[i] = xs[i] * 2;
+  }
+}
+
+fn largest(int[5] xs) -> int {
+  int best = xs[0];
+  for (int i = 1; i < len(xs); i = i + 1) {
+    if (xs[i] > best) {
+      best = xs[i];
+    }
+  }
+  return best;
+}
+
+fn main() {
+  int[5] xs = [3, 1, 4, 1, 5];
+  print(xs[0]);          // 3
+  print(len(xs));        // 5
+  print(total(xs));      // 14
+
+  // Writing through an index, with a constant the compiler settles outright.
+  xs[1] = 100;
+  print(xs[1]);          // 100
+  print(total(xs));      // 113
+
+  // The callee wrote through the caller's array.
+  double_each(xs);
+  print(xs[0]);          // 6
+  print(largest(xs));    // 200
+
+  // Arrays of the other types, too.
+  string[3] words = ["alpha", "beta", "gamma"];
+  print(words[2]);       // gamma
+  bool[2] flags = [true, false];
+  print(flags[1]);       // false
+
+  // An index the compiler cannot work out is guarded where it lands. This one
+  // stays in range, so the guard never fires.
+  int at = 0;
+  while (at < len(xs)) {
+    print(xs[at]);       // 6, 200, 8, 2, 10
+    at = at + 1;
+  }
+}

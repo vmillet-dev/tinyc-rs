@@ -8,11 +8,12 @@
 //! fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 //! params  := param ("," param)*
 //! param   := type IDENT
-//! type    := "int" | "string" | "bool" | IDENT
+//! type    := ("int" | "string" | "bool" | IDENT) ("[" INT "]")?
 //! stmt    := decl | assign | print | if | while | for | match | return
 //!          | break | continue
 //! decl    := type IDENT "=" expr ";"
-//! assign  := IDENT "=" expr ";"
+//! assign  := place "=" expr ";"
+//! place   := IDENT ("[" expr "]")?
 //! print   := "print" "(" expr ")" ";"
 //! if      := "if" "(" expr ")" block ("else" (block | if))?
 //! while   := "while" "(" expr ")" block
@@ -27,9 +28,12 @@
 //! sum     := term (("+" | "-") term)*
 //! term    := unary (("*" | "/" | "%") unary)*
 //! unary   := ("-" | "!") unary | primary
-//! primary := INT | STRING | BOOL | IDENT | variant | call | match
-//!          | "(" expr ")"
+//! primary := INT | STRING | BOOL | IDENT | variant | call | match | array
+//!          | index | len | "(" expr ")"
 //! variant := IDENT "::" IDENT
+//! array   := "[" (expr ("," expr)*)? "]"
+//! index   := IDENT "[" expr "]"
+//! len     := "len" "(" IDENT ")"
 //! call    := IDENT "(" (expr ("," expr)*)? ")"
 //! match   := "match" "(" expr ")" "{" arm* "}"
 //! arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
@@ -40,7 +44,7 @@
 
 use crate::ast::{
     ArmBody, BinOp, Block, CmpOp, EnumDecl, Expr, ExprKind, FnDecl, LogicOp, MatchArm, NodeId,
-    Param, Program, Stmt, TypeRef, Variant,
+    Param, Place, Program, Stmt, TypeRef, Variant,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
@@ -177,18 +181,49 @@ impl<'a> Parser<'a> {
                 .with_note("the types are `int`, `string`, `bool` and any declared enum", None));
             }
         };
-        Ok(TypeRef { name, span: self.bump().span })
+        let span = self.bump().span;
+
+        // `int[3]`. The length is a literal rather than an expression: it is
+        // part of the *type*, and a type is not something the program computes.
+        if !self.eat(&TokenKind::LBracket) {
+            return Ok(TypeRef { name, array_len: None, span });
+        }
+        let token = self.peek();
+        let TokenKind::Int(len) = token.kind else {
+            return Err(Diagnostic::new(
+                format!("expected an array length, found {}", token.kind.describe()),
+                token.span,
+            )
+            .with_label("a length has to be written out here")
+            .with_note("`int[3]` is an array of three ints", None));
+        };
+        let len_span = self.bump().span;
+        let close = self.expect(TokenKind::RBracket)?.span;
+        Ok(TypeRef { name, array_len: Some((len, len_span)), span: span.to(close) })
     }
 
     /// Whether a declaration starts at the current token.
     ///
-    /// A type keyword settles it outright. An identifier does not: `Color c` is
-    /// a declaration, but `c = 1` and `c(1)` are not — so the deciding token is
-    /// the *second* one, and only a name can follow a type.
+    /// A type keyword settles it outright. An identifier does not: `Colour c`
+    /// is a declaration, but `c = 1` and `c(1)` are not — so the second token
+    /// decides, and only a name can follow a type.
+    ///
+    /// Arrays make the identifier case reach further, because `Colour[3] cs`
+    /// and `cs[3] = 1` agree for two more tokens. They part at the fourth: a
+    /// type's length is a literal, and what follows the `]` is a name in a
+    /// declaration and an `=` in an assignment.
     fn starts_declaration(&self) -> bool {
         match self.peek().kind {
             TokenKind::KwInt | TokenKind::KwString | TokenKind::KwBool => true,
-            TokenKind::Ident(_) => matches!(self.peek_at(1).kind, TokenKind::Ident(_)),
+            TokenKind::Ident(_) => match self.peek_at(1).kind {
+                TokenKind::Ident(_) => true,
+                TokenKind::LBracket => {
+                    matches!(self.peek_at(2).kind, TokenKind::Int(_))
+                        && matches!(self.peek_at(3).kind, TokenKind::RBracket)
+                        && matches!(self.peek_at(4).kind, TokenKind::Ident(_))
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -573,9 +608,20 @@ impl<'a> Parser<'a> {
         let (name, name_span) = (name.clone(), token.span);
         self.bump();
 
+        // The two things that may be written to. Anything else assignable would
+        // have to be an expression, and TinyC has no expression that names a
+        // place a value could go.
+        let target = if self.eat(&TokenKind::LBracket) {
+            let index = self.expr()?;
+            self.expect(TokenKind::RBracket)?;
+            Place::Element { array: name, name_span, index }
+        } else {
+            Place::Var { name, name_span }
+        };
+
         self.expect(TokenKind::Eq)?;
         let value = self.expr()?;
-        Ok(Stmt::Assign { name, name_span, value })
+        Ok(Stmt::Assign { target, value })
     }
 
     fn print_stmt(&mut self) -> PResult<Stmt> {
@@ -729,6 +775,21 @@ impl<'a> Parser<'a> {
                         },
                     });
                 }
+                // `xs[i]`. The array is a name, because a name is the only
+                // place an array can be.
+                if self.eat(&TokenKind::LBracket) {
+                    let index = self.expr()?;
+                    let close = self.expect(TokenKind::RBracket)?.span;
+                    return Ok(Expr {
+                        id: self.node_id(),
+                        span: span.to(close),
+                        kind: ExprKind::Index {
+                            array: name,
+                            name_span: span,
+                            index: Box::new(index),
+                        },
+                    });
+                }
                 if !matches!(self.peek().kind, TokenKind::LParen) {
                     let kind = ExprKind::Var(name);
                     return Ok(Expr { id: self.node_id(), span, kind });
@@ -745,6 +806,18 @@ impl<'a> Parser<'a> {
             // A match is an ordinary primary expression: it binds as tightly as
             // a literal, so `match (c) { ... } == x` compares the two.
             TokenKind::KwMatch => return self.match_expr(),
+            TokenKind::LBracket => return self.array_literal(),
+            TokenKind::KwLen => {
+                let keyword = self.bump().span;
+                let open = self.expect(TokenKind::LParen)?.span;
+                let (array, name_span) = self.expect_ident("an array name")?;
+                let close = self.expect_closing_paren(open)?;
+                return Ok(Expr {
+                    id: self.node_id(),
+                    span: keyword.to(close),
+                    kind: ExprKind::Len { array, name_span },
+                });
+            }
             // Parentheses only group: the expression between them keeps its own
             // node id, so [`crate::sema`]'s table gains no unused entry, and
             // only its span widens to cover the brackets a diagnostic should
@@ -766,6 +839,36 @@ impl<'a> Parser<'a> {
         };
         self.bump();
         Ok(Expr { id: self.node_id(), span, kind })
+    }
+
+    /// `[1, 2, 3]` — the only way to make an array.
+    ///
+    /// Empty is allowed by the grammar and rejected by `sema`, which is where
+    /// "an array needs at least one element" belongs alongside the same rule
+    /// for an enum.
+    fn array_literal(&mut self) -> PResult<Expr> {
+        let open = self.expect(TokenKind::LBracket)?.span;
+        let mut elements = Vec::new();
+        if !matches!(self.peek().kind, TokenKind::RBracket) {
+            loop {
+                elements.push(self.expr()?);
+                // A comma promises another element, as everywhere else.
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        if !self.eat(&TokenKind::RBracket) {
+            let found = self.peek();
+            return Err(Diagnostic::new(
+                format!("expected `]`, found {}", found.kind.describe()),
+                found.span,
+            )
+            .with_label("an array literal ends here")
+            .with_note("to close this `[`", Some(open)));
+        }
+        let span = open.to(self.tokens[self.pos - 1].span);
+        Ok(Expr { id: self.node_id(), span, kind: ExprKind::Array { elements, span } })
     }
 
     fn expect_closing_paren(&mut self, open: Span) -> PResult<Span> {
@@ -1081,6 +1184,61 @@ mod tests {
         let errors = errors_in_main("print(1 + 2;");
         assert!(errors[0].message.contains("expected `)`"));
         assert!(errors[0].note.is_some());
+    }
+
+    // -- arrays ------------------------------------------------------------
+
+    #[test]
+    fn parses_an_array_declaration() {
+        assert_eq!(
+            dump_main("int[3] xs = [1, 2, 3];"),
+            "decl int[3] xs\n  array\n    int 1\n    int 2\n    int 3\n"
+        );
+    }
+
+    #[test]
+    fn a_declaration_and_an_indexed_assignment_agree_for_three_tokens() {
+        // `Colour[3] cs` and `cs[3] = 1` part at the fourth: a name after the
+        // `]` in one, an `=` in the other.
+        assert_eq!(
+            dump_main("Colour[3] cs = [1];"),
+            "decl Colour[3] cs\n  array\n    int 1\n"
+        );
+        assert_eq!(dump_main("cs[3] = 1;"), "assign cs[]\n  int 3\n  int 1\n");
+    }
+
+    #[test]
+    fn parses_indexing_and_len() {
+        assert_eq!(dump_main("print(xs[0]);"), "print\n  index xs\n    int 0\n");
+        assert_eq!(dump_main("print(len(xs));"), "print\n  len xs\n");
+    }
+
+    #[test]
+    fn an_index_may_be_any_expression() {
+        assert_eq!(
+            dump_main("print(xs[i + 1]);"),
+            "print\n  index xs\n    +\n      var i\n      int 1\n"
+        );
+    }
+
+    #[test]
+    fn an_array_type_needs_a_written_length() {
+        let errors = errors_in_main("int[n] xs = [1];");
+        assert!(errors[0].message.contains("expected an array length"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn rejects_a_trailing_comma_and_an_unclosed_literal() {
+        assert!(errors_in_main("int[1] xs = [1,];")[0].message.contains("expected an expression"));
+        let errors = errors_in_main("int[2] xs = [1, 2;");
+        assert!(errors[0].message.contains("expected `]`"), "{}", errors[0].message);
+        assert!(errors[0].note.is_some());
+    }
+
+    #[test]
+    fn an_empty_literal_is_left_for_sema_to_judge() {
+        // Its element type is the question, and that is not a syntactic one.
+        assert_eq!(dump_main("int[1] xs = [];"), "decl int[1] xs\n  array\n");
     }
 
     // -- enums and match ---------------------------------------------------

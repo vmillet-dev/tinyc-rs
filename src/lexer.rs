@@ -56,6 +56,8 @@ impl<'a> Lexer<'a> {
                 '{' => self.single(TokenKind::LBrace),
                 '}' => self.single(TokenKind::RBrace),
                 ';' => self.single(TokenKind::Semi),
+                '[' => self.single(TokenKind::LBracket),
+                ']' => self.single(TokenKind::RBracket),
                 // Two-character operators are recognised before their prefixes.
                 // `=` is the one with two of them, so it does not fit
                 // [`Self::one_or_two`].
@@ -182,6 +184,7 @@ impl<'a> Lexer<'a> {
             "continue" => TokenKind::KwContinue,
             "enum" => TokenKind::KwEnum,
             "match" => TokenKind::KwMatch,
+            "len" => TokenKind::KwLen,
             name => TokenKind::Ident(name.to_string()),
         }
     }

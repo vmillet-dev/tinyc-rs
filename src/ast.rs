@@ -6,6 +6,10 @@ use crate::diag::Span;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EnumId(pub u32);
 
+/// Index of an array type in [`TypeTable::arrays`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ArrayId(pub u32);
+
 /// What every stage after the parser needs to know about a declared enum: what
 /// it is called, and what its variants are called *in order*.
 ///
@@ -15,6 +19,39 @@ pub struct EnumId(pub u32);
 pub struct EnumInfo {
     pub name: String,
     pub variants: Vec<String>,
+}
+
+/// An array type: what it holds, and how many.
+///
+/// The length is part of the type, so `int[3]` and `int[4]` are different types
+/// and **every length is known at compile time**. That is what lets a constant
+/// index be checked outright rather than guarded, and what lets a function
+/// receiving an array know how long it is without being told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrayInfo {
+    pub elem: Ty,
+    pub len: u32,
+}
+
+/// Every type a program declared or built, indexed by the ids a [`Ty`] holds.
+///
+/// `Ty` is deliberately small enough to be `Copy` and to compare as an integer,
+/// which means it cannot carry a name or an element type. This is where those
+/// live, and why naming a type takes a second argument.
+#[derive(Clone, Debug, Default)]
+pub struct TypeTable {
+    pub enums: Vec<EnumInfo>,
+    pub arrays: Vec<ArrayInfo>,
+}
+
+impl TypeTable {
+    pub fn array(&self, id: ArrayId) -> ArrayInfo {
+        self.arrays[id.0 as usize]
+    }
+
+    pub fn enum_info(&self, id: EnumId) -> &EnumInfo {
+        &self.enums[id.0 as usize]
+    }
 }
 
 impl EnumInfo {
@@ -32,7 +69,7 @@ impl EnumInfo {
 /// [`Ty::Enum`] holds an *index* rather than a name, which is what keeps `Ty`
 /// `Copy` and its equality an integer comparison. The price is that a `Ty`
 /// cannot name itself — see [`Ty::name`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
     /// 64-bit signed integer.
     Int,
@@ -42,6 +79,11 @@ pub enum Ty {
     Bool,
     /// One of the variants of a declared enum, held as its index.
     Enum(EnumId),
+    /// A fixed-length run of values, held as an index into the type table.
+    ///
+    /// The one type that does not fit in a register: a value of one lives in
+    /// the frame, and what travels in a register is its address.
+    Array(ArrayId),
 }
 
 impl Ty {
@@ -51,23 +93,29 @@ impl Ty {
     /// The table has to be handed in because an enum's name comes from the
     /// source rather than from this enum, and [`Ty`] is deliberately too small
     /// to carry one.
-    pub fn name(self, enums: &[EnumInfo]) -> &str {
+    pub fn name(self, types: &TypeTable) -> String {
         match self {
-            Ty::Int => "int",
-            Ty::Str => "string",
-            Ty::Bool => "bool",
-            Ty::Enum(id) => &enums[id.0 as usize].name,
+            Ty::Int => "int".to_string(),
+            Ty::Str => "string".to_string(),
+            Ty::Bool => "bool".to_string(),
+            Ty::Enum(id) => types.enum_info(id).name.clone(),
+            Ty::Array(id) => {
+                let info = types.array(id);
+                format!("{}[{}]", info.elem.name(types), info.len)
+            }
         }
     }
 
     /// The quoted type name with its indefinite article, for prose in messages.
-    pub fn with_article(self, enums: &[EnumInfo]) -> String {
-        match self {
-            Ty::Int => "an `int`".to_string(),
-            Ty::Str => "a `string`".to_string(),
-            Ty::Bool => "a `bool`".to_string(),
-            Ty::Enum(id) => format!("a `{}`", enums[id.0 as usize].name),
-        }
+    pub fn with_article(self, types: &TypeTable) -> String {
+        let name = self.name(types);
+        // `int` and `int[3]` both want "an"; an enum's name is the program's, so
+        // the article follows the spelling rather than the type.
+        let article = match name.starts_with(['a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O', 'U']) {
+            true => "an",
+            false => "a",
+        };
+        format!("{article} `{name}`")
     }
 
     /// Whether values of this type can be ordered, and so compared with `<` and
@@ -80,10 +128,22 @@ impl Ty {
     }
 
     /// Whether two values of this type can be compared for equality at all.
+    ///
     /// Strings cannot: it would need a runtime routine, and comparing the
-    /// pointers would quietly answer a different question.
+    /// pointers would quietly answer a different question. Arrays cannot for
+    /// the same reason — element by element is a loop, and the addresses are
+    /// not what anybody meant to ask about.
     pub fn has_equality(self) -> bool {
-        !matches!(self, Ty::Str)
+        !matches!(self, Ty::Str | Ty::Array(_))
+    }
+
+    /// Whether a value of this type travels in a register.
+    ///
+    /// Everything but an array does. An array lives in the frame, and what a
+    /// register holds is its address — which is why one may be passed to a
+    /// function but never returned from one.
+    pub fn fits_in_a_register(self) -> bool {
+        !matches!(self, Ty::Array(_))
     }
 }
 
@@ -96,6 +156,10 @@ impl Ty {
 #[derive(Clone, Debug)]
 pub struct TypeRef {
     pub name: String,
+    /// `Some((n, span))` when written `name[n]`, with the span of the length so
+    /// a nonsensical one can be underlined on its own.
+    pub array_len: Option<(i64, Span)>,
+    /// The whole type as written, brackets included.
     pub span: Span,
 }
 
@@ -289,6 +353,24 @@ pub enum ExprKind {
     /// `lhs && rhs` or `lhs || rhs`. `rhs` is evaluated only when `lhs` did not
     /// already decide the answer, which is why this is not a [`Self::Bin`].
     Logic { op: LogicOp, lhs: Box<Expr>, rhs: Box<Expr> },
+    /// `[1, 2, 3]` — the only way to make an array.
+    ///
+    /// Its length is its element count, and the declaration it initialises has
+    /// to agree: `int[3] xs = [1, 2];` is a mistake worth catching, not a length
+    /// to infer.
+    Array { elements: Vec<Expr>, span: Span },
+    /// `xs[i]`.
+    ///
+    /// The array is named rather than computed, because a name is the only
+    /// place an array can be: they are not returned from functions and not
+    /// nested inside each other.
+    Index { array: String, name_span: Span, index: Box<Expr> },
+    /// `len(xs)` — the length of an array, which is always a constant.
+    ///
+    /// A word rather than a method because TinyC has no methods, and a
+    /// construct rather than a library function because there is nothing a
+    /// library function could be given: an array's length is in its *type*.
+    Len { array: String, name_span: Span },
     /// A variant of an enum, `Color::Red`.
     ///
     /// Always written qualified, so that two enums may use the same variant
@@ -337,10 +419,9 @@ pub enum Stmt {
         name_span: Span,
         init: Expr,
     },
-    /// Assignment to an already declared variable.
+    /// Assignment to an already declared variable or array element.
     Assign {
-        name: String,
-        name_span: Span,
+        target: Place,
         value: Expr,
     },
     Print {
@@ -399,6 +480,34 @@ pub enum Stmt {
     /// nothing could not be called otherwise. The parser only ever puts an
     /// [`ExprKind::Call`] here.
     Call(Expr),
+}
+
+/// Where an assignment puts its value.
+///
+/// A separate shape from [`Expr`] rather than "an expression that happens to be
+/// assignable": what may be written to is a syntactic question, so the parser
+/// answers it once instead of every later stage re-deciding.
+#[derive(Clone, Debug)]
+pub enum Place {
+    /// `x = ...`
+    Var { name: String, name_span: Span },
+    /// `xs[i] = ...`
+    Element { array: String, name_span: Span, index: Expr },
+}
+
+impl Place {
+    /// The name being written through, which both shapes have.
+    pub fn name(&self) -> &str {
+        match self {
+            Place::Var { name, .. } | Place::Element { array: name, .. } => name,
+        }
+    }
+
+    pub fn name_span(&self) -> Span {
+        match self {
+            Place::Var { name_span, .. } | Place::Element { name_span, .. } => *name_span,
+        }
+    }
 }
 
 /// What an arm does once its pattern matches.
@@ -510,11 +619,20 @@ pub fn dump(program: &Program) -> String {
     out
 }
 
+/// A type as the program spelled it, for the AST dump — which has no table to
+/// resolve names against and does not need one.
+fn written_type(ty: &TypeRef) -> String {
+    match ty.array_len {
+        Some((len, _)) => format!("{}[{len}]", ty.name),
+        None => ty.name.clone(),
+    }
+}
+
 fn dump_fn(out: &mut String, function: &FnDecl) {
     let params: Vec<String> =
-        function.params.iter().map(|p| format!("{} {}", p.ty.name, p.name)).collect();
+        function.params.iter().map(|p| format!("{} {}", written_type(&p.ty), p.name)).collect();
     let ret = match &function.ret {
-        Some(ty) => format!(" -> {}", ty.name),
+        Some(ty) => format!(" -> {}", written_type(ty)),
         None => String::new(),
     };
     out.push_str(&format!("fn {}({}){}\n", function.name, params.join(", "), ret));
@@ -525,11 +643,17 @@ fn dump_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
     let pad = "  ".repeat(depth);
     match stmt {
         Stmt::Decl { ty, name, init, .. } => {
-            out.push_str(&format!("{pad}decl {} {name}\n", ty.name));
+            out.push_str(&format!("{pad}decl {} {name}\n", written_type(ty)));
             dump_expr(out, init, depth + 1);
         }
-        Stmt::Assign { name, value, .. } => {
-            out.push_str(&format!("{pad}assign {name}\n"));
+        Stmt::Assign { target, value } => {
+            match target {
+                Place::Var { name, .. } => out.push_str(&format!("{pad}assign {name}\n")),
+                Place::Element { array, index, .. } => {
+                    out.push_str(&format!("{pad}assign {array}[]\n"));
+                    dump_expr(out, index, depth + 1);
+                }
+            }
             dump_expr(out, value, depth + 1);
         }
         Stmt::Print { value, .. } => {
@@ -589,6 +713,17 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
         ExprKind::Variant { enum_name, variant, .. } => {
             out.push_str(&format!("{pad}variant {enum_name}::{variant}\n"))
         }
+        ExprKind::Array { elements, .. } => {
+            out.push_str(&format!("{pad}array\n"));
+            for element in elements {
+                dump_expr(out, element, depth + 1);
+            }
+        }
+        ExprKind::Index { array, index, .. } => {
+            out.push_str(&format!("{pad}index {array}\n"));
+            dump_expr(out, index, depth + 1);
+        }
+        ExprKind::Len { array, .. } => out.push_str(&format!("{pad}len {array}\n")),
         ExprKind::Neg(operand) => {
             out.push_str(&format!("{pad}neg\n"));
             dump_expr(out, operand, depth + 1);

@@ -102,7 +102,7 @@ fn run(cli: &Cli) -> Result<(), String> {
 
     if cli.dump_regalloc {
         for (function, allocation) in compiled.ir.functions.iter().zip(&compiled.allocations) {
-            println!("{}:", function.signature(&compiled.ir.enums));
+            println!("{}:", function.signature(&compiled.ir.table));
             print!("{}", allocation.dump(function, &compiled.registers));
         }
     }

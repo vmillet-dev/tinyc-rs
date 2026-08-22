@@ -38,8 +38,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArmBody, BinOp, Block as AstBlock, CmpOp, EnumInfo, Expr, ExprKind, FnDecl, LogicOp,
-    MatchArm, Program as Ast, Stmt, Ty,
+    ArmBody, BinOp, Block as AstBlock, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
+    MatchArm, Place, Program as Ast, Stmt, Ty, TypeTable,
 };
 use crate::sema::Types;
 
@@ -79,6 +79,25 @@ pub enum Instr {
     Bin { op: BinOp, dst: VReg, lhs: Value, rhs: Value },
     /// `dst = (lhs op rhs)`, producing 0 or 1.
     Cmp { op: CmpOp, dst: VReg, lhs: Value, rhs: Value },
+    /// `dst = &frame[offset]`: the address of a run of bytes this function owns.
+    ///
+    /// The first instruction in TinyC that is about *memory*. Everything else
+    /// names a value; this names a place, and it exists because an array is the
+    /// one thing too big to live in a register.
+    ///
+    /// The frame region is reserved once, in the prologue, so this costs a
+    /// single `lea` and never allocates.
+    Frame { dst: VReg, offset: u32 },
+    /// `dst = base[index]`, in elements rather than bytes.
+    ///
+    /// `len` travels with it so the backend can bounds check, and *only* so it
+    /// can: a constant index was checked at compile time and needs none, which
+    /// is the same bargain `DivGuards` strikes for division.
+    Elem { dst: VReg, base: Value, index: Value, len: u32 },
+    /// `dst = *addr`
+    Load { dst: VReg, addr: Value },
+    /// `*addr = value`
+    Store { addr: Value, value: Value },
     /// `dst = arg(index)`: the incoming parameter that arrived in the ABI's
     /// register for `index`.
     ///
@@ -211,11 +230,22 @@ impl Instr {
             }
         };
         match self {
-            Instr::Const { .. } | Instr::StrAddr { .. } | Instr::Param { .. } => {}
-            Instr::Copy { src, .. } => reg(src),
+            Instr::Const { .. }
+            | Instr::StrAddr { .. }
+            | Instr::Param { .. }
+            | Instr::Frame { .. } => {}
+            Instr::Copy { src, .. } | Instr::Load { addr: src, .. } => reg(src),
             Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => {
                 reg(lhs);
                 reg(rhs);
+            }
+            Instr::Elem { base, index, .. } => {
+                reg(base);
+                reg(index);
+            }
+            Instr::Store { addr, value } => {
+                reg(addr);
+                reg(value);
             }
             Instr::Print { val, .. } => reg(val),
             Instr::Call { args, .. } => args.iter().for_each(reg),
@@ -230,9 +260,12 @@ impl Instr {
             | Instr::Copy { dst, .. }
             | Instr::Bin { dst, .. }
             | Instr::Param { dst, .. }
+            | Instr::Frame { dst, .. }
+            | Instr::Elem { dst, .. }
+            | Instr::Load { dst, .. }
             | Instr::Cmp { dst, .. } => Some(*dst),
             Instr::Call { dst, .. } => *dst,
-            Instr::Print { .. } => None,
+            Instr::Print { .. } | Instr::Store { .. } => None,
         }
     }
 
@@ -250,6 +283,9 @@ pub struct Function {
     pub params: Vec<VReg>,
     /// `None` for a function that returns nothing.
     pub ret: Option<Ty>,
+    /// Bytes of frame this function's arrays need, reserved once in the
+    /// prologue and handed out by [`Instr::Frame`].
+    pub frame_bytes: u32,
     /// Basic blocks in the order they will be emitted; block 0 is the entry.
     pub blocks: Vec<Block>,
     /// Human-readable name per virtual register, used by IR and allocator dumps.
@@ -277,11 +313,11 @@ impl Function {
     }
 
     /// The signature line used by the IR dump and by assembly comments.
-    pub fn signature(&self, enums: &[EnumInfo]) -> String {
+    pub fn signature(&self, table: &TypeTable) -> String {
         let params: Vec<String> =
             self.params.iter().map(|&r| format!("%{}", self.name_of(r))).collect();
         let ret = match self.ret {
-            Some(ty) => format!(" -> {}", ty.name(enums)),
+            Some(ty) => format!(" -> {}", ty.name(table)),
             None => String::new(),
         };
         format!("fn {}({}){}", self.name, params.join(", "), ret)
@@ -292,12 +328,12 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// Interned string literals, each stored without its NUL terminator.
     pub strings: Vec<Vec<u8>>,
-    /// The declared enums, carried through so that a type can still be named
+    /// Every type the program has, carried through so that a type can still be named
     /// and a value of one can still be printed.
     ///
     /// An enum's *values* need nothing here: a variant is its index, so it is
     /// an integer everywhere the backend is concerned. Only the names survive.
-    pub enums: Vec<EnumInfo>,
+    pub table: TypeTable,
 }
 
 impl Program {
@@ -316,7 +352,7 @@ impl Program {
         }
 
         for function in &self.functions {
-            out.push_str(&format!("{}:\n", function.signature(&self.enums)));
+            out.push_str(&format!("{}:\n", function.signature(&self.table)));
 
             // Numbering restarts per function, matching the indices the
             // allocator works with.
@@ -382,6 +418,21 @@ impl Program {
             Instr::Param { dst, index } => {
                 format!("%{} = param {index}", function.name_of(*dst))
             }
+            Instr::Frame { dst, offset } => {
+                format!("%{} = frame {offset}", function.name_of(*dst))
+            }
+            Instr::Elem { dst, base, index, len } => format!(
+                "%{} = elem {}[{}] of {len}",
+                function.name_of(*dst),
+                value(base),
+                value(index)
+            ),
+            Instr::Load { dst, addr } => {
+                format!("%{} = load {}", function.name_of(*dst), value(addr))
+            }
+            Instr::Store { addr, value: stored } => {
+                format!("store {}, {}", value(addr), value(stored))
+            }
             Instr::Call { dst, callee, args } => {
                 let args: Vec<String> = args.iter().map(value).collect();
                 let call = format!("call {}({})", self.function(*callee).name, args.join(", "));
@@ -390,7 +441,7 @@ impl Program {
                     None => call,
                 }
             }
-            Instr::Print { ty, val } => format!("print {} {}", ty.name(&self.enums), value(val)),
+            Instr::Print { ty, val } => format!("print {} {}", ty.name(&self.table), value(val)),
         }
     }
 }
@@ -428,17 +479,18 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
             current: BlockId(0),
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
+            frame_bytes: 0,
             name_counts: HashMap::new(),
             types,
-            enums: types.enums(),
+            table: types.table(),
             strings: &mut strings,
             ids: &ids,
         };
-        functions.push(lowering.run(decl, types.ret_of(index)));
+        functions.push(lowering.run(decl, types.ret_of(index), types.params_of(index)));
     }
 
     let functions = prune_unreachable_functions(functions, ids.get(crate::sema::ENTRY_POINT));
-    Program { functions, strings: strings.bytes, enums: types.enums().to_vec() }
+    Program { functions, strings: strings.bytes, table: types.table().clone() }
 }
 
 /// The literals every function shares, plus the index that keeps interning them
@@ -593,28 +645,36 @@ struct Lowering<'a> {
     /// The block instructions are currently appended to.
     current: BlockId,
     /// Variable name -> virtual register, one map per open scope.
-    scopes: Vec<HashMap<String, VReg>>,
+    scopes: Vec<HashMap<String, (VReg, Ty)>>,
     /// The loops enclosing the statement being lowered, innermost last.
     loops: Vec<LoopFrame>,
+    /// Bytes of frame handed out so far, which is the offset the next array
+    /// gets. Never reclaimed: an array's room is reserved for the whole call,
+    /// which costs a few bytes and spares the lowering a lifetime analysis.
+    frame_bytes: u32,
     /// How many registers have borne each name, so a shadowing declaration in
     /// another scope gets a distinct dump name (`i`, then `i.1`).
     name_counts: HashMap<String, u32>,
     types: &'a Types,
-    /// The declared enums, for turning a variant name into its tag.
-    enums: &'a [EnumInfo],
+    /// Every type the program has, for turning a variant name into its tag and
+    /// an array type into a size.
+    table: &'a TypeTable,
     /// Shared with every other function: the strings all land in one section.
     strings: &'a mut Strings,
     ids: &'a HashMap<String, FuncId>,
 }
 
 impl Lowering<'_> {
-    fn run(mut self, decl: &FnDecl, ret: Option<Ty>) -> Function {
+    fn run(mut self, decl: &FnDecl, ret: Option<Ty>, param_types: &[Ty]) -> Function {
         self.new_block(BlockKind::Entry);
 
         // Parameters first, so each one is defined at the top of the function.
+        //
+        // An array parameter is no different here: what arrived in the register
+        // is its address, and the address is what the register keeps.
         let mut params = Vec::new();
-        for (index, param) in decl.params.iter().enumerate() {
-            let dst = self.declare(&param.name);
+        for (index, (param, ty)) in decl.params.iter().zip(param_types).enumerate() {
+            let dst = self.declare(&param.name, *ty);
             self.emit(Instr::Param { dst, index: index as u32 });
             params.push(dst);
         }
@@ -647,6 +707,7 @@ impl Lowering<'_> {
             name: decl.name.clone(),
             params,
             ret,
+            frame_bytes: self.frame_bytes,
             blocks: prune_unreachable(blocks),
             vreg_names: self.vreg_names,
         }
@@ -700,13 +761,29 @@ impl Lowering<'_> {
         reg
     }
 
-    fn declare(&mut self, name: &str) -> VReg {
+    /// Give a name a register, and remember the type it holds.
+    ///
+    /// The type is carried because an array's *length* is part of it, and the
+    /// length is what a bounds check and an allocation both need. Nothing else
+    /// asks.
+    fn declare(&mut self, name: &str, ty: Ty) -> VReg {
         let reg = self.fresh(name);
-        self.scopes.last_mut().expect("a scope is always open").insert(name.to_string(), reg);
+        self.scopes
+            .last_mut()
+            .expect("a scope is always open")
+            .insert(name.to_string(), (reg, ty));
         reg
     }
 
     fn lookup(&self, name: &str) -> VReg {
+        self.binding(name).0
+    }
+
+    fn lookup_type(&self, name: &str) -> Ty {
+        self.binding(name).1
+    }
+
+    fn binding(&self, name: &str) -> (VReg, Ty) {
         self.scopes
             .iter()
             .rev()
@@ -727,14 +804,23 @@ impl Lowering<'_> {
     fn stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Decl { name, init, .. } => {
-                let dst = self.declare(name);
+                let dst = self.declare(name, self.types.of(init.id));
                 self.expr_into(dst, init);
             }
-            // The variable keeps its register; the assignment overwrites it.
-            Stmt::Assign { name, value, .. } => {
-                let dst = self.lookup(name);
-                self.expr_into(dst, value);
-            }
+            Stmt::Assign { target, value } => match target {
+                // The variable keeps its register; the assignment overwrites it.
+                Place::Var { name, .. } => {
+                    let dst = self.lookup(name);
+                    self.expr_into(dst, value);
+                }
+                // An element has no register of its own: what the name holds is
+                // the array's address, and the write goes through it.
+                Place::Element { array, index, .. } => {
+                    let addr = self.element_address(array, index);
+                    let value = self.expr(value);
+                    self.emit(Instr::Store { addr: Value::Reg(addr), value });
+                }
+            },
             Stmt::Print { value, .. } => {
                 let ty = self.types.of(value.id);
                 let val = self.expr(value);
@@ -862,7 +948,7 @@ impl Lowering<'_> {
         let Ty::Enum(id) = self.types.of(expr.id) else {
             unreachable!("sema gives a variant its enum's type");
         };
-        self.enums[id.0 as usize].tag(variant).expect("sema rejects an unknown variant")
+        self.table.enum_info(id).tag(variant).expect("sema rejects an unknown variant")
     }
 
     /// The tag an arm's pattern selects.
@@ -873,7 +959,7 @@ impl Lowering<'_> {
         let Ty::Enum(id) = self.types.of(scrutinee.id) else {
             unreachable!("sema rejects a match on anything but an enum");
         };
-        self.enums[id.0 as usize].tag(&arm.variant).expect("sema rejects an unknown variant")
+        self.table.enum_info(id).tag(&arm.variant).expect("sema rejects an unknown variant")
     }
 
     /// Lower a `break` or a `continue`: hand the block it ends to the innermost
@@ -988,6 +1074,39 @@ impl Lowering<'_> {
         self.switch_to(after);
     }
 
+    // -- arrays ------------------------------------------------------------
+
+    /// The address of `array[index]`, in a fresh register.
+    ///
+    /// One `Elem` and nothing else: the multiply-and-add that turns an index
+    /// into an offset is an addressing mode on x86, not arithmetic, so it is
+    /// not lowered as arithmetic and never picks up the overflow guard that
+    /// `Bin` carries.
+    fn element_address(&mut self, array: &str, index: &Expr) -> VReg {
+        let base = self.lookup(array);
+        let len = self.array_len(array);
+        let index = self.expr(index);
+        let dst = self.fresh_temp();
+        self.emit(Instr::Elem { dst, base: Value::Reg(base), index, len });
+        dst
+    }
+
+    /// How long the array a name holds is — a fact about its *type*, so it is
+    /// known here without anything being computed.
+    fn array_len(&self, array: &str) -> u32 {
+        let Ty::Array(id) = self.lookup_type(array) else {
+            unreachable!("sema rejects indexing anything but an array");
+        };
+        self.table.array(id).len
+    }
+
+    /// Reserve room for an array in the frame and put its address in `dst`.
+    fn allocate_array(&mut self, dst: VReg, len: u32) {
+        let offset = self.frame_bytes;
+        self.frame_bytes += len * 8;
+        self.emit(Instr::Frame { dst, offset });
+    }
+
     // -- expressions -------------------------------------------------------
 
     /// The callee and evaluated arguments of a call expression.
@@ -1010,6 +1129,31 @@ impl Lowering<'_> {
             ExprKind::Bool(v) => self.emit(Instr::Const { dst, val: i64::from(*v) }),
             ExprKind::Variant { .. } => {
                 let val = self.variant_tag(expr);
+                self.emit(Instr::Const { dst, val });
+            }
+            // The array's room is reserved first, then filled: an element's
+            // value may itself mention the array being built only in ways sema
+            // has already ruled out, so the order is not observable.
+            ExprKind::Array { elements, .. } => {
+                self.allocate_array(dst, elements.len() as u32);
+                for (index, element) in elements.iter().enumerate() {
+                    let value = self.expr(element);
+                    let addr = self.fresh_temp();
+                    self.emit(Instr::Elem {
+                        dst: addr,
+                        base: Value::Reg(dst),
+                        index: Value::Const(index as i64),
+                        len: elements.len() as u32,
+                    });
+                    self.emit(Instr::Store { addr: Value::Reg(addr), value });
+                }
+            }
+            ExprKind::Index { array, index, .. } => {
+                let addr = self.element_address(array, index);
+                self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
+            }
+            ExprKind::Len { array, .. } => {
+                let val = i64::from(self.array_len(array));
                 self.emit(Instr::Const { dst, val });
             }
             ExprKind::Str(bytes) => {
@@ -1160,6 +1304,15 @@ impl Lowering<'_> {
             // integer literal does — which is the whole reason a payload-free
             // enum costs the backend nothing.
             ExprKind::Variant { .. } => Value::Const(self.variant_tag(expr)),
+            // A length is a fact about a type, so it is a constant here and
+            // costs nothing at all — `i < len(xs)` compares against a literal.
+            ExprKind::Len { array, .. } => Value::Const(i64::from(self.array_len(array))),
+            ExprKind::Index { array, index, .. } => {
+                let addr = self.element_address(array, index);
+                let dst = self.fresh_temp();
+                self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
+                Value::Reg(dst)
+            }
             ExprKind::Neg(operand) => match self.expr(operand) {
                 // An operand that is already a literal folds, and so does the
                 // whole tree above it: `-(2 * 3)` never reaches an instruction.
@@ -1219,7 +1372,10 @@ impl Lowering<'_> {
                 self.logic_branch(dst, *op, cond, rhs);
                 Value::Reg(dst)
             }
-            ExprKind::Str(_) | ExprKind::Call { .. } | ExprKind::Match { .. } => {
+            ExprKind::Str(_)
+            | ExprKind::Call { .. }
+            | ExprKind::Match { .. }
+            | ExprKind::Array { .. } => {
                 let dst = self.fresh_temp();
                 self.expr_into(dst, expr);
                 Value::Reg(dst)
@@ -1382,6 +1538,104 @@ mod tests {
         let with_for = lower_main("for (int i = 0; i < 3; i = i + 1) {\n  print(i);\n}");
         let with_while = lower_main("int i = 0;\nwhile (i < 3) {\n  print(i);\n  i = i + 1;\n}");
         assert_eq!(with_for.dump(), with_while.dump());
+    }
+
+    // -- arrays ------------------------------------------------------------
+
+    #[test]
+    fn an_array_is_room_in_the_frame_and_a_store_per_element() {
+        let ir = lower_main("int[3] xs = [10, 20, 30];\nprint(xs[0]);");
+        assert_eq!(
+            body_dump(&ir),
+            concat!(
+                "entry0:\n",
+                "  0  %xs = frame 0\n",
+                "  1  %t1 = elem %xs[0] of 3\n",
+                "  2  store %t1, 10\n",
+                "  3  %t2 = elem %xs[1] of 3\n",
+                "  4  store %t2, 20\n",
+                "  5  %t3 = elem %xs[2] of 3\n",
+                "  6  store %t3, 30\n",
+                "  7  %t4 = elem %xs[0] of 3\n",
+                "  8  %t5 = load %t4\n",
+                "  9  print int %t5\n",
+                " 10  return\n",
+            )
+        );
+    }
+
+    #[test]
+    fn the_frame_is_sized_by_what_the_function_declared() {
+        let ir = lower_main("int[3] a = [1, 2, 3];\nbool[2] b = [true, false];\nprint(a[0]);");
+        // Two arrays, five elements, eight bytes each.
+        assert_eq!(ir.functions[0].frame_bytes, 40);
+        // And they do not overlap.
+        let offsets: Vec<u32> = ir.functions[0].blocks[0]
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Frame { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offsets, vec![0, 24]);
+    }
+
+    #[test]
+    fn a_function_with_no_arrays_reserves_nothing() {
+        assert_eq!(lower_main("int n = 1;\nprint(n);").functions[0].frame_bytes, 0);
+    }
+
+    #[test]
+    fn len_is_a_constant_and_costs_nothing() {
+        // It is a fact about the type, so nothing computes it.
+        let ir = lower_main("int[4] xs = [1, 2, 3, 4];\nprint(len(xs));");
+        let main = &ir.functions[0];
+        assert!(
+            matches!(main.blocks[0].instrs.last(), Some(Instr::Print { val: Value::Const(4), .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn an_element_address_is_one_instruction_and_never_arithmetic() {
+        // `base + index * 8` is an addressing mode, so it picks up none of the
+        // overflow guards `Bin` carries.
+        let ir = lower_main("int[3] xs = [1, 2, 3];\nint i = 1;\nprint(xs[i]);");
+        let main = &ir.functions[0];
+        let elems = main.blocks[0].instrs.iter().filter(|i| matches!(i, Instr::Elem { .. })).count();
+        // Three to build it, one to read it.
+        assert_eq!(elems, 4, "{}", ir.dump());
+        assert!(
+            !main.blocks[0]
+                .instrs
+                .iter()
+                .any(|i| matches!(i, Instr::Bin { op: BinOp::Mul, .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn writing_through_an_index_stores_rather_than_copying_a_register() {
+        let ir = lower_main("int[2] xs = [1, 2];\nxs[1] = 7;\nprint(xs[1]);");
+        let main = &ir.functions[0];
+        // Two stores for the literal, one for the assignment.
+        let stores = main.blocks[0].instrs.iter().filter(|i| matches!(i, Instr::Store { .. })).count();
+        assert_eq!(stores, 3, "{}", ir.dump());
+    }
+
+    #[test]
+    fn an_array_parameter_is_an_address_like_any_other_value() {
+        let ir = lower_src(
+            "fn first(int[2] xs) -> int {\n  return xs[0];\n}\n\
+             fn main() {\n  int[2] xs = [1, 2];\n  print(first(xs));\n}",
+        );
+        let first = &ir.functions[0];
+        // Nothing is copied in: the register holds the caller's address.
+        assert!(matches!(first.blocks[0].instrs[0], Instr::Param { index: 0, .. }));
+        assert!(!first.blocks.iter().flat_map(|b| &b.instrs).any(|i| matches!(i, Instr::Frame { .. })));
     }
 
     // -- enums and match ---------------------------------------------------
@@ -1587,9 +1841,9 @@ mod tests {
         // The backend needs the names to print one, and the dump to name the
         // type; the values themselves need nothing.
         let ir = lower_colour("print(Colour::Red);");
-        assert_eq!(ir.enums.len(), 1);
-        assert_eq!(ir.enums[0].name, "Colour");
-        assert_eq!(ir.enums[0].variants, vec!["Red", "Green", "Blue"]);
+        assert_eq!(ir.table.enums.len(), 1);
+        assert_eq!(ir.table.enums[0].name, "Colour");
+        assert_eq!(ir.table.enums[0].variants, vec!["Red", "Green", "Blue"]);
     }
 
     // -- negation and remainder --------------------------------------------

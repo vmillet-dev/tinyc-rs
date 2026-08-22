@@ -100,14 +100,17 @@ const RUNTIME_PREFIX: &str = "tc$rt$";
 const ABORT_DIV_ZERO: &str = "tc$rt$div_by_zero";
 const ABORT_DIV_OVERFLOW: &str = "tc$rt$div_overflow";
 const ABORT_OVERFLOW: &str = "tc$rt$overflow";
+const ABORT_BOUNDS: &str = "tc$rt$bounds";
 const ABORT_REPORT: &str = "tc$rt$abort";
 const MSG_DIV_ZERO: &str = "tc$rt$msg_div_zero";
 const MSG_DIV_OVERFLOW: &str = "tc$rt$msg_div_overflow";
 const MSG_OVERFLOW: &str = "tc$rt$msg_overflow";
+const MSG_BOUNDS: &str = "tc$rt$msg_bounds";
 
 const DIV_ZERO_TEXT: &str = "runtime error: division by zero\n";
 const DIV_OVERFLOW_TEXT: &str = "runtime error: division overflows an int\n";
 const OVERFLOW_TEXT: &str = "runtime error: arithmetic overflows an int\n";
+const BOUNDS_TEXT: &str = "runtime error: array index out of bounds\n";
 
 /// The file descriptor `_write` should report a runtime failure on.
 const STDERR: u32 = 2;
@@ -203,6 +206,9 @@ impl DivGuards {
 /// fail at all.
 fn may_abort(instr: &Instr) -> bool {
     match instr {
+        // A constant index was settled at compile time; anything else is
+        // checked where it lands.
+        Instr::Elem { index, .. } => !matches!(index, Value::Const(_)),
         Instr::Bin { op, lhs, rhs, .. } if op.divides() => DivGuards::of(lhs, rhs).any(),
         // `add`, `sub` and `imul` are all guarded; a folded result never
         // reaches an instruction in the first place.
@@ -286,7 +292,7 @@ struct Used {
 impl Used {
     fn of(program: &Program) -> Used {
         let mut used =
-            Used { formats: [false; 3], enums: vec![false; program.enums.len()], aborts: false };
+            Used { formats: [false; 3], enums: vec![false; program.table.enums.len()], aborts: false };
         for instr in program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instrs) {
             match instr {
                 Instr::Print { ty, .. } => {
@@ -314,7 +320,7 @@ impl Used {
 fn format_index(ty: Ty) -> usize {
     match ty {
         Ty::Int => 0,
-        Ty::Str | Ty::Enum(_) => 1,
+        Ty::Str | Ty::Enum(_) | Ty::Array(_) => 1,
         Ty::Bool => 2,
     }
 }
@@ -401,7 +407,7 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
     // One table per printed enum: the variant names, and the array of pointers
     // a tag indexes. A tag can only have come from a variant of this very enum,
     // so the index is in range by construction and needs no check.
-    for (index, info) in program.enums.iter().enumerate() {
+    for (index, info) in program.table.enums.iter().enumerate() {
         if !used.enums[index] {
             continue;
         }
@@ -422,6 +428,7 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
         asm.asm(&format!("{MSG_DIV_ZERO}: db {}", bytes_of(DIV_ZERO_TEXT)));
         asm.asm(&format!("{MSG_DIV_OVERFLOW}: db {}", bytes_of(DIV_OVERFLOW_TEXT)));
         asm.asm(&format!("{MSG_OVERFLOW}: db {}", bytes_of(OVERFLOW_TEXT)));
+        asm.asm(&format!("{MSG_BOUNDS}: db {}", bytes_of(BOUNDS_TEXT)));
     }
     for (index, bytes) in program.strings.iter().enumerate() {
         // Emitting raw bytes avoids every string-quoting corner case.
@@ -464,6 +471,11 @@ fn abort_stubs(asm: &mut Asm) {
     asm.line(&format!("{ABORT_OVERFLOW}:"));
     asm.asm(&format!("lea  {RDX}, [{MSG_OVERFLOW}]"));
     asm.asm(&format!("mov  r8d, {}", OVERFLOW_TEXT.len()));
+    asm.asm(&format!("jmp  {ABORT_REPORT}"));
+
+    asm.line(&format!("{ABORT_BOUNDS}:"));
+    asm.asm(&format!("lea  {RDX}, [{MSG_BOUNDS}]"));
+    asm.asm(&format!("mov  r8d, {}", BOUNDS_TEXT.len()));
 
     asm.line(&format!("{ABORT_REPORT}:"));
     asm.comment("a frame of its own, so nothing that jumps here owes one");
@@ -510,7 +522,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             .flat_map(|block| &block.instrs)
             .any(|instr| instr.is_call());
 
-        let frame = FrameLayout::new(allocation, leaf);
+        let frame = FrameLayout::new(allocation, function.frame_bytes, leaf);
         FnEmitter { program, function, allocation, registers, frame, asm, next_label: 0 }
     }
 
@@ -786,6 +798,56 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 self.asm.asm(&format!("jo   {ABORT_OVERFLOW}"));
                 self.store_back(*dst, &work);
             }
+            // The address of this function's own room, which the prologue has
+            // already reserved. One `lea`, and never a call.
+            Instr::Frame { dst, offset } => {
+                let work = self.work_reg(*dst, false);
+                let at = self.frame.array_offset(*offset);
+                self.asm.asm(&format!("lea  {work}, [rsp+{at}]"));
+                self.store_back(*dst, &work);
+            }
+            // `base + index * 8` is an addressing mode, so an element's address
+            // is one instruction and not arithmetic — which is also why it
+            // carries none of the overflow guards `Bin` does.
+            Instr::Elem { dst, base, index, len } => {
+                let base = self.in_register(base, SCRATCH0);
+                if let Value::Const(at) = index {
+                    // `sema` proved this one is in range, so it needs no check
+                    // and its offset folds into the addressing mode.
+                    let work = self.work_reg(*dst, false);
+                    self.asm.asm(&format!("lea  {work}, [{base}+{}]", at * 8));
+                    self.store_back(*dst, &work);
+                } else {
+                    let index = self.in_register(index, SCRATCH1);
+                    // One *unsigned* comparison rules out both ends: a negative
+                    // index read as unsigned is enormous, so it fails the same
+                    // test that catches one past the end.
+                    self.asm.asm(&format!("cmp  {index}, {len}"));
+                    self.asm.asm(&format!("jae  {ABORT_BOUNDS}"));
+                    // `lea` reads its operands before it writes, so the result
+                    // may land on the base's own register.
+                    let work = self.work_reg(*dst, false);
+                    self.asm.asm(&format!("lea  {work}, [{base}+{index}*8]"));
+                    self.store_back(*dst, &work);
+                }
+            }
+            Instr::Load { dst, addr } => {
+                let addr = self.in_register(addr, SCRATCH0);
+                let work = self.work_reg(*dst, false);
+                self.asm.asm(&format!("mov  {work}, [{addr}]"));
+                self.store_back(*dst, &work);
+            }
+            Instr::Store { addr, value } => {
+                let addr = self.in_register(addr, SCRATCH0);
+                let (source, _) = self.operand_for_alu(value);
+                let source = if is_memory(&source) {
+                    self.asm.mov(SCRATCH1, &source);
+                    SCRATCH1.to_string()
+                } else {
+                    source
+                };
+                self.asm.asm(&format!("mov  qword [{addr}], {source}"));
+            }
             // No source of these moves can be an argument register, because the
             // allocator is never given one — see the module docs.
             Instr::Call { dst, callee, args } => {
@@ -826,7 +888,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 }
                 let format = match ty {
                     Ty::Int => FMT_INT,
-                    Ty::Str | Ty::Enum(_) => FMT_STR,
+                    Ty::Str | Ty::Enum(_) | Ty::Array(_) => FMT_STR,
                     Ty::Bool => FMT_BOOL,
                 };
                 self.asm.asm(&format!("lea  {RCX}, [{format}]"));
@@ -929,6 +991,17 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         }
     }
 
+    /// The value as something an addressing mode can use, which is to say a
+    /// register. A spilled one or an immediate is materialised in `scratch`.
+    fn in_register(&mut self, value: &Value, scratch: &str) -> String {
+        let operand = self.value(value);
+        if is_memory(&operand) || matches!(value, Value::Const(_)) {
+            self.asm.mov(scratch, &operand);
+            return scratch.to_string();
+        }
+        operand
+    }
+
     /// Whether `value` lives exactly where `dst` will.
     fn shares_register(&self, dst: VReg, value: &Value) -> bool {
         matches!(
@@ -984,26 +1057,35 @@ struct FrameLayout {
     size: u32,
     /// Where the spill slots start, measured from `rsp`.
     slots_at: u32,
+    /// Where this function's arrays start, just above the spill slots.
+    arrays_at: u32,
 }
 
 impl FrameLayout {
-    fn new(allocation: &Allocation, leaf: bool) -> FrameLayout {
+    fn new(allocation: &Allocation, frame_bytes: u32, leaf: bool) -> FrameLayout {
         let slots_at = if leaf { 0 } else { SHADOW_SPACE };
-        let locals = slots_at + 8 * allocation.spill_slots;
+        let arrays_at = slots_at + 8 * allocation.spill_slots;
+        let locals = arrays_at + frame_bytes;
         if leaf {
-            return FrameLayout { size: locals, slots_at };
+            return FrameLayout { size: locals, slots_at, arrays_at };
         }
 
         let mut size = locals.div_ceil(16) * 16;
         if allocation.used_callee_saved.len().is_multiple_of(2) {
             size += 8;
         }
-        FrameLayout { size, slots_at }
+        FrameLayout { size, slots_at, arrays_at }
     }
 
     /// Spill slots sit just above the shadow space.
     fn slot_offset(&self, slot: u32) -> u32 {
         self.slots_at + 8 * slot
+    }
+
+    /// Arrays sit above the spill slots, which is what keeps their addresses
+    /// stable: nothing between them and `rsp` moves for the life of the call.
+    fn array_offset(&self, offset: u32) -> u32 {
+        self.arrays_at + offset
     }
 }
 #[cfg(test)]
@@ -1037,7 +1119,7 @@ mod tests {
                     spill_slots,
                     intervals: Vec::new(),
                 };
-                let frame = FrameLayout::new(&allocation, false);
+                let frame = FrameLayout::new(&allocation, 0, false);
                 // 8 (return address) + 8*pushes + frame must be a multiple of 16.
                 assert_eq!((8 + 8 * pushes as u32 + frame.size) % 16, 0);
                 // The frame must still cover shadow space and every spill slot.
@@ -1055,7 +1137,7 @@ mod tests {
                 spill_slots,
                 intervals: Vec::new(),
             };
-            let frame = FrameLayout::new(&allocation, true);
+            let frame = FrameLayout::new(&allocation, 0, true);
             // No call to align for and no callee to leave shadow space for.
             assert_eq!(frame.size, 8 * spill_slots);
             assert_eq!(frame.slot_offset(0), 0);
@@ -1298,6 +1380,44 @@ mod tests {
         assert!(asm.contains(".step"), "{asm}");
         assert!(asm.contains(".done"), "{asm}");
         assert!(asm.contains("jmp  .loop1"), "{asm}");
+    }
+
+    #[test]
+    fn an_element_address_is_a_single_lea() {
+        // `base + index * 8` is an addressing mode on x86, so the multiply and
+        // the add cost nothing at all.
+        let asm = compile("int[3] xs = [1, 2, 3];\nint i = 1;\nprint(xs[i]);");
+        assert!(asm.contains("*8]"), "{asm}");
+        assert!(!asm.contains("imul"), "{asm}");
+    }
+
+    #[test]
+    fn a_constant_index_folds_into_the_offset_and_carries_no_check() {
+        // `sema` settled it, so what is left is the address arithmetic — and
+        // even that is a constant the addressing mode absorbs.
+        let asm = compile("int[3] xs = [1, 2, 3];\nprint(xs[2]);");
+        assert!(asm.contains("+16]"), "{asm}");
+        assert!(!asm.contains(ABORT_BOUNDS), "{asm}");
+    }
+
+    #[test]
+    fn an_index_the_compiler_cannot_see_is_checked_with_one_comparison() {
+        // Unsigned, so a negative index fails the same test that catches one
+        // past the end: there is no second branch for the other side.
+        let asm = compile("int[3] xs = [1, 2, 3];\nint i = 1;\nprint(xs[i]);");
+        assert!(asm.contains("cmp  rdi, 3") || asm.contains(", 3"), "{asm}");
+        assert!(asm.contains(&format!("jae  {ABORT_BOUNDS}")), "{asm}");
+        assert_eq!(asm.matches(&format!("jae  {ABORT_BOUNDS}")).count(), 1, "{asm}");
+    }
+
+    #[test]
+    fn an_array_gets_room_above_the_spill_slots() {
+        let asm = compile("int[3] xs = [1, 2, 3];\nprint(xs[0]);");
+        // `main` calls `printf`, so it owes shadow space; it spills nothing, so
+        // the array starts immediately above.
+        assert!(asm.contains(&format!("lea  rbx, [rsp+{SHADOW_SPACE}]")), "{asm}");
+        // Shadow space plus three elements, rounded for alignment.
+        assert!(asm.contains("sub  rsp, 72"), "{asm}");
     }
 
     #[test]
