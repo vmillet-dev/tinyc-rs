@@ -758,29 +758,12 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
     let (len, len_span) = match ty.shape {
         Shape::One => return Some(element),
         Shape::Array(len, len_span) => (len, len_span),
-        // A list holds what fits in a register and nothing else. An aggregate
-        // element would have to be copied rather than moved every time the list
-        // grew; a list *of* lists would let one be reached through another,
-        // and assigning the outer one would copy handles rather than elements —
-        // which is exactly the aliasing the copy exists to prevent.
-        Shape::List => {
-            if !element.fits_in_a_register() || matches!(element, Ty::List(_)) {
-                errors.push(
-                    Diagnostic::new(
-                        format!("a list cannot hold {}", element.with_article(&declared.table)),
-                        ty.span,
-                    )
-                    .with_label("a list holds values that fit in a register")
-                    .with_note(
-                        "`int`, `string`, `char`, `bool` and any enum can be held; arrays, \
-                         objects and other lists cannot yet",
-                        None,
-                    ),
-                );
-                return None;
-            }
-            return Some(declared.list_of(element));
-        }
+        // A list holds its elements *where it is*, exactly as an array does, so
+        // an object may be one: growing copies whole elements rather than
+        // handles, and there is nothing for two names to share. A list of lists
+        // or of arrays is not refused here because it cannot be written at all
+        // — a type carries at most one pair of brackets.
+        Shape::List => return Some(declared.list_of(element)),
     };
 
     // A length is part of the type, so it has to be a length a type could have.
@@ -3169,14 +3152,31 @@ mod tests {
     }
 
     #[test]
-    fn a_list_holds_only_what_fits_in_a_register() {
-        // An object would have to be copied rather than moved every time the
-        // list grew. A list of arrays or of lists cannot even be *written*:
-        // a type carries at most one pair of brackets.
-        let errors =
-            check_src("class Shape {\n  int n;\n}\nfn main() {\n  Shape[] xs = [];\n}\n")
-                .expect_err("a list of objects is refused");
-        assert!(errors[0].message.contains("a list cannot hold"), "{}", errors[0].message);
+    fn a_list_may_hold_objects() {
+        // The elements live in the list, so an object is no harder to hold
+        // than an `int`: growing copies whole elements, and nothing is shared.
+        assert!(
+            check_src(
+                "class Shape {\n  int n;\n}\n\
+                 fn main() {\n  Shape[] xs = [];\n  push(xs, Shape { n: 1 });\n  \
+                 print(xs[0].n);\n}\n"
+            )
+            .is_ok()
+        );
+        // And a subclass may go into a list of its base, as it may into an
+        // array of one: every slot is the hierarchy's size.
+        assert!(
+            check_src(
+                "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+                 class Circle : Shape {\n  int r;\n  fn area(self) -> int { return self.r; }\n}\n\
+                 fn main() {\n  Shape[] xs = [];\n  push(xs, Circle { r: 2 });\n  \
+                 print(xs[0].area());\n}\n"
+            )
+            .is_ok()
+        );
+        // A list of lists or of arrays cannot even be *written*: a type carries
+        // at most one pair of brackets.
+        assert!(check_src("fn main() {\n  int[][] xs = [];\n}\n").is_err());
     }
 
     // -- input -------------------------------------------------------------

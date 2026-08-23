@@ -9,6 +9,9 @@
 30
 1000
 1000000
+3
+Nice
+Oslo
 trois
 3
 true

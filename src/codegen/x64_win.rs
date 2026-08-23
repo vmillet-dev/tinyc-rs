@@ -165,6 +165,9 @@ const ABORT_NOT_A_NUMBER: &str = "tc$rt$not_a_number";
 /// The one routine `int(s)` and `is_int(s)` are both built on. Internal: no
 /// `Runtime` names it, because no program calls it directly.
 const PARSE_INT: &str = "tc$rt$parse_int";
+/// The same for the two pushes: this makes the room and says where it is, and
+/// they differ only in what they put there.
+const LIST_ROOM: &str = "tc$rt$list_room";
 const ABORT_REPORT: &str = "tc$rt$abort";
 
 /// One way a program can stop rather than answer wrongly.
@@ -430,6 +433,7 @@ struct Used {
     is_int: bool,
     list_new: bool,
     list_push: bool,
+    list_push_big: bool,
     list_clone: bool,
     chars_str: bool,
     read_line: bool,
@@ -454,6 +458,7 @@ impl Used {
             is_int: false,
             list_new: false,
             list_push: false,
+            list_push_big: false,
             list_clone: false,
             chars_str: false,
             read_line: false,
@@ -486,6 +491,7 @@ impl Used {
                             Runtime::IsInt => used.is_int = true,
                             Runtime::ListNew => used.list_new = true,
                             Runtime::ListPush => used.list_push = true,
+                            Runtime::ListPushBig => used.list_push_big = true,
                             Runtime::ListClone => used.list_clone = true,
                             Runtime::CharsToStr => used.chars_str = true,
                             Runtime::ReadLine => used.read_line = true,
@@ -517,6 +523,12 @@ impl Used {
         self.str_int || self.is_int
     }
 
+    /// The same for the routine both pushes are wrappers around: it makes the
+    /// room, and only what goes into it differs.
+    fn list_room(&self) -> bool {
+        self.list_push || self.list_push_big
+    }
+
     /// Whether anything cuts memory out of the arena — which is what decides
     /// whether the program calls `malloc` at all.
     fn allocates(&self) -> bool {
@@ -524,7 +536,7 @@ impl Used {
             || self.char_str
             || self.int_str
             || self.list_new
-            || self.list_push
+            || self.list_room()
             || self.list_clone
             || self.chars_str
             || self.print_str
@@ -1059,28 +1071,85 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
 /// instruction and never asks which of the two it was handed.
 ///
 /// ```text
-/// [ capacity : 8 ][ length : 8 ][ elements, 8 bytes each ]
+/// [ capacity : 8 ][ length : 8 ][ elements, `bytes` each ]
 ///                               ^ this is the value
 /// ```
+///
+/// Both counts are in *elements*, and how wide one is comes in as an argument:
+/// a list holds its elements where it is, so a list of objects holds whole
+/// objects. Every width is a multiple of eight — everything that fits in a
+/// register is eight, and an object's storage is a sum of those — which is why
+/// every copy below walks words rather than bytes.
 fn list_stubs(asm: &mut Asm, used: &Used) {
     if used.list_new {
         asm.blank();
         asm.comment("room for n elements, with the length already set");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListNew)));
-        asm.comment("rcx = how many elements -> rax = the list");
-        let frame = StubFrame::enter(asm, &["rbx", "rsi"], 40, "shadow space + alignment");
+        asm.comment("rcx = how many elements, rdx = bytes each -> rax = the list");
+        let frame = StubFrame::enter(asm, &["rbx", "rsi", "rdi"], 32, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}    ; the length"));
+        asm.asm(&format!("mov  rdi, {RDX}    ; bytes per element"));
         asm.asm(&format!("mov  rbx, {RCX}"));
         asm.comment("never less than four, so the first few pushes need no move");
         asm.asm(&format!("cmp  rbx, {LIST_MIN_CAPACITY}"));
         asm.asm("jae  .big_enough");
         asm.asm(&format!("mov  rbx, {LIST_MIN_CAPACITY}"));
         asm.line(".big_enough:");
-        asm.asm(&format!("lea  {RCX}, [rbx*8+16]    ; the two counts, then the elements"));
+        asm.asm(&format!("mov  {RCX}, rbx"));
+        asm.asm(&format!("imul {RCX}, rdi"));
+        asm.asm(&format!("add  {RCX}, 16    ; the two counts, then the elements"));
         asm.asm(&format!("call {ALLOC}"));
         asm.asm(&format!("mov  [{RAX}], rbx    ; capacity"));
         asm.asm(&format!("mov  [{RAX}+8], rsi    ; length"));
         asm.asm(&format!("add  {RAX}, 16    ; and the value is where the elements start"));
+        frame.ret(asm);
+    }
+
+    // One routine makes the room; the two pushes differ only in what they put
+    // in it. Growing is the whole of the difficulty, and it happens once.
+    if used.list_room() {
+        asm.blank();
+        asm.comment("one more element's worth of room, and where it goes");
+        asm.line(&format!("{LIST_ROOM}:"));
+        asm.comment("rcx = the list, rdx = bytes each -> rax = the list, rdx = the new slot");
+        let frame =
+            StubFrame::enter(asm, &["rbx", "rsi", "rdi", "r12"], 40, "shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm(&format!("mov  r12, {RDX}    ; bytes per element"));
+        asm.asm("mov  rbx, [rsi-8]    ; length");
+        asm.asm("mov  rdi, [rsi-16]   ; capacity");
+        asm.asm("cmp  rbx, rdi");
+        asm.asm("jb   .room");
+        asm.comment("full: twice the room, and the old block is left where it is");
+        asm.asm("lea  rdi, [rdi*2]");
+        asm.asm(&format!("mov  {RCX}, rdi"));
+        asm.asm(&format!("imul {RCX}, r12"));
+        asm.asm(&format!("add  {RCX}, 16"));
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("mov  [{RAX}], rdi"));
+        asm.asm(&format!("add  {RAX}, 16"));
+        asm.comment("the elements, as words: every width is a multiple of eight");
+        asm.asm(&format!("mov  {RCX}, rbx"));
+        asm.asm(&format!("imul {RCX}, r12"));
+        asm.asm(&format!("shr  {RCX}, 3"));
+        asm.asm(&format!("xor  {RDX}, {RDX}"));
+        asm.line(".copy:");
+        asm.asm(&format!("cmp  {RDX}, {RCX}"));
+        asm.asm("jae  .copied");
+        asm.asm(&format!("mov  r8, [rsi+{RDX}*8]"));
+        asm.asm(&format!("mov  [{RAX}+{RDX}*8], r8"));
+        asm.asm(&format!("inc  {RDX}"));
+        asm.asm("jmp  .copy");
+        asm.line(".copied:");
+        asm.asm(&format!("mov  rsi, {RAX}"));
+        asm.line(".room:");
+        asm.comment("the new element goes where the ones before it stop");
+        asm.asm(&format!("mov  {RAX}, rbx"));
+        asm.asm(&format!("imul {RAX}, r12"));
+        asm.asm(&format!("lea  {RDX}, [rsi+{RAX}]"));
+        asm.asm("inc  rbx");
+        asm.asm("mov  [rsi-8], rbx    ; the length lives with the elements");
+        asm.asm(&format!("mov  {RAX}, rsi"));
         frame.ret(asm);
     }
 
@@ -1089,36 +1158,37 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("one more element, answering where the list ended up");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListPush)));
         asm.comment("rcx = the list, rdx = the value -> rax = the list, possibly moved");
-        let frame =
+        let frame = StubFrame::enter(asm, &["rsi"], 32, "shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RDX}    ; the value, over the call"));
+        asm.asm(&format!("mov  {RDX}, 8      ; what fits in a register is eight bytes"));
+        asm.asm(&format!("call {LIST_ROOM}"));
+        asm.asm(&format!("mov  [{RDX}], rsi"));
+        frame.ret(asm);
+    }
 
-            StubFrame::enter(asm, &["rbx", "rsi", "rdi", "r12"], 40, "shadow space + alignment");
-        asm.asm(&format!("mov  rsi, {RCX}"));
-        asm.asm(&format!("mov  r12, {RDX}"));
-        asm.asm("mov  rbx, [rsi-8]    ; length");
-        asm.asm("mov  rdi, [rsi-16]   ; capacity");
-        asm.asm("cmp  rbx, rdi");
-        asm.asm("jb   .room");
-        asm.comment("full: twice the room, and the old block is left where it is");
-        asm.asm("lea  rdi, [rdi*2]");
-        asm.asm(&format!("lea  {RCX}, [rdi*8+16]"));
-        asm.asm(&format!("call {ALLOC}"));
-        asm.asm(&format!("mov  [{RAX}], rdi"));
-        asm.asm(&format!("add  {RAX}, 16"));
+    if used.list_push_big {
+        asm.blank();
+        asm.comment("the same, for an element that arrives as an address");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::ListPushBig)));
+        asm.comment("rcx = the list, rdx = where the element is, r8 = its size");
+        let frame = StubFrame::enter(asm, &["rbx", "rsi"], 40, "shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RDX}    ; where it is now"));
+        asm.asm("mov  rbx, r8       ; how much of it");
+        asm.asm(&format!("mov  {RDX}, r8"));
+        asm.asm(&format!("call {LIST_ROOM}"));
+        asm.comment("the list may have moved out from under the source, and the block it");
+        asm.comment("moved from is still there — the arena gives nothing back, so a push");
+        asm.comment("of one of the list's own elements copies what it was handed");
+        asm.asm("shr  rbx, 3");
         asm.asm(&format!("xor  {RCX}, {RCX}"));
         asm.line(".copy:");
         asm.asm(&format!("cmp  {RCX}, rbx"));
         asm.asm("jae  .copied");
-        asm.asm(&format!("mov  {RDX}, [rsi+{RCX}*8]"));
-        asm.asm(&format!("mov  [{RAX}+{RCX}*8], {RDX}"));
+        asm.asm(&format!("mov  r8, [rsi+{RCX}*8]"));
+        asm.asm(&format!("mov  [{RDX}+{RCX}*8], r8"));
         asm.asm(&format!("inc  {RCX}"));
         asm.asm("jmp  .copy");
         asm.line(".copied:");
-        asm.asm(&format!("mov  rsi, {RAX}"));
-        asm.line(".room:");
-        asm.asm("mov  [rsi+rbx*8], r12");
-        asm.asm("inc  rbx");
-        asm.asm("mov  [rsi-8], rbx    ; the length lives with the elements");
-        asm.asm(&format!("mov  {RAX}, rsi"));
         frame.ret(asm);
     }
 
@@ -1230,19 +1300,25 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.blank();
         asm.comment("a second list holding the same elements — what assigning one costs");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListClone)));
-        asm.comment("rcx = the list -> rax = a list of its own");
-        let frame = StubFrame::enter(asm, &["rbx", "rsi"], 40, "shadow space + alignment");
+        asm.comment("rcx = the list, rdx = bytes each -> rax = a list of its own");
+        let frame = StubFrame::enter(asm, &["rbx", "rsi", "rdi"], 32, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm(&format!("mov  rdi, {RDX}    ; bytes per element"));
         asm.asm("mov  rbx, [rsi-8]");
         asm.asm(&format!("mov  {RCX}, rbx"));
+        asm.asm(&format!("mov  {RDX}, rdi"));
         asm.asm(&format!("call {}", runtime_symbol(Runtime::ListNew)));
-        asm.asm(&format!("xor  {RCX}, {RCX}"));
+        asm.comment("as words, so an element wider than a register costs no more code");
+        asm.asm(&format!("mov  {RCX}, rbx"));
+        asm.asm(&format!("imul {RCX}, rdi"));
+        asm.asm(&format!("shr  {RCX}, 3"));
+        asm.asm(&format!("xor  {RDX}, {RDX}"));
         asm.line(".copy:");
-        asm.asm(&format!("cmp  {RCX}, rbx"));
+        asm.asm(&format!("cmp  {RDX}, {RCX}"));
         asm.asm("jae  .copied");
-        asm.asm(&format!("mov  {RDX}, [rsi+{RCX}*8]"));
-        asm.asm(&format!("mov  [{RAX}+{RCX}*8], {RDX}"));
-        asm.asm(&format!("inc  {RCX}"));
+        asm.asm(&format!("mov  r8, [rsi+{RDX}*8]"));
+        asm.asm(&format!("mov  [{RAX}+{RDX}*8], r8"));
+        asm.asm(&format!("inc  {RDX}"));
         asm.asm("jmp  .copy");
         asm.line(".copied:");
         frame.ret(asm);
@@ -1494,6 +1570,7 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.asm(&format!("jl   {ABORT_NO_INPUT}"));
     asm.asm(&format!("mov  rsi, {RAX}"));
     asm.asm(&format!("xor  {RCX}, {RCX}"));
+    asm.asm(&format!("mov  {RDX}, 8    ; characters are what fits in a register"));
     asm.asm(&format!("call {}", runtime_symbol(Runtime::ListNew)));
     asm.asm(&format!("mov  rbx, {RAX}"));
 

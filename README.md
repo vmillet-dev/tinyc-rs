@@ -709,21 +709,41 @@ through. Every other type either cannot be written to (a string) or is copied
 outright (an array, an object). This is what keeps "assignment copies, never
 aliases" true without exception.
 
-A list holds what fits in a register: `int`, `string`, `char`, `bool`, and any
-enum. Not an object, which would have to be copied rather than moved on every
-growth — and not another list, which would put the aliasing back by the side
-door. A field of a class cannot be a list for that second reason read the other
-way round: an object is copied outright, so the copy would share the elements
-rather than copy them. Everything that is not a list does nest in an object —
-see [Composition](#composition) — precisely because it lives *inside* the
-object rather than in the arena.
+**A list may hold objects**, and it holds them the way an array does: whole,
+inside the list itself ([`examples/lists.tc`](examples/lists.tc)).
+
+```c
+class Reading {
+  string place;
+  int degrees;
+}
+
+Reading[] readings = [];
+push(readings, Reading { place: "Oslo", degrees: -3 });
+readings[0].degrees = 40;      // an element *is* the object
+```
+
+That is what pairs the two halves of the language: a class says what a record
+is, and a list holds as many of them as the data turns out to have. It needed
+no rule of its own, because the rules a list already had cover it — growing
+copies whole elements rather than handles, so there is nothing for two lists to
+share, and assigning still copies. An element of a list of a *base* class is
+the hierarchy's size, exactly as an array's is, so a `Shape[]` may hold a
+`Circle` and the call through it still reaches `Circle`'s `area`.
+
+The one thing a list cannot hold is another list, and it cannot be *written*
+either — a type carries at most one pair of brackets. The mirror of that rule
+is that a field of a class cannot be a list: an object is copied outright, so
+the copy would share the elements rather than copy them. Everything that is not
+a list does nest in an object — see [Composition](#composition) — precisely
+because it lives *inside* the object rather than in the arena.
 
 ### What lists changed underneath
 
 **A list is laid out like a string, on purpose.**
 
 ```
-[ capacity : 8 ][ length : 8 ][ elements, 8 bytes each ]
+[ capacity : 8 ][ length : 8 ][ elements, as wide as one is ]
                               ^ this is the value
 ```
 
@@ -733,11 +753,28 @@ the only place in the compiler that reads *behind* an address it was given —
 which is exactly what lets a list stay one pointer, travel in a register, and
 still know how long it is.
 
-**Three routines, and all of them are loops.** `list_new` cuts a block from the
-arena, `list_push` appends and doubles when full, `list_clone` is what an
-assignment costs. Everything else is inline: indexing is a bounds check and a
-`lea`, `len` is a load. The rule is the same one the strings follow — a call
-only where there is a loop.
+**Both counts are in elements, and how wide one is comes in as an argument.**
+That is the whole of what holding objects took: the routines walk the elements
+rather than reading one, so they cannot work the width out for themselves, and
+the compiler — which knows it from the type — tells them. Every width is a
+multiple of eight, so every copy in them moves words rather than bytes.
+
+**Four routines, and all of them are loops.** `list_new` cuts a block from the
+arena, `list_room` makes room for one more and doubles when full, `list_clone`
+is what an assignment costs. The fourth is the *second* push: `list_push` puts a
+register in the room `list_room` made, and `list_push_big` copies into it from
+an address, because an element too big for a register cannot arrive in one. The
+compiler picks between them from the element's type rather than the runtime
+guessing from a width — an object of one word is exactly as wide as an `int`,
+and only the type says which it is. Everything else is inline: indexing is a
+bounds check and a `lea`, `len` is a load. The rule is the same one the strings
+follow — a call only where there is a loop.
+
+**The arena is what makes `push(xs, xs[0])` mean what it says.** The push may
+move the list, and the element it is copying *from* then lives in the block that
+was left behind — which is still there, because nothing here is ever reclaimed.
+The same property that removed lifetimes from the language removes a special
+case from the runtime.
 
 **Growing abandons the old block**, like everything else on this arena. Doubling
 is what keeps that honest: n pushes copy 2n elements in total and leave n behind,

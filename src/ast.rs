@@ -1416,8 +1416,7 @@ mod tests {
         assert_eq!(table.size_of(Ty::Class(circle)), 24);
         assert_eq!(table.class(circle).size, 16);
 
-        // Everything that fits in a register is eight, which is what makes a
-        // field's offset its position.
+        // Everything that fits in a register is eight, whichever of them it is.
         for ty in [Ty::Int, Ty::Str, Ty::Char, Ty::Bool, Ty::Enum(EnumId(0))] {
             assert_eq!(table.size_of(ty), 8, "{ty:?}");
         }

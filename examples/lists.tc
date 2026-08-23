@@ -39,6 +39,27 @@ fn double_each(int[] xs) {
   }
 }
 
+// A list may hold objects, and it holds them the way an array does: whole, and
+// inside the list itself. So growing copies elements rather than handles, and
+// there is nothing for two lists to share — which is why this needs no rule of
+// its own beyond the ones a list already had.
+class Reading {
+  string place;
+  int degrees;
+}
+
+fn warmest(Reading[] rs) -> string {
+  string best = rs[0].place;
+  int high = rs[0].degrees;
+  for (int i = 1; i < len(rs); i = i + 1) {
+    if (rs[i].degrees > high) {
+      high = rs[i].degrees;
+      best = rs[i].place;
+    }
+  }
+  return best;
+}
+
 // Building a string a character at a time. This is what a list is *for*: the
 // characters accumulate in one place that grows, and become a string once, at
 // the end. Writing `out = out + string(c)` instead would build a whole new
@@ -89,6 +110,20 @@ fn main() {
   int[] big = squares(1000);
   print(len(big));           // 1000
   print(big[999]);           // 1000000
+
+  // As many objects as the data turns out to need — the thing neither an
+  // array nor a list could do on its own before.
+  Reading[] readings = [];
+  push(readings, Reading { place: "Oslo", degrees: -3 });
+  push(readings, Reading { place: "Nice", degrees: 21 });
+  push(readings, Reading { place: "Lima", degrees: 18 });
+  print(len(readings));      // 3
+  print(warmest(readings));  // Nice
+
+  // An element is the object itself, so writing through one is writing into
+  // the list.
+  readings[0].degrees = 40;
+  print(warmest(readings));  // Oslo
 
   // Lists of the other things that fit in a register.
   string[] words = ["un", "deux"];

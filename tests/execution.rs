@@ -236,6 +236,91 @@ fn lists_grow_and_stay_their_owners() {
     harness.each_prints_after("list", prelude, &cases);
 }
 
+/// A list holds its elements *whole*, which is what lets one hold objects.
+///
+/// Everything here would still compile if a list held addresses instead, and
+/// nearly everything would still print the right number — until the list moved.
+/// So the cases that matter are the ones that grow past a block: an element
+/// read after the move, and an element pushed *from* the block being left.
+#[test]
+fn lists_hold_objects_whole() {
+    let Some(harness) = Harness::find() else { return };
+
+    let prelude = "class Point {\n  int x;\n  int y;\n}\n\
+                   class Pair {\n  Point a;\n  Point b;\n}\n\
+                   class Named {\n  string name;\n  int n;\n}\n\
+                   class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+                   class Circle : Shape {\n  int r;\n  \
+                   fn area(self) -> int { return 3 * self.r * self.r; }\n}\n\
+                   class Rect : Shape {\n  int w;\n  int h;\n  \
+                   fn area(self) -> int { return self.w * self.h; }\n}\n\
+                   fn built(int n) -> Point[] {\n  Point[] ps = [];\n  \
+                   for (int i = 0; i < n; i = i + 1) {\n    \
+                   push(ps, Point { x: i, y: i * 2 });\n  }\n  return ps;\n}\n\
+                   fn total(Shape[] ss) -> int {\n  int sum = 0;\n  \
+                   for (int i = 0; i < len(ss); i = i + 1) {\n    \
+                   sum = sum + ss[i].area();\n  }\n  return sum;\n}\n\
+                   fn bump(Point[] ps) {\n  ps[0].x = ps[0].x + 1;\n}\n";
+
+    let cases: [(&str, &str); 10] = [
+        // An element that is itself composed: the list moves whole objects,
+        // whatever they are made of, and copying the list copies all of it.
+        (
+            "Pair[] ps = [];\n\
+             for (int i = 0; i < 30; i = i + 1) {\n  \
+             push(ps, Pair { a: Point { x: i, y: 0 }, b: Point { x: i * 10, y: 1 } });\n}\n\
+             Pair[] kept = ps;\nps[0].a.x = 999;\nprint(ps[29].b.x + kept[0].a.x);",
+            "290",
+        ),
+        // Built by pushing, handed back, and read at both ends: an element is
+        // two fields wide, so an address that still counted registers would
+        // land in the middle of one.
+        ("Point[] ps = built(10);\nprint(ps[9].x + ps[9].y);", "27"),
+        ("Point[] ps = built(1);\nprint(len(ps) + ps[0].y);", "1"),
+        ("Point[] ps = [];\nprint(len(ps));", "0"),
+        // A hundred of them is several moves, and every element has to arrive.
+        (
+            "Point[] ps = built(100);\nint sum = 0;\n\
+             for (int i = 0; i < len(ps); i = i + 1) {\n  sum = sum + ps[i].x;\n}\nprint(sum);",
+            "4950",
+        ),
+        // Writing through an element writes into the list, and a parameter is
+        // still the caller's own.
+        ("Point[] ps = built(3);\nps[1].x = 50;\nprint(ps[1].x + ps[2].x);", "52"),
+        ("Point[] ps = built(3);\nbump(ps);\nprint(ps[0].x);", "1"),
+        // Assignment copies the elements, so writing through one is invisible
+        // through the other.
+        ("Point[] a = built(3);\nPoint[] b = a;\na[0].x = 9;\nprint(b[0].x + len(b));", "3"),
+        // Pushing one of the list's own elements: the block it is read from is
+        // the one being left behind, and the arena never takes it back.
+        (
+            "Point[] rs = [Point { x: 7, y: 8 }];\n\
+             for (int i = 0; i < 6; i = i + 1) {\n  push(rs, rs[0]);\n}\n\
+             print(rs[6].x + rs[6].y + len(rs));",
+            "22",
+        ),
+        // A list of a base class: every slot is the hierarchy's size, and the
+        // vtable pointer travels with the copy into it.
+        (
+            "Shape[] ss = [Circle { r: 1 }, Rect { w: 2, h: 3 }];\n\
+             push(ss, Circle { r: 2 });\nprint(total(ss));",
+            "21",
+        ),
+    ];
+
+    harness.each_prints_after("objlist", prelude, &cases);
+
+    // A string inside an element is one pointer among the object's bytes, and
+    // it has to survive every move the list makes.
+    let cases: [(&str, &str); 1] = [(
+        "Named[] ns = [];\nfor (int i = 0; i < 20; i = i + 1) {\n  \
+         push(ns, Named { name: \"n\" + string(i), n: i });\n}\n\
+         print(ns[19].name + \" \" + string(ns[19].n));",
+        "n19 19",
+    )];
+    harness.each_prints_after("objliststr", prelude, &cases);
+}
+
 /// Reading input, which is the one thing that cannot be checked by looking at
 /// the program alone: what it does depends on what it is given.
 #[test]

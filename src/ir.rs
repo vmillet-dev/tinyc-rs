@@ -115,9 +115,9 @@ pub enum Instr {
     /// indexing one always costs the check.
     ///
     /// `scale` is eight for everything that fits in a register, four for the
-    /// characters of a string, and the object's room for an array of them —
-    /// which is the one case where the address is not a single `lea`, because
-    /// x86 scales by 1, 2, 4 or 8 and nothing else.
+    /// characters of a string, and the object's room for an array or a list
+    /// of them — which is the one case where the address is not a single
+    /// `lea`, because x86 scales by 1, 2, 4 or 8 and nothing else.
     Elem { dst: VReg, base: Value, index: Value, len: Value, scale: u32 },
     /// `dst = len(of)`: the count that a string or a list carries in the eight
     /// bytes in front of its elements.
@@ -198,13 +198,23 @@ pub enum Runtime {
     CharToStr,
     /// `(n) -> string`: the number written out in decimal.
     IntToStr,
-    /// `(n) -> list`: room for `n` elements, with the length already set —
-    /// what a list literal fills in.
+    /// `(n, bytes) -> list`: room for `n` elements of `bytes` each, with the
+    /// length already set — what a list literal fills in.
+    ///
+    /// The width is an argument because an element is not always a register:
+    /// a list holds its elements where it is, so one holding objects holds
+    /// whole objects.
     ListNew,
     /// `(list, value) -> list`: one more element on the end, **answering where
     /// the list now is**. Growing copies the elements into a larger block, so
     /// the address may change and the caller has to be told.
     ListPush,
+    /// `(list, from, bytes) -> list`: the same push for an element too big for
+    /// a register, which therefore arrives as an *address* and is copied in.
+    ///
+    /// Both go through one routine that makes the room; only what is written
+    /// into it differs — a store there, a copy here.
+    ListPushBig,
     /// `(s) -> int`: the number a string spells, refusing anything else.
     StrToInt,
     /// `(s) -> bool`: whether [`Runtime::StrToInt`] would answer rather than
@@ -223,8 +233,8 @@ pub enum Runtime {
     /// The way to build a string a character at a time without paying for a
     /// whole new string on each one.
     CharsToStr,
-    /// `(list) -> list`: a new list holding the same elements. What makes
-    /// assigning a list a copy rather than a second name for one.
+    /// `(list, bytes) -> list`: a new list holding the same elements. What
+    /// makes assigning a list a copy rather than a second name for one.
     ListClone,
 }
 
@@ -239,6 +249,7 @@ impl Runtime {
             Runtime::IntToStr => "int_str",
             Runtime::ListNew => "list_new",
             Runtime::ListPush => "list_push",
+            Runtime::ListPushBig => "list_push_big",
             Runtime::ListClone => "list_clone",
             Runtime::CharsToStr => "chars_str",
             Runtime::StrToInt => "str_int",
@@ -1125,26 +1136,34 @@ impl Lowering<'_> {
             // to land back where the list is named — which is the whole reason
             // `push` takes a place rather than a value.
             Stmt::Push { target, value, .. } => {
+                let (elem, bytes) = self.element_of(self.place_type(target));
                 let value = self.expr(value);
+                // An element too big for a register arrives as its address, and
+                // what the routine does with it is a copy. The list may move
+                // out from under that copy, and the block it moved *from* is
+                // still there to read — the arena never gives anything back,
+                // which is what makes `push(xs, xs[0])` mean what it says.
+                let (callee, mut rest) = match elem.fits_in_a_register() {
+                    true => (Runtime::ListPush, vec![value]),
+                    false => {
+                        (Runtime::ListPushBig, vec![value, Value::Const(i64::from(bytes))])
+                    }
+                };
                 match target {
                     Place::Var { name, .. } => {
                         let (dst, _) = self.binding(name);
-                        self.emit(Instr::RtCall {
-                            dst: Some(dst),
-                            callee: Runtime::ListPush,
-                            args: vec![Value::Reg(dst), value],
-                        });
+                        let mut args = vec![Value::Reg(dst)];
+                        args.append(&mut rest);
+                        self.emit(Instr::RtCall { dst: Some(dst), callee, args });
                     }
                     target => {
                         let addr = self.place_address(target);
                         let held = self.fresh_temp();
                         self.emit(Instr::Load { dst: held, addr: Value::Reg(addr) });
                         let grown = self.fresh_temp();
-                        self.emit(Instr::RtCall {
-                            dst: Some(grown),
-                            callee: Runtime::ListPush,
-                            args: vec![Value::Reg(held), value],
-                        });
+                        let mut args = vec![Value::Reg(held)];
+                        args.append(&mut rest);
+                        self.emit(Instr::RtCall { dst: Some(grown), callee, args });
                         self.emit(Instr::Store {
                             addr: Value::Reg(addr),
                             value: Value::Reg(grown),
@@ -1466,11 +1485,27 @@ impl Lowering<'_> {
                 (Value::Const(i64::from(info.len)), self.table.size_of(info.elem))
             }
             Ty::Str => (self.length_of(base), CHAR_BYTES),
-            // A list holds only what fits in a register, so its elements are
-            // eight bytes each and the address is always a single `lea`.
-            Ty::List(_) => (self.length_of(base), 8),
+            // A list holds its elements where it is, so one of objects scales
+            // by the whole object — the same arithmetic an array of them does,
+            // with a length that has to be read rather than known.
+            Ty::List(_) => {
+                let (_, bytes) = self.element_of(ty);
+                (self.length_of(base), bytes)
+            }
             _ => unreachable!("sema rejects indexing anything without elements"),
         }
+    }
+
+    /// What one element of this list type is, and how many bytes it takes.
+    ///
+    /// The second half is what the routines have to be told: they walk the
+    /// elements rather than reading one, so they cannot work it out.
+    fn element_of(&self, list: Ty) -> (Ty, u32) {
+        let Ty::List(id) = list else {
+            unreachable!("sema rejects a list operation on anything but a list");
+        };
+        let elem = self.table.element(id);
+        (elem, self.table.size_of(elem))
     }
 
     /// The count in front of a string's characters or a list's elements.
@@ -1495,11 +1530,13 @@ impl Lowering<'_> {
     /// call site: it cloned at its own `return`, if it had anything to clone.
     fn keep_into(&mut self, dst: VReg, expr: &Expr) {
         self.expr_into(dst, expr);
-        if matches!(self.types.of(expr.id), Ty::List(_)) && !builds_its_own(expr) {
+        let ty = self.types.of(expr.id);
+        if matches!(ty, Ty::List(_)) && !builds_its_own(expr) {
+            let (_, bytes) = self.element_of(ty);
             self.emit(Instr::RtCall {
                 dst: Some(dst),
                 callee: Runtime::ListClone,
-                args: vec![Value::Reg(dst)],
+                args: vec![Value::Reg(dst), Value::Const(i64::from(bytes))],
             });
         }
     }
@@ -1665,7 +1702,10 @@ impl Lowering<'_> {
             Place::Var { name, .. } => self.lookup_type(name),
             Place::Element { base, .. } => match self.place_type(base) {
                 Ty::Array(id) => self.table.array(id).elem,
-                _ => unreachable!("sema rejects indexing anything but an array"),
+                // Reached once a list can hold objects: `xs[i].f` asks what
+                // `xs[i]` is before it can ask where its field is.
+                Ty::List(id) => self.table.element(id),
+                _ => unreachable!("sema rejects indexing anything but an array or a list"),
             },
             Place::Field { base, name, .. } => match self.place_type(base) {
                 Ty::Class(id) => {
@@ -1805,11 +1845,12 @@ impl Lowering<'_> {
             // in the arena, because how many there will be by the end is not a
             // question this function can answer.
             ExprKind::Array { elements, .. } if matches!(self.types.of(expr.id), Ty::List(_)) => {
+                let (_, bytes) = self.element_of(self.types.of(expr.id));
                 let len = Value::Const(elements.len() as i64);
                 self.emit(Instr::RtCall {
                     dst: Some(dst),
                     callee: Runtime::ListNew,
-                    args: vec![len],
+                    args: vec![len, Value::Const(i64::from(bytes))],
                 });
                 for (index, element) in elements.iter().enumerate() {
                     let addr = self.fresh_temp();
@@ -1818,7 +1859,7 @@ impl Lowering<'_> {
                         base: Value::Reg(dst),
                         index: Value::Const(index as i64),
                         len,
-                        scale: 8,
+                        scale: bytes,
                     });
                     self.write_through(Value::Reg(addr), element);
                 }
@@ -3375,6 +3416,50 @@ mod tests {
         // The list's own register is both what goes in and what comes back.
         let Instr::RtCall { dst: Some(dst), args, .. } = pushes[0] else { panic!("a push") };
         assert_eq!(args[0], Value::Reg(*dst), "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_list_of_objects_is_measured_in_whole_objects() {
+        // The routines walk the elements rather than reading one, so how wide
+        // an element is has to travel with every call — and the addressing has
+        // to scale by the same number.
+        let ir = lower_src(
+            "class Point {\n  int x;\n  int y;\n}\n\
+             fn main() {\n  Point[] ps = [Point { x: 1, y: 2 }];\n  print(ps[0].x);\n}\n",
+        );
+        // A vtable pointer and two fields.
+        let width = Value::Const(24);
+        let new = instrs(&ir)
+            .into_iter()
+            .find(|i| matches!(i, Instr::RtCall { callee: Runtime::ListNew, .. }))
+            .expect("the literal builds one");
+        let Instr::RtCall { args, .. } = new else { panic!("a call") };
+        assert_eq!(args[1], width, "{}", ir.dump());
+        assert!(
+            instrs(&ir).iter().any(|i| matches!(i, Instr::Elem { scale: 24, .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    #[test]
+    fn pushing_an_object_hands_over_where_it_is() {
+        // An element too big for a register cannot travel in one, so the push
+        // that takes an address is a different routine — the compiler knows
+        // which from the element's type, and the runtime is not left to guess
+        // from a width that an object of one word would make ambiguous.
+        let ir = lower_src(
+            "class Point {\n  int x;\n}\n\
+             fn main() {\n  Point[] ps = [];\n  push(ps, Point { x: 1 });\n  \
+             print(len(ps));\n}\n",
+        );
+        assert!(routines(&ir).contains(&Runtime::ListPushBig), "{}", ir.dump());
+        assert!(!routines(&ir).contains(&Runtime::ListPush), "{}", ir.dump());
+
+        // A register-sized element still goes through the plain one.
+        let ir = lower_main("int[] xs = [];\npush(xs, 1);\nprint(len(xs));");
+        assert!(routines(&ir).contains(&Runtime::ListPush), "{}", ir.dump());
+        assert!(!routines(&ir).contains(&Runtime::ListPushBig), "{}", ir.dump());
     }
 
     #[test]
