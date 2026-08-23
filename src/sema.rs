@@ -22,7 +22,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
-    ArmBody, ArrayId, ArrayInfo, BinOp, Block, ClassId, ClassInfo, EnumId, EnumInfo, Expr,
+    ArmBody, ArrayId, ArrayInfo, BinOp, Block, Builtin, ClassId, ClassInfo, EnumId, EnumInfo, Expr,
     ListId, Shape,
     ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Prim, Program,
     Stmt, Ty, TypeRef, TypeTable, is_scalar_value,
@@ -549,8 +549,8 @@ struct Binding {
 ///
 /// It is a short list on purpose: nothing converts on its own, so this is also
 /// the complete answer to "how do I turn this into that".
-const CONVERSIONS: &str = "the conversions are `int(c)`, `char(n)`, `string(c)`, `string(n)`, \
-                           and `string(cs)` for a `char[]`";
+const CONVERSIONS: &str = "the conversions are `int(c)`, `int(s)`, `char(n)`, `string(c)`, \
+                           `string(n)`, and `string(cs)` for a `char[]`";
 
 /// Why a particular number is not a character, which is a different sentence
 /// depending on where it lands.
@@ -585,8 +585,18 @@ struct Signature {
     params: Vec<Ty>,
     /// `None` for a function that returns nothing.
     ret: Option<Ty>,
-    /// Where the function was declared, for "defined here" notes.
-    name_span: Span,
+    /// Where the function was declared, for "defined here" notes — and `None`
+    /// for a built-in, which was declared nowhere the program can be shown.
+    name_span: Option<Span>,
+}
+
+/// The note that says where a callee came from, which is a different sentence
+/// for a function the program wrote and one it was given.
+fn came_from(name: &str, at: Option<Span>) -> (String, Option<Span>) {
+    match at {
+        Some(at) => (format!("`{name}` is defined here"), Some(at)),
+        None => (format!("`{name}` is built in"), None),
+    }
 }
 
 /// Type check a program.
@@ -663,9 +673,44 @@ fn collect_signatures(
     method_signatures: &mut HashMap<usize, Signature>,
     errors: &mut Vec<Diagnostic>,
 ) -> HashMap<String, Signature> {
-    let mut signatures: HashMap<String, Signature> = HashMap::new();
+    // The built-ins are in the table before the program's own functions are,
+    // so a call reaches them through exactly the machinery a declared function
+    // uses — and so a program that declares one of their names collides with
+    // something already there rather than quietly winning.
+    let mut signatures: HashMap<String, Signature> = Builtin::ALL
+        .into_iter()
+        .map(|builtin| {
+            let signature = Signature {
+                params: builtin.params().to_vec(),
+                ret: builtin.ret(),
+                name_span: None,
+            };
+            (builtin.name().to_string(), signature)
+        })
+        .collect();
 
     for (at, function) in program.functions.iter().enumerate() {
+        if declared.method_of.get(&at).is_none()
+            && let Some(builtin) = Builtin::from_name(&function.name)
+        {
+            errors.push(
+                Diagnostic::new(
+                    format!("`{}` is built in and cannot be redefined", function.name),
+                    function.name_span,
+                )
+                .with_label("this name already belongs to the language")
+                .with_note(
+                    format!(
+                        "the built-in functions are {}",
+                        list(&Builtin::ALL.map(|b| b.name()))
+                    ),
+                    None,
+                ),
+            );
+            let _ = builtin;
+            continue;
+        }
+
         // A function returning an aggregate spends one register on the hidden
         // address the caller hands in, so it has one fewer to give parameters.
         let returns_aggregate = function.ret.as_ref().is_some_and(|ty| {
@@ -716,7 +761,7 @@ fn collect_signatures(
                     function.name_span,
                 )
                 .with_label("defined a second time here")
-                .with_note("previous definition", Some(previous)),
+                .with_note("previous definition", previous),
             );
             continue;
         }
@@ -763,7 +808,7 @@ fn collect_signatures(
             .as_ref()
             .map(|ty| resolve_type(declared, ty, errors).unwrap_or(Ty::Int));
 
-        let signature = Signature { params, ret, name_span: function.name_span };
+        let signature = Signature { params, ret, name_span: Some(function.name_span) };
         match owner {
             Some(_) => method_signatures.insert(at, signature),
             None => signatures.insert(function.name.clone(), signature),
@@ -1890,6 +1935,10 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             // A character's code point, and the character with that code point.
             // Two directions, spelled apart, so neither can happen by accident.
             (Ty::Char, Ty::Int) => {}
+            // Text back into a number, which is what a line of input is for.
+            // Nothing is guessed: an optional `-`, then digits, and the program
+            // stops on anything else rather than settling for a zero.
+            (Ty::Str, Ty::Int) => {}
             // Into a string: a character on its own, or a number written out in
             // decimal. Both exist because `+` converts nothing, so a message
             // with a value in it has to say where the value became text.
@@ -2252,7 +2301,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     expr.span,
                 )
                 .with_label(format!("expected {} here", plural(params.len(), "argument")))
-                .with_note(format!("`{name}` is defined here"), Some(declared_at)),
+                .with_note(came_from(name, declared_at).0, declared_at),
             );
         } else {
             for ((expected, found), arg) in params.iter().zip(&actual).zip(args) {
@@ -2271,7 +2320,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                             self.ty_name(*expected),
                             self.ty_name(*found)
                         ))
-                        .with_note(format!("`{name}` is defined here"), Some(declared_at)),
+                        .with_note(came_from(name, declared_at).0, declared_at),
                     );
                 }
             }
@@ -2281,7 +2330,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             self.error(
                 Diagnostic::new(format!("`{name}` returns nothing"), expr.span)
                     .with_label("so this call produces no value to use")
-                    .with_note(format!("`{name}` is defined here"), Some(declared_at)),
+                    .with_note(came_from(name, declared_at).0, declared_at),
             );
         }
         ret
@@ -2842,6 +2891,43 @@ mod tests {
             check_src("class Shape {\n  int n;\n}\nfn main() {\n  Shape[] xs = [];\n}\n")
                 .expect_err("a list of objects is refused");
         assert!(errors[0].message.contains("a list cannot hold"), "{}", errors[0].message);
+    }
+
+    // -- input -------------------------------------------------------------
+
+    #[test]
+    fn the_builtins_are_called_like_any_other_function() {
+        assert!(check_main("string s = read_line();\nprint(s);").is_ok());
+        assert!(check_main("while (!eof()) {\n  print(read_line());\n}").is_ok());
+        // `read_line();` on its own throws the line away, which is a way to
+        // skip one — a call statement is allowed to discard a value.
+        assert!(check_main("read_line();").is_ok());
+    }
+
+    #[test]
+    fn a_builtin_checks_its_arguments_like_any_other_function() {
+        let errors = errors_in_main("print(read_line(1));");
+        assert!(errors[0].message.contains("takes 0 arguments"), "{}", errors[0].message);
+        assert!(errors[0].note.as_ref().is_some_and(|(text, at)| {
+            // A built-in was declared nowhere the program can be shown.
+            text.contains("built in") && at.is_none()
+        }));
+
+        let errors = errors_in_main("int n = eof();");
+        assert!(errors[0].message.contains("with a `bool` value"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_program_cannot_take_a_builtins_name() {
+        let errors = check_src("fn eof() -> bool {\n  return true;\n}\nfn main() {\n}\n")
+            .expect_err("`eof` is taken");
+        assert!(errors[0].message.contains("is built in"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn text_converts_back_into_a_number() {
+        assert!(check_main("print(int(read_line()));").is_ok());
+        assert!(check_main("print(int(\"42\"));").is_ok());
     }
 
     #[test]

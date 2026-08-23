@@ -401,6 +401,57 @@ impl Prim {
     }
 }
 
+/// A function the compiler provides rather than the program declaring.
+///
+/// Unlike `len` and `push`, which are *constructs* because no signature could
+/// describe them — one takes several unrelated types, the other takes a place
+/// rather than a value — these two have signatures a TinyC program could have
+/// written itself. So they are not syntax: they are names already in the table
+/// when the first line is checked, called through the ordinary machinery, and
+/// differing from a declared function only in having no body to compile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Builtin {
+    /// `read_line() -> string` — one line of input, without its line ending.
+    ///
+    /// Stops the program when there is no line left, which is why [`Self::Eof`]
+    /// exists: asking for something that is not there is a mistake, and there
+    /// has to be a way to find out first.
+    ReadLine,
+    /// `eof() -> bool` — whether the input has run out.
+    ///
+    /// Answers *before* consuming anything, so `while (!eof())` reads every
+    /// line and asks for none that is not there.
+    Eof,
+}
+
+impl Builtin {
+    pub const ALL: [Builtin; 2] = [Builtin::ReadLine, Builtin::Eof];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Builtin::ReadLine => "read_line",
+            Builtin::Eof => "eof",
+        }
+    }
+
+    /// What it takes. Neither takes anything yet, and the array is here so that
+    /// one that does needs no new machinery.
+    pub fn params(self) -> &'static [Ty] {
+        &[]
+    }
+
+    pub fn ret(self) -> Option<Ty> {
+        match self {
+            Builtin::ReadLine => Some(Ty::Str),
+            Builtin::Eof => Some(Ty::Bool),
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Builtin> {
+        Builtin::ALL.into_iter().find(|b| b.name() == name)
+    }
+}
+
 /// Index of an expression node, used by [`crate::sema`] to record its type
 /// without mutating the tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

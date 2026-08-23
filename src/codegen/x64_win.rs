@@ -117,14 +117,38 @@ const RUNTIME_PREFIX: &str = "tc$rt$";
 /// Each is a label the failing instruction jumps to, paired with the text it
 /// reports. They are kept together so that adding a way to fail means adding
 /// one row rather than touching four places.
-const ABORTS: [Abort; 6] = [
+const ABORTS: [Abort; 10] = [
     Abort::new(ABORT_DIV_ZERO, "division by zero"),
     Abort::new(ABORT_DIV_OVERFLOW, "division overflows an int"),
     Abort::new(ABORT_OVERFLOW, "arithmetic overflows an int"),
     Abort::new(ABORT_BOUNDS, "index out of bounds"),
     Abort::new(ABORT_OOM, "out of memory"),
     Abort::new(ABORT_BAD_CHAR, "this number is not a character"),
+    Abort::new(ABORT_NO_INPUT, "there is no more input to read"),
+    Abort::new(ABORT_BAD_UTF8, "the input is not valid UTF-8"),
+    Abort::new(ABORT_INPUT_FAILED, "the input could not be read"),
+    Abort::new(ABORT_NOT_A_NUMBER, "this text is not a number an int can hold"),
 ];
+
+/// Where a line of input is read into before it is picked apart.
+///
+/// The compiler does its own buffering rather than going through a `FILE*`,
+/// which keeps it to one import and makes [`Runtime::Eof`] answerable without
+/// pushing a character back: "is there more" is a question about this buffer.
+const INPUT: &str = "tc$rt$input";
+const INPUT_POS: &str = "tc$rt$input_pos";
+const INPUT_LEN: &str = "tc$rt$input_len";
+const INPUT_BYTES: u32 = 4096;
+/// Whether a byte is waiting, refilling the buffer if it has run dry.
+const READY: &str = "tc$rt$ready";
+const NEXT_BYTE: &str = "tc$rt$next_byte";
+/// Reads one character's worth of UTF-8, which is where the outside world's
+/// encoding becomes the language's.
+const UTF8_DECODE: &str = "tc$rt$utf8_decode";
+
+/// The code page that makes a Windows console *hand over* what is typed into it
+/// as UTF-8, which is [`UTF8_CODE_PAGE`]'s counterpart for input.
+const CONSOLE_INPUT_CP: &str = "SetConsoleCP";
 
 const ABORT_DIV_ZERO: &str = "tc$rt$div_by_zero";
 const ABORT_DIV_OVERFLOW: &str = "tc$rt$div_overflow";
@@ -132,6 +156,10 @@ const ABORT_OVERFLOW: &str = "tc$rt$overflow";
 const ABORT_BOUNDS: &str = "tc$rt$bounds";
 const ABORT_OOM: &str = "tc$rt$out_of_memory";
 const ABORT_BAD_CHAR: &str = "tc$rt$bad_char";
+const ABORT_NO_INPUT: &str = "tc$rt$no_input";
+const ABORT_BAD_UTF8: &str = "tc$rt$bad_utf8";
+const ABORT_INPUT_FAILED: &str = "tc$rt$input_failed";
+const ABORT_NOT_A_NUMBER: &str = "tc$rt$not_a_number";
 const ABORT_REPORT: &str = "tc$rt$abort";
 
 /// One way a program can stop rather than answer wrongly.
@@ -363,6 +391,9 @@ impl Backend for X64Windows {
         if used.writes_text() {
             text_stubs(&mut asm, &used);
         }
+        if used.reads_text() {
+            input_stubs(&mut asm, &used);
+        }
         if used.aborts {
             abort_stubs(&mut asm);
         }
@@ -390,10 +421,13 @@ struct Used {
     check_char: bool,
     char_str: bool,
     int_str: bool,
+    str_int: bool,
     list_new: bool,
     list_push: bool,
     list_clone: bool,
     chars_str: bool,
+    read_line: bool,
+    eof: bool,
     print_str: bool,
     print_char: bool,
 }
@@ -410,10 +444,13 @@ impl Used {
             check_char: false,
             char_str: false,
             int_str: false,
+            str_int: false,
             list_new: false,
             list_push: false,
             list_clone: false,
             chars_str: false,
+            read_line: false,
+            eof: false,
             print_str: false,
             print_char: false,
         };
@@ -438,19 +475,25 @@ impl Used {
                             Runtime::CheckChar => used.check_char = true,
                             Runtime::CharToStr => used.char_str = true,
                             Runtime::IntToStr => used.int_str = true,
+                            Runtime::StrToInt => used.str_int = true,
                             Runtime::ListNew => used.list_new = true,
                             Runtime::ListPush => used.list_push = true,
                             Runtime::ListClone => used.list_clone = true,
                             Runtime::CharsToStr => used.chars_str = true,
+                            Runtime::ReadLine => used.read_line = true,
+                            Runtime::Eof => used.eof = true,
                         }
                     }
                 }
             }
         }
-        // Two routines are reached without any instruction naming them: a
-        // `print` encodes into a buffer cut from the arena, and cloning a list
-        // builds the new one with `list_new`.
-        used.list_new |= used.list_clone;
+        // Some routines are reached without any instruction naming them: a
+        // `print` encodes into a buffer cut from the arena, cloning a list
+        // builds the new one with `list_new`, and reading a line accumulates
+        // its characters in a list before sealing it into a string.
+        used.list_new |= used.list_clone | used.read_line;
+        used.list_push |= used.read_line;
+        used.chars_str |= used.read_line;
         // Asking the arena for memory is a way to fail like any other.
         used.aborts |= used.allocates();
         used
@@ -475,6 +518,12 @@ impl Used {
 
     /// Whether any character is ever written out, and so whether the encoder
     /// and the console's code page are needed.
+    /// Whether anything is read from the input, and so whether the buffer and
+    /// the decoder are needed.
+    fn reads_text(&self) -> bool {
+        self.read_line || self.eof
+    }
+
     fn writes_text(&self) -> bool {
         self.print_str || self.print_char
     }
@@ -571,6 +620,12 @@ fn header(asm: &mut Asm, target: &str, used: &Used) {
     if used.writes_text() {
         asm.line("extern SetConsoleOutputCP");
     }
+    if used.reads_text() {
+        // The input is buffered here rather than through a `FILE*`, so what is
+        // needed is the low-level read and nothing else.
+        asm.line("extern _read");
+        asm.line(&format!("extern {CONSOLE_INPUT_CP}"));
+    }
     asm.line(&format!("global {ENTRY_POINT}"));
     asm.blank();
 }
@@ -656,7 +711,7 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
     // Uninitialised, so the arena's bookkeeping costs nothing in the file: a
     // next pointer and an end pointer that start equal at zero, which is what
     // sends the very first allocation to ask for a chunk.
-    if used.allocates() || used.print_str {
+    if used.allocates() || used.print_str || used.reads_text() {
         asm.line("section .bss");
         if used.allocates() {
             asm.asm(&format!("{ARENA_NEXT}: resq 1"));
@@ -665,6 +720,13 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
         if used.print_str {
             asm.asm(&format!("{SCRATCH}: resq 1"));
             asm.asm(&format!("{SCRATCH_CAP}: resq 1"));
+        }
+        // The input buffer, and how much of it has been read. Both start at
+        // zero, which is what sends the first question to the operating system.
+        if used.reads_text() {
+            asm.asm(&format!("{INPUT}: resb {INPUT_BYTES}"));
+            asm.asm(&format!("{INPUT_POS}: resq 1"));
+            asm.asm(&format!("{INPUT_LEN}: resq 1"));
         }
         asm.blank();
     }
@@ -1029,6 +1091,60 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.asm("ret");
     }
 
+    if used.str_int {
+        asm.blank();
+        asm.comment("int(s): the number a string spells, and nothing else will do");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::StrToInt)));
+        asm.comment("rcx = the text -> rax = the number");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("push rdi");
+        asm.asm("push r12");
+        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm("mov  rbx, [rsi-8]    ; how many characters");
+        asm.asm("xor  rdi, rdi        ; where we are");
+        asm.asm("xor  r12, r12        ; was there a minus?");
+        asm.asm("test rbx, rbx");
+        asm.asm(&format!("jz   {ABORT_NOT_A_NUMBER}    ; the empty string spells nothing"));
+        asm.asm(&format!("mov  eax, [rsi]"));
+        asm.asm("cmp  eax, 45    ; '-'");
+        asm.asm("jne  .digits");
+        asm.asm("mov  r12, 1");
+        asm.asm("inc  rdi");
+        asm.asm("cmp  rdi, rbx");
+        asm.asm(&format!("jae  {ABORT_NOT_A_NUMBER}    ; a minus on its own"));
+        asm.line(".digits:");
+        asm.comment("built on the negative side, so the most negative int needs no special case");
+        asm.asm(&format!("xor  {RAX}, {RAX}"));
+        asm.line(".next:");
+        asm.asm("cmp  rdi, rbx");
+        asm.asm("jae  .complete");
+        asm.asm(&format!("mov  ecx, [rsi+rdi*4]"));
+        asm.asm(&format!("sub  ecx, 48    ; '0'"));
+        asm.asm("cmp  ecx, 9");
+        asm.asm(&format!("ja   {ABORT_NOT_A_NUMBER}    ; unsigned, so it catches both ends"));
+        asm.asm(&format!("imul {RAX}, {RAX}, 10"));
+        asm.asm(&format!("jo   {ABORT_NOT_A_NUMBER}"));
+        asm.asm(&format!("movsxd {RDX}, ecx"));
+        asm.asm(&format!("sub  {RAX}, {RDX}"));
+        asm.asm(&format!("jo   {ABORT_NOT_A_NUMBER}"));
+        asm.asm("inc  rdi");
+        asm.asm("jmp  .next");
+        asm.line(".complete:");
+        asm.asm("test r12, r12");
+        asm.asm("jnz  .signed");
+        asm.asm(&format!("neg  {RAX}"));
+        asm.asm(&format!("jo   {ABORT_NOT_A_NUMBER}    ; only the one with no positive twin"));
+        asm.line(".signed:");
+        asm.asm("add  rsp, 40");
+        asm.asm("pop  r12");
+        asm.asm("pop  rdi");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+
     if used.chars_str {
         asm.blank();
         asm.comment("string(cs): a list of characters sealed into a string");
@@ -1188,6 +1304,205 @@ fn text_stubs(asm: &mut Asm, used: &Used) {
     }
 }
 
+/// Reading input: the other edge, where UTF-8 becomes characters.
+///
+/// The compiler buffers stdin itself, in [`INPUT`], rather than going through a
+/// `FILE*`. That is what makes `eof` answerable at all without pushing a
+/// character back: "has the input run out" becomes a question about this
+/// buffer, and the answer costs nothing when the buffer is not empty.
+fn input_stubs(asm: &mut Asm, used: &Used) {
+    asm.blank();
+    asm.comment("is a byte waiting? refills the buffer when it has run dry");
+    asm.line(&format!("{READY}:"));
+    asm.comment("-> rax = 1 when there is a byte to take, 0 at the end of the input");
+    asm.asm(&format!("mov  {RAX}, [{INPUT_POS}]"));
+    asm.asm(&format!("cmp  {RAX}, [{INPUT_LEN}]"));
+    asm.asm("jb   .waiting");
+    asm.asm("sub  rsp, 40    ; shadow space + alignment");
+    asm.asm(&format!("mov  ecx, 0    ; the input"));
+    asm.asm(&format!("lea  {RDX}, [{INPUT}]"));
+    asm.asm(&format!("mov  r8d, {INPUT_BYTES}"));
+    asm.asm("call _read");
+    asm.asm("add  rsp, 40");
+    asm.comment("nothing left is an answer; a refusal is not");
+    asm.asm("test eax, eax");
+    asm.asm(&format!("js   {ABORT_INPUT_FAILED}"));
+    asm.asm("jz   .spent");
+    asm.comment("a 32-bit result leaves the top half undefined, so widen it");
+    asm.asm(&format!("movsxd {RAX}, eax"));
+    asm.asm(&format!("mov  [{INPUT_LEN}], {RAX}"));
+    asm.asm(&format!("mov  qword [{INPUT_POS}], 0"));
+    asm.line(".waiting:");
+    asm.asm("mov  eax, 1");
+    asm.asm("ret");
+    asm.line(".spent:");
+    asm.asm("xor  eax, eax");
+    asm.asm("ret");
+
+    asm.blank();
+    asm.comment("take one byte");
+    asm.line(&format!("{NEXT_BYTE}:"));
+    asm.comment("-> rax = the byte, or -1 at the end of the input");
+    asm.asm("sub  rsp, 40    ; shadow space + alignment");
+    asm.asm(&format!("call {READY}"));
+    asm.asm("add  rsp, 40");
+    asm.asm(&format!("test {RAX}, {RAX}"));
+    asm.asm("jz   .spent");
+    asm.asm(&format!("mov  {RAX}, [{INPUT_POS}]"));
+    asm.asm(&format!("lea  {RCX}, [{INPUT}]"));
+    asm.asm(&format!("movzx edx, byte [{RCX}+{RAX}]"));
+    asm.asm(&format!("inc  {RAX}"));
+    asm.asm(&format!("mov  [{INPUT_POS}], {RAX}"));
+    asm.asm(&format!("mov  {RAX}, {RDX}"));
+    asm.asm("ret");
+    asm.line(".spent:");
+    asm.asm(&format!("mov  {RAX}, -1"));
+    asm.asm("ret");
+
+    if used.eof {
+        asm.blank();
+        asm.comment("eof(): the same question, asked the other way round");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::Eof)));
+        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        asm.asm(&format!("call {READY}"));
+        asm.asm("add  rsp, 40");
+        asm.comment("nothing was consumed, which is the whole point of asking");
+        asm.asm(&format!("xor  {RAX}, 1"));
+        asm.asm("ret");
+    }
+
+    if !used.read_line {
+        return;
+    }
+
+    asm.blank();
+    asm.comment("one character's worth of UTF-8, taken from the input");
+    asm.line(&format!("{UTF8_DECODE}:"));
+    asm.comment("rcx = the first byte -> rax = the character it starts");
+    asm.asm("push rbx");
+    asm.asm("push rsi");
+    asm.asm("push rdi");
+    asm.asm("sub  rsp, 32    ; shadow space");
+    asm.asm(&format!("cmp  ecx, 0x80"));
+    asm.asm("jb   .plain");
+    asm.asm(&format!("mov  rbx, {RCX}"));
+    // Which of the three multi-byte forms this is, read off the lead byte.
+    for (mask, tag, label) in [(0xE0, 0xC0, ".two"), (0xF0, 0xE0, ".three"), (0xF8, 0xF0, ".four")]
+    {
+        asm.asm("mov  eax, ecx");
+        asm.asm(&format!("and  eax, {mask:#x}"));
+        asm.asm(&format!("cmp  eax, {tag:#x}"));
+        asm.asm(&format!("je   {label}"));
+    }
+    asm.comment("anything else is a byte no character starts with");
+    asm.asm(&format!("jmp  {ABORT_BAD_UTF8}"));
+
+    asm.line(".plain:");
+    asm.asm(&format!("mov  {RAX}, {RCX}"));
+    asm.asm("jmp  .decoded");
+
+    // `rdi` counts the continuation bytes still owed, `rsi` is the smallest
+    // value this many bytes is allowed to encode.
+    for (label, mask, owed, least) in
+        [(".two", 0x1F, 1, 0x80), (".three", 0x0F, 2, 0x800), (".four", 0x07, 3, 0x10000)]
+    {
+        asm.line(&format!("{label}:"));
+        asm.asm(&format!("and  ebx, {mask:#x}"));
+        asm.asm(&format!("mov  rdi, {owed}"));
+        asm.asm(&format!("mov  rsi, {least:#x}"));
+        if label != ".four" {
+            asm.asm("jmp  .continuation");
+        }
+    }
+
+    asm.line(".continuation:");
+    asm.asm("test rdi, rdi");
+    asm.asm("jz   .complete");
+    asm.asm(&format!("call {NEXT_BYTE}"));
+    asm.asm(&format!("cmp  {RAX}, 0"));
+    asm.asm(&format!("jl   {ABORT_BAD_UTF8}    ; the input stopped mid-character"));
+    asm.asm(&format!("mov  edx, eax"));
+    asm.asm(&format!("and  edx, 0xC0"));
+    asm.asm(&format!("cmp  edx, 0x80"));
+    asm.asm(&format!("jne  {ABORT_BAD_UTF8}"));
+    asm.asm("and  eax, 0x3F");
+    asm.asm("shl  rbx, 6");
+    asm.asm(&format!("or   rbx, {RAX}"));
+    asm.asm("dec  rdi");
+    asm.asm("jmp  .continuation");
+
+    asm.line(".complete:");
+    asm.comment("an overlong encoding spells a character in more bytes than it needs");
+    asm.asm("cmp  rbx, rsi");
+    asm.asm(&format!("jb   {ABORT_BAD_UTF8}"));
+    asm.asm(&format!("cmp  rbx, 0x10FFFF"));
+    asm.asm(&format!("ja   {ABORT_BAD_UTF8}"));
+    asm.asm(&format!("mov  {RAX}, rbx"));
+    asm.asm(&format!("sub  {RAX}, 0xD800"));
+    asm.asm(&format!("cmp  {RAX}, 0x7FF"));
+    asm.asm(&format!("jbe  {ABORT_BAD_UTF8}    ; a surrogate names no character"));
+    asm.asm(&format!("mov  {RAX}, rbx"));
+    asm.line(".decoded:");
+    asm.asm("add  rsp, 32");
+    asm.asm("pop  rdi");
+    asm.asm("pop  rsi");
+    asm.asm("pop  rbx");
+    asm.asm("ret");
+
+    asm.blank();
+    asm.comment("read_line(): characters accumulate in a list, then become a string");
+    asm.line(&format!("{}:", runtime_symbol(Runtime::ReadLine)));
+    asm.comment("-> rax = the line, without its ending");
+    asm.asm("push rbx");
+    asm.asm("push rsi");
+    asm.asm("push rdi");
+    asm.asm("push r12");
+    asm.asm("sub  rsp, 40    ; shadow space + alignment");
+    asm.comment("the first byte decides whether there is a line at all");
+    asm.asm(&format!("call {NEXT_BYTE}"));
+    asm.asm(&format!("cmp  {RAX}, 0"));
+    asm.asm(&format!("jl   {ABORT_NO_INPUT}"));
+    asm.asm(&format!("mov  rsi, {RAX}"));
+    asm.asm(&format!("xor  {RCX}, {RCX}"));
+    asm.asm(&format!("call {}", runtime_symbol(Runtime::ListNew)));
+    asm.asm(&format!("mov  rbx, {RAX}"));
+
+    asm.line(".next:");
+    asm.asm("cmp  rsi, 10");
+    asm.asm("je   .ended    ; a newline ends the line and is not part of it");
+    asm.asm(&format!("mov  {RCX}, rsi"));
+    asm.asm(&format!("call {UTF8_DECODE}"));
+    asm.asm(&format!("mov  {RCX}, rbx"));
+    asm.asm(&format!("mov  {RDX}, {RAX}"));
+    asm.asm(&format!("call {}", runtime_symbol(Runtime::ListPush)));
+    asm.asm(&format!("mov  rbx, {RAX}"));
+    asm.asm(&format!("call {NEXT_BYTE}"));
+    asm.asm(&format!("mov  rsi, {RAX}"));
+    asm.asm(&format!("cmp  rsi, 0"));
+    asm.asm("jge  .next    ; the input running out ends the line too");
+
+    asm.line(".ended:");
+    asm.comment("a carriage return before the newline belongs to the ending");
+    asm.asm(&format!("mov  {RCX}, [rbx-8]"));
+    asm.asm(&format!("test {RCX}, {RCX}"));
+    asm.asm("jz   .seal");
+    asm.asm(&format!("mov  edx, [rbx+{RCX}*8-8]"));
+    asm.asm(&format!("cmp  edx, 13"));
+    asm.asm("jne  .seal");
+    asm.asm(&format!("dec  {RCX}"));
+    asm.asm(&format!("mov  [rbx-8], {RCX}"));
+
+    asm.line(".seal:");
+    asm.asm(&format!("mov  {RCX}, rbx"));
+    asm.asm(&format!("call {}", runtime_symbol(Runtime::CharsToStr)));
+    asm.asm("add  rsp, 40");
+    asm.asm("pop  r12");
+    asm.asm("pop  rdi");
+    asm.asm("pop  rsi");
+    asm.asm("pop  rbx");
+    asm.asm("ret");
+}
+
 /// One byte of a UTF-8 sequence: some bits of the character, under the tag that
 /// says which byte of how many this is.
 fn utf8_byte(asm: &mut Asm, shift: u32, mask: u32, tag: u32, at: u32) {
@@ -1247,7 +1562,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         // calls the console's code page into shape first, even when every
         // print happens somewhere else.
         let entry = function.name == ENTRY_POINT;
-        let leaf = !(entry && used.writes_text())
+        let leaf = !(entry && (used.writes_text() || used.reads_text()))
             && !function
                 .blocks
                 .iter()
@@ -1265,10 +1580,21 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         }
         self.asm.line(&format!("{}:", symbol(&self.function.name)));
         self.prologue();
-        if self.is_entry_point() && self.used.writes_text() {
-            self.asm.comment("tell the console the bytes it is about to receive are UTF-8");
-            self.asm.asm(&format!("mov  ecx, {UTF8_CODE_PAGE}"));
-            self.asm.asm("call SetConsoleOutputCP");
+        if self.is_entry_point() {
+            // Both directions, and for the same reason: a console speaks a code
+            // page, and unless it is told otherwise it is not this one. Without
+            // this a program that prints `é` prints mojibake, and one that
+            // reads it is handed bytes no character starts with.
+            if self.used.writes_text() {
+                self.asm.comment("tell the console the bytes it is about to receive are UTF-8");
+                self.asm.asm(&format!("mov  ecx, {UTF8_CODE_PAGE}"));
+                self.asm.asm("call SetConsoleOutputCP");
+            }
+            if self.used.reads_text() {
+                self.asm.comment("and to hand over what is typed into it as UTF-8");
+                self.asm.asm(&format!("mov  ecx, {UTF8_CODE_PAGE}"));
+                self.asm.asm(&format!("call {CONSOLE_INPUT_CP}"));
+            }
         }
 
         for (index, block) in self.function.blocks.iter().enumerate() {
@@ -2408,6 +2734,36 @@ mod tests {
         let asm = compile("int[] a = [1];\nint[] b = a;\nprint(len(b));");
         assert!(asm.contains(&format!("{}:", runtime_symbol(Runtime::ListClone))), "{asm}");
         assert!(asm.contains(&format!("{}:", runtime_symbol(Runtime::ListNew))), "{asm}");
+    }
+
+    #[test]
+    fn reading_a_line_brings_everything_it_leans_on() {
+        // `read_line` accumulates characters in a list and seals them into a
+        // string, so it needs three routines no instruction names.
+        let asm = compile("print(read_line());");
+        for routine in [Runtime::ListNew, Runtime::ListPush, Runtime::CharsToStr] {
+            assert!(asm.contains(&format!("{}:", runtime_symbol(routine))), "{routine:?}: {asm}");
+        }
+        assert!(asm.contains("extern _read"), "{asm}");
+        assert!(asm.contains(&format!("{INPUT}:")), "{asm}");
+    }
+
+    #[test]
+    fn asking_whether_the_input_ran_out_needs_no_decoder() {
+        // `eof` is a question about the buffer, so a program that only asks it
+        // carries neither the decoder nor the list routines.
+        let asm = compile("print(eof());");
+        assert!(asm.contains(&format!("{READY}:")), "{asm}");
+        assert!(!asm.contains(&format!("{UTF8_DECODE}:")), "{asm}");
+        assert!(!asm.contains(&runtime_symbol(Runtime::ListPush)), "{asm}");
+    }
+
+    #[test]
+    fn a_program_that_reads_nothing_carries_no_input_buffer() {
+        let asm = compile("print(1);");
+        assert!(!asm.contains("extern _read"), "{asm}");
+        assert!(!asm.contains(INPUT), "{asm}");
+        assert!(!asm.contains("SetConsoleCP"), "{asm}");
     }
 
     #[test]

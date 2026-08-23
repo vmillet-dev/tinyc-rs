@@ -12,7 +12,7 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 11] = [
+const EXAMPLES: [&str; 12] = [
     "arith.tc",
     "spill.tc",
     "reassign.tc",
@@ -24,6 +24,7 @@ const EXAMPLES: [&str; 11] = [
     "classes.tc",
     "strings.tc",
     "lists.tc",
+    "interactive.tc",
 ];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
@@ -252,6 +253,15 @@ fn a_number_that_names_no_character_points_at_the_number() {
 #[test]
 fn joining_a_number_to_a_string_points_at_the_number() {
     assert_error_at("joining_a_number.tc", "3:22");
+}
+
+// -- input ----------------------------------------------------------------
+
+#[test]
+fn redefining_a_builtin_points_at_the_name() {
+    // The built-ins are in the signature table before the program's own
+    // functions are, so this collides with something already there.
+    assert_error_at("redefining_a_builtin.tc", "2:4");
 }
 
 // -- lists ----------------------------------------------------------------

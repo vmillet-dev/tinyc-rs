@@ -1,0 +1,8 @@
+// `eof` is a name the language already uses, so a program cannot take it.
+fn eof() -> bool {
+  return true;
+}
+
+fn main() {
+  print(eof());
+}

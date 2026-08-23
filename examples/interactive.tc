@@ -1,0 +1,87 @@
+// Input: the first programs that do not know what they will be given.
+//
+// `read_line()` answers one line, without its ending — a `\n` on its own, or a
+// `\r\n`, either way. `eof()` says whether there is anything left, and it says
+// so *without consuming anything*, which is what makes the loop below read
+// every line and ask for none that is not there.
+//
+// Asking for a line when there is none stops the program. That is deliberate:
+// answering `""` would make an empty line and the end of the input the same
+// value, and there would be no way to tell them apart afterwards.
+//
+// Everything the file gives is UTF-8; everything TinyC holds is characters. The
+// decoding happens here, at the edge, and a byte sequence that spells no
+// character stops the program rather than turning into a question mark.
+
+fn max_of(int[] xs) -> int {
+  int best = xs[0];
+  for (int i = 1; i < len(xs); i = i + 1) {
+    if (xs[i] > best) {
+      best = xs[i];
+    }
+  }
+  return best;
+}
+
+fn sum_of(int[] xs) -> int {
+  int total = 0;
+  for (int i = 0; i < len(xs); i = i + 1) {
+    total = total + xs[i];
+  }
+  return total;
+}
+
+// Nothing in this program says how many lines there will be, and nothing had
+// to: the list grows to fit whatever arrives.
+fn main() {
+  int[] numbers = [];
+  string[] words = [];
+
+  while (!eof()) {
+    string line = read_line();
+
+    // An empty line is a line: it has a length, and it is not the end.
+    if (len(line) == 0) {
+      print("(blank)");
+      continue;
+    }
+
+    // A line that is all digits is a number; anything else is a word. The
+    // compiler converts nothing on its own, so this asks first and only then
+    // says `int(line)`.
+    bool numeric = true;
+    for (int i = 0; i < len(line); i = i + 1) {
+      char c = line[i];
+      if (c < '0' || c > '9') {
+        numeric = false;
+      }
+    }
+
+    if (numeric) {
+      push(numbers, int(line));
+      print("number " + line);
+    } else {
+      push(words, line);
+      print("word " + line + " (" + string(len(line)) + " characters)");
+    }
+  }
+
+  print("");
+  print("numbers: " + string(len(numbers)));
+  if (len(numbers) > 0) {
+    print("sum: " + string(sum_of(numbers)));
+    print("largest: " + string(max_of(numbers)));
+  }
+  print("words: " + string(len(words)));
+
+  // The longest word, found without knowing how many there were.
+  if (len(words) > 0) {
+    string longest = words[0];
+    for (int i = 1; i < len(words); i = i + 1) {
+      if (len(words[i]) > len(longest)) {
+        longest = words[i];
+      }
+    }
+    print("longest: " + longest);
+  }
+}

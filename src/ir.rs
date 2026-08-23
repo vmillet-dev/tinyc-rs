@@ -38,7 +38,8 @@
 use std::collections::HashMap;
 
 use crate::ast::{
-    ArmBody, BinOp, Block as AstBlock, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp, MatchArm,
+    ArmBody, BinOp, Block as AstBlock, Builtin, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
+    MatchArm,
     Place, Prim, Program as Ast, Stmt, Ty, TypeTable, is_scalar_value,
 };
 use crate::sema::Types;
@@ -204,6 +205,13 @@ pub enum Runtime {
     /// the list now is**. Growing copies the elements into a larger block, so
     /// the address may change and the caller has to be told.
     ListPush,
+    /// `(s) -> int`: the number a string spells, refusing anything else.
+    StrToInt,
+    /// `() -> string`: one line of input, without its line ending.
+    ReadLine,
+    /// `() -> bool`: whether the input has run out, asked without consuming
+    /// anything.
+    Eof,
     /// `(chars) -> string`: the characters of a `char[]`, sealed into a string.
     ///
     /// The way to build a string a character at a time without paying for a
@@ -227,6 +235,18 @@ impl Runtime {
             Runtime::ListPush => "list_push",
             Runtime::ListClone => "list_clone",
             Runtime::CharsToStr => "chars_str",
+            Runtime::StrToInt => "str_int",
+            Runtime::ReadLine => "read_line",
+            Runtime::Eof => "eof",
+        }
+    }
+
+    /// The routine a built-in function is, which is the only thing that tells
+    /// them apart once lowering is done.
+    pub fn of(builtin: Builtin) -> Runtime {
+        match builtin {
+            Builtin::ReadLine => Runtime::ReadLine,
+            Builtin::Eof => Runtime::Eof,
         }
     }
 }
@@ -1170,8 +1190,15 @@ impl Lowering<'_> {
             Stmt::Match(expr) => self.match_lowering(None, expr),
             Stmt::Break { .. } => self.loop_jump(|frame| &mut frame.breaks),
             Stmt::Continue { .. } => self.loop_jump(|frame| &mut frame.continues),
-            Stmt::Call(call) => match call.kind {
+            Stmt::Call(call) => match &call.kind {
                 ExprKind::MethodCall { .. } => self.method_call(None, call),
+                // `read_line();` is a line skipped: the call happens, and what
+                // it answered is thrown away like any other call statement's.
+                ExprKind::Call { name, args, .. } if Builtin::from_name(name).is_some() => {
+                    let args: Vec<Value> = args.iter().map(|arg| self.expr(arg)).collect();
+                    let callee = Runtime::of(Builtin::from_name(name).expect("just matched"));
+                    self.emit(Instr::RtCall { dst: None, callee, args });
+                }
                 _ => {
                     let (callee, args) = self.call_parts(call);
                     self.emit(Instr::Call { dst: None, callee, args });
@@ -1527,6 +1554,7 @@ impl Lowering<'_> {
 
         let callee = match (from, to) {
             (Ty::Int, Prim::Char) if !settled => Runtime::CheckChar,
+            (Ty::Str, Prim::Int) => Runtime::StrToInt,
             (Ty::Char, Prim::Str) => Runtime::CharToStr,
             (Ty::Int, Prim::Str) => Runtime::IntToStr,
             (Ty::List(_), Prim::Str) => Runtime::CharsToStr,
@@ -1853,6 +1881,13 @@ impl Lowering<'_> {
             }
             ExprKind::Logic { op, lhs, rhs } => self.logic_into(dst, *op, lhs, rhs),
             ExprKind::Match { .. } => self.match_lowering(Some(dst), expr),
+            // A built-in is a call with no body to compile, so it goes out as
+            // the routine it is. Nothing else about the call site differs.
+            ExprKind::Call { name, args, .. } if Builtin::from_name(name).is_some() => {
+                let args: Vec<Value> = args.iter().map(|arg| self.expr(arg)).collect();
+                let callee = Runtime::of(Builtin::from_name(name).expect("just matched"));
+                self.emit(Instr::RtCall { dst: Some(dst), callee, args });
+            }
             ExprKind::Call { .. } => {
                 let (callee, mut args) = self.call_parts(expr);
                 let ty = self.types.of(expr.id);
@@ -3274,6 +3309,23 @@ mod tests {
         // The list's own register is both what goes in and what comes back.
         let Instr::RtCall { dst: Some(dst), args, .. } = pushes[0] else { panic!("a push") };
         assert_eq!(args[0], Value::Reg(*dst), "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_builtin_call_becomes_a_routine_and_not_a_function_call() {
+        // There is no body to compile and no `FuncId` to name, so the ordinary
+        // call instruction could not carry it.
+        let ir = lower_main("print(read_line());");
+        assert!(routines(&ir).contains(&Runtime::ReadLine), "{}", ir.dump());
+        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::Call { .. })), "{}", ir.dump());
+
+        // Discarded on its own, which is a line skipped.
+        let ir = lower_main("read_line();");
+        let calls: Vec<&Instr> = instrs(&ir)
+            .into_iter()
+            .filter(|i| matches!(i, Instr::RtCall { callee: Runtime::ReadLine, dst: None, .. }))
+            .collect();
+        assert_eq!(calls.len(), 1, "{}", ir.dump());
     }
 
     #[test]

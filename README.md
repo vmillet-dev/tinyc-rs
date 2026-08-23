@@ -159,6 +159,10 @@ joins two strings, `&&`, `||` and `!` are `bool`-only, `//` starts a comment, an
 a variable keeps the type it was declared with — assigning a `string` to an
 `int` is an error.
 
+Two functions come with the language rather than being declared —
+`read_line() -> string` and `eof() -> bool`, see
+[Reading input](#reading-input) — and a program cannot take their names.
+
 There is no implicit truth test either, so `!n` on an `int` is a type error
 rather than a comparison against zero. `%` takes its sign from the dividend, as
 in C: `-7 % 2` is `-1`. Arithmetic that has no answer stops the program rather
@@ -471,6 +475,7 @@ is written out, and these four conversions are the whole list:
 | Written | Gives | Fails when |
 |---|---|---|
 | `int(c)` | a character's code point | never |
+| `int(s)` | the number a string spells | the text is not a number an `int` can hold |
 | `char(n)` | the character with that code point | `n` names none — checked at compile time when it is a constant, at run time otherwise |
 | `string(c)` | a string of that one character | never |
 | `string(n)` | a number written out in decimal | never |
@@ -664,6 +669,74 @@ makes it necessary rather than merely convenient.
 rather than a bare type, for one question asked in one place: `push` onto a
 parameter is refused. That is the smallest amount of ownership tracking that
 makes the arena safe to grow things in.
+
+### Reading input
+
+Two functions the compiler provides, and the first programs that do not know
+what they will be given ([`examples/interactive.tc`](examples/interactive.tc)):
+
+```c
+while (!eof()) {
+  string line = read_line();
+  print(line + " (" + string(len(line)) + " characters)");
+}
+```
+
+`read_line()` answers one line without its ending — `\n` or `\r\n`, either way —
+and `eof()` says whether anything is left. **`eof()` consumes nothing**, which is
+what makes the loop above read every line and ask for none that is not there.
+
+**Asking for a line when there is none stops the program**, rather than
+answering `""`. That is the whole reason `eof()` exists: an empty line and the
+end of the input would otherwise be the same value, and nothing afterwards could
+tell them apart. It is the same bargain as an index out of range — there is a
+way to ask first, so failing to is a mistake worth naming.
+
+Everything arriving is UTF-8; everything TinyC holds is characters. Bytes that
+spell no character stop the program too:
+
+```
+runtime error: the input is not valid UTF-8
+```
+
+`int(s)` is the way back from text to a number, and it guesses nothing: an
+optional `-`, then digits, and nothing else — no leading spaces, no trailing
+units, and no settling for zero when the text is not a number at all. A number
+too large for an `int` is refused for the same reason arithmetic that overflows
+is.
+
+### What input changed underneath
+
+**The first functions the compiler provides.** `len` and `push` are *constructs*
+because no signature could describe them: one takes several unrelated types, the
+other takes a place rather than a value. `read_line` and `eof` have signatures a
+TinyC program could have written itself, so they are not syntax at all — they
+are two names already in the signature table when the first line is checked,
+reached through the ordinary call machinery, and differing from a declared
+function only in having no body to compile. A program that tries to declare one
+of their names collides with something already there:
+
+```
+error: `eof` is built in and cannot be redefined
+```
+
+The whole cost is one row per built-in and one arm in lowering, where the call
+becomes a `tc$rt$…` routine instead of a `FuncId`.
+
+**The compiler buffers the input itself**, with `_read` and 4 KB of `.bss`,
+rather than going through a `FILE*`. That is what makes `eof()` answerable
+without pushing a character back: "has the input run out" becomes a question
+about that buffer, and it costs nothing at all while the buffer is not empty.
+
+**`read_line` is built out of the two features before it.** Characters
+accumulate in a list, which grows by doubling, and `string(cs)` seals them —
+so a line of any length costs one pass and no quadratic anything. It is the
+clearest argument for having built the lists first.
+
+**And the console is told twice.** `SetConsoleOutputCP(65001)` was already there
+for printing; `SetConsoleCP(65001)` is its counterpart, so that what is *typed*
+arrives as UTF-8 too. Without it a console hands over its own code page, and the
+decoder would rightly refuse it.
 
 ### Enums and exhaustive matching
 
@@ -1092,10 +1165,13 @@ complaint, so the compiler settles what it can and guards the rest. It is
 described under [Arrays](#arrays), and applies to
 [strings](#strings-and-characters) too.
 
-Two more joined the family with strings, and are checked the same way: `char(n)`
-for an `n` that names no character — settled at compile time when it is a
-constant — and an arena that cannot get memory from the operating system. Six
-ways to stop, one routine to report them, and none of them answers wrongly.
+Six more joined the family with strings, lists and input, and none of them is a
+special case: `char(n)` for an `n` that names no character — settled at compile
+time when it is a constant — an arena that cannot get memory from the operating
+system, `int(s)` on text that is not a number, a line asked for when there is
+none, input that is not valid UTF-8, and input the operating system refuses to
+hand over. **Ten ways to stop, one routine to report them, and not one of them
+answers wrongly instead.**
 
 The rule is checked in whichever of two places can see it:
 

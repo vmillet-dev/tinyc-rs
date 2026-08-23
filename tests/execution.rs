@@ -27,7 +27,7 @@ use tinyc::codegen::Target;
 
 /// Programs that must keep printing exactly what `examples/expected/<name>.txt`
 /// says, and the source of truth for what a working TinyC program looks like.
-const EXAMPLES: [&str; 12] = [
+const EXAMPLES: [&str; 13] = [
     "hello.tc",
     "arith.tc",
     "spill.tc",
@@ -40,6 +40,7 @@ const EXAMPLES: [&str; 12] = [
     "classes.tc",
     "strings.tc",
     "lists.tc",
+    "interactive.tc",
 ];
 
 #[test]
@@ -52,7 +53,13 @@ fn every_example_prints_what_it_promises() {
         let expected = std::fs::read_to_string(&expected)
             .unwrap_or_else(|e| panic!("{}: {e}", expected.display()));
 
-        let run = tools.build_and_run(&source, file);
+        // An example that reads is fed the `.in` beside its expected output;
+        // one that does not gets nothing, and so sees the end of the input at
+        // once — which is itself the state `eof()` has to get right.
+        let input = examples().join("expected").join(file.replace(".tc", ".in"));
+        let input = std::fs::read(&input).unwrap_or_default();
+
+        let run = tools.build_and_run_on(&source, file, &input);
         assert!(run.status.success(), "{file} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(normalise(&run.stdout), normalise(&expected), "{file} printed the wrong thing");
     }
@@ -254,6 +261,97 @@ fn lists_grow_and_stay_their_owners() {
         assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
     }
+}
+
+/// Reading input, which is the one thing that cannot be checked by looking at
+/// the program alone: what it does depends on what it is given.
+#[test]
+fn reading_the_input_sees_characters_and_knows_when_to_stop() {
+    let Some(tools) = Tools::find() else { return };
+
+    // `(input, body, expected)`. The inputs are written as raw bytes on
+    // purpose: what arrives is UTF-8, and turning it into characters is the
+    // very thing under test.
+    let cases: [(&[u8], &str, &str); 12] = [
+        // Nothing at all: the end of the input is where the program starts.
+        (b"", "print(eof());", "true"),
+        (b"x\n", "print(eof());", "false"),
+        // Asking does not consume, so asking twice answers twice.
+        (b"x\n", "print(eof());\nprint(eof());\nprint(read_line());", "false\nfalse\nx"),
+        // A line is what is between the endings, and both endings work.
+        (b"one\ntwo\n", "print(read_line());\nprint(read_line());", "one\ntwo"),
+        (b"one\r\ntwo\r\n", "print(len(read_line()));", "3"),
+        // An empty line is a line, and is not the end.
+        (b"\nx\n", "print(len(read_line()));\nprint(read_line());", "0\nx"),
+        // A last line with no ending is still a line.
+        (b"tail", "print(read_line());\nprint(eof());", "tail\ntrue"),
+        // Characters, not bytes: five characters in six bytes.
+        ("h\u{e9}llo\n".as_bytes(), "print(len(read_line()));", "5"),
+        ("\u{65e5}\u{672c}\u{8a9e}\n".as_bytes(), "print(len(read_line()));", "3"),
+        // A line longer than the buffer, so the refill happens mid-line.
+        (
+            &[b'a'; 5000],
+            "string line = read_line();\nprint(len(line));",
+            "5000",
+        ),
+        // Counting an unknown quantity, which is what all of this was for.
+        (
+            b"3\n1\n4\n1\n5\n",
+            "int total = 0;\n\
+             int[] seen = [];\n\
+             while (!eof()) {\n  push(seen, int(read_line()));\n}\n\
+             for (int i = 0; i < len(seen); i = i + 1) { total = total + seen[i]; }\n\
+             print(len(seen) * 100 + total);",
+            "514",
+        ),
+        // Text into a number and out again, unchanged — including the one with
+        // no positive twin, which a parser that negates at the end would lose.
+        (
+            b"-9223372036854775808\n",
+            "print(string(int(read_line())) == \"-9223372036854775808\");",
+            "true",
+        ),
+    ];
+
+    for (index, (input, body, expected)) in cases.iter().enumerate() {
+        let name = format!("input{index}");
+        let source = tools.scratch.join(format!("{name}.tc"));
+        std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
+
+        let run = tools.build_and_run_on(&source, &name, input);
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(normalise(&run.stdout), normalise(expected), "case {index}:\n{body}");
+    }
+}
+
+/// Asking for a line that is not there stops the program, rather than answering
+/// with something that could be mistaken for an empty line.
+#[test]
+fn reading_past_the_end_reports_and_exits() {
+    let Some(tools) = Tools::find() else { return };
+
+    let source = tools.scratch.join("past_the_end.tc");
+    std::fs::write(&source, "fn main() {\n  print(read_line());\n  print(read_line());\n}\n")
+        .unwrap();
+
+    let run = tools.build_and_run_on(&source, "past_the_end", b"only\n");
+    assert!(!run.status.success(), "it should not have finished");
+    assert!(run.stdout.contains("only"), "the line it did have: {}", run.stdout);
+    assert!(run.stderr.contains("no more input"), "{}", run.stderr);
+}
+
+/// Bytes that spell no character stop the program too, rather than becoming
+/// some replacement nobody asked for.
+#[test]
+fn input_that_is_not_utf8_reports_and_exits() {
+    let Some(tools) = Tools::find() else { return };
+
+    let source = tools.scratch.join("bad_utf8.tc");
+    std::fs::write(&source, "fn main() {\n  print(read_line());\n}\n").unwrap();
+
+    let run = tools.build_and_run_on(&source, "bad_utf8", b"\xff\xfe\n");
+    assert!(!run.status.success(), "it should not have finished");
+    assert!(run.stderr.contains("not valid UTF-8"), "{}", run.stderr);
 }
 
 /// Compile each body as the whole of `main`, run it, and check what it printed.
@@ -734,6 +832,15 @@ impl Tools {
 
     /// tinyc -> nasm -> link -> run, answering what the program printed.
     fn build_and_run(&self, source: &Path, name: &str) -> Run {
+        self.build_and_run_on(source, name, b"")
+    }
+
+    /// Build and run, with `input` on the program's standard input.
+    ///
+    /// A program that reads is given exactly these bytes and then the end of
+    /// the input, which is what makes `eof()` testable at all: run with a
+    /// terminal attached it would wait for someone to type.
+    fn build_and_run_on(&self, source: &Path, name: &str, input: &[u8]) -> Run {
         let asm = self.scratch.join(format!("{name}.asm"));
         let obj = self.scratch.join(format!("{name}.obj"));
         let exe = self.scratch.join(format!("{name}.exe"));
@@ -780,7 +887,18 @@ impl Tools {
             String::from_utf8_lossy(&linked.stderr)
         );
 
-        let run = Command::new(&exe).output().expect("the compiled program should run");
+        let mut child = Command::new(&exe)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("the compiled program should run");
+        {
+            use std::io::Write;
+            let stdin = child.stdin.as_mut().expect("stdin was piped");
+            stdin.write_all(input).expect("the program should take its input");
+        }
+        let run = child.wait_with_output().expect("the program should finish");
         Run {
             status: run.status,
             stdout: String::from_utf8_lossy(&run.stdout).into_owned(),

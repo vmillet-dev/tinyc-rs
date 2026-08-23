@@ -1,0 +1,13 @@
+word héllo (5 characters)
+number 42
+(blank)
+word welt (4 characters)
+number 7
+word relativité (10 characters)
+number 1000
+
+numbers: 3
+sum: 1049
+largest: 1000
+words: 3
+longest: relativité
