@@ -173,6 +173,10 @@ const CHUNK_BYTES: u32 = 1 << 16;
 
 /// Encodes one character as UTF-8, which is the only place the language's
 /// representation meets the one the outside world reads.
+/// The smallest capacity a list is given, so that the first few `push`es cost
+/// no move at all.
+const LIST_MIN_CAPACITY: u32 = 4;
+
 const UTF8: &str = "tc$rt$utf8";
 const PRINT_STR: &str = "tc$rt$print_str";
 const PRINT_CHAR: &str = "tc$rt$print_char";
@@ -355,6 +359,7 @@ impl Backend for X64Windows {
             arena(&mut asm);
         }
         string_stubs(&mut asm, &used);
+        list_stubs(&mut asm, &used);
         if used.writes_text() {
             text_stubs(&mut asm, &used);
         }
@@ -385,6 +390,10 @@ struct Used {
     check_char: bool,
     char_str: bool,
     int_str: bool,
+    list_new: bool,
+    list_push: bool,
+    list_clone: bool,
+    chars_str: bool,
     print_str: bool,
     print_char: bool,
 }
@@ -401,6 +410,10 @@ impl Used {
             check_char: false,
             char_str: false,
             int_str: false,
+            list_new: false,
+            list_push: false,
+            list_clone: false,
+            chars_str: false,
             print_str: false,
             print_char: false,
         };
@@ -425,14 +438,20 @@ impl Used {
                             Runtime::CheckChar => used.check_char = true,
                             Runtime::CharToStr => used.char_str = true,
                             Runtime::IntToStr => used.int_str = true,
+                            Runtime::ListNew => used.list_new = true,
+                            Runtime::ListPush => used.list_push = true,
+                            Runtime::ListClone => used.list_clone = true,
+                            Runtime::CharsToStr => used.chars_str = true,
                         }
                     }
                 }
             }
         }
-        // Asking the arena for memory is a way to fail like any other, and a
-        // `print` reaches it without any instruction saying so: the buffer it
-        // encodes into is cut from the arena too.
+        // Two routines are reached without any instruction naming them: a
+        // `print` encodes into a buffer cut from the arena, and cloning a list
+        // builds the new one with `list_new`.
+        used.list_new |= used.list_clone;
+        // Asking the arena for memory is a way to fail like any other.
         used.aborts |= used.allocates();
         used
     }
@@ -444,7 +463,14 @@ impl Used {
     /// Whether anything cuts memory out of the arena — which is what decides
     /// whether the program calls `malloc` at all.
     fn allocates(&self) -> bool {
-        self.concat || self.char_str || self.int_str || self.print_str
+        self.concat
+            || self.char_str
+            || self.int_str
+            || self.list_new
+            || self.list_push
+            || self.list_clone
+            || self.chars_str
+            || self.print_str
     }
 
     /// Whether any character is ever written out, and so whether the encoder
@@ -463,8 +489,10 @@ impl Used {
 fn format_index(ty: Ty) -> usize {
     match ty {
         Ty::Int => 0,
-        Ty::Str | Ty::Char | Ty::Enum(_) | Ty::Array(_) | Ty::Class(_) => 1,
         Ty::Bool => 2,
+        // Listed rather than left to a wildcard, so that a new type has to be
+        // thought about here instead of quietly getting `%s` applied to it.
+        Ty::Str | Ty::Char | Ty::Enum(_) | Ty::Array(_) | Ty::List(_) | Ty::Class(_) => 1,
     }
 }
 
@@ -601,7 +629,7 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
     if used.aborts {
         // No NUL: `_write` is given a length, not a C string.
         for abort in &ABORTS {
-            asm.asm(&format!("{}: db {}", abort.message(), bytes_of(&*abort.text())));
+            asm.asm(&format!("{}: db {}", abort.message(), bytes_of(&abort.text())));
         }
     }
     // A literal is laid out exactly as a string built at run time is: the
@@ -912,6 +940,147 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
         asm.asm("add  rsp, 72");
         asm.asm("pop  r12");
         asm.asm("pop  rdi");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+}
+
+/// The routines a list needs, on the same arena the strings use.
+///
+/// A list is laid out as a capacity, then a length, then its elements — and the
+/// *value* is the address of the elements, so `[p-8]` is the length exactly as
+/// it is for a string. That is not a coincidence but the point: `len` is one
+/// instruction and never asks which of the two it was handed.
+///
+/// ```text
+/// [ capacity : 8 ][ length : 8 ][ elements, 8 bytes each ]
+///                               ^ this is the value
+/// ```
+fn list_stubs(asm: &mut Asm, used: &Used) {
+    if used.list_new {
+        asm.blank();
+        asm.comment("room for n elements, with the length already set");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::ListNew)));
+        asm.comment("rcx = how many elements -> rax = the list");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RCX}    ; the length"));
+        asm.asm(&format!("mov  rbx, {RCX}"));
+        asm.comment("never less than four, so the first few pushes need no move");
+        asm.asm(&format!("cmp  rbx, {LIST_MIN_CAPACITY}"));
+        asm.asm("jae  .big_enough");
+        asm.asm(&format!("mov  rbx, {LIST_MIN_CAPACITY}"));
+        asm.line(".big_enough:");
+        asm.asm(&format!("lea  {RCX}, [rbx*8+16]    ; the two counts, then the elements"));
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("mov  [{RAX}], rbx    ; capacity"));
+        asm.asm(&format!("mov  [{RAX}+8], rsi    ; length"));
+        asm.asm(&format!("add  {RAX}, 16    ; and the value is where the elements start"));
+        asm.asm("add  rsp, 40");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+
+    if used.list_push {
+        asm.blank();
+        asm.comment("one more element, answering where the list ended up");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::ListPush)));
+        asm.comment("rcx = the list, rdx = the value -> rax = the list, possibly moved");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("push rdi");
+        asm.asm("push r12");
+        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm(&format!("mov  r12, {RDX}"));
+        asm.asm("mov  rbx, [rsi-8]    ; length");
+        asm.asm("mov  rdi, [rsi-16]   ; capacity");
+        asm.asm("cmp  rbx, rdi");
+        asm.asm("jb   .room");
+        asm.comment("full: twice the room, and the old block is left where it is");
+        asm.asm("lea  rdi, [rdi*2]");
+        asm.asm(&format!("lea  {RCX}, [rdi*8+16]"));
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("mov  [{RAX}], rdi"));
+        asm.asm(&format!("add  {RAX}, 16"));
+        asm.asm(&format!("xor  {RCX}, {RCX}"));
+        asm.line(".copy:");
+        asm.asm(&format!("cmp  {RCX}, rbx"));
+        asm.asm("jae  .copied");
+        asm.asm(&format!("mov  {RDX}, [rsi+{RCX}*8]"));
+        asm.asm(&format!("mov  [{RAX}+{RCX}*8], {RDX}"));
+        asm.asm(&format!("inc  {RCX}"));
+        asm.asm("jmp  .copy");
+        asm.line(".copied:");
+        asm.asm(&format!("mov  rsi, {RAX}"));
+        asm.line(".room:");
+        asm.asm("mov  [rsi+rbx*8], r12");
+        asm.asm("inc  rbx");
+        asm.asm("mov  [rsi-8], rbx    ; the length lives with the elements");
+        asm.asm(&format!("mov  {RAX}, rsi"));
+        asm.asm("add  rsp, 40");
+        asm.asm("pop  r12");
+        asm.asm("pop  rdi");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+
+    if used.chars_str {
+        asm.blank();
+        asm.comment("string(cs): a list of characters sealed into a string");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::CharsToStr)));
+        asm.comment("rcx = a char[] -> rax = a string of the same characters");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm("mov  rbx, [rsi-8]");
+        asm.asm(&format!("lea  {RCX}, [rbx*4+8]"));
+        asm.asm(&format!("call {ALLOC}"));
+        asm.asm(&format!("mov  [{RAX}], rbx"));
+        asm.asm(&format!("add  {RAX}, 8"));
+        asm.asm(&format!("xor  {RCX}, {RCX}"));
+        asm.line(".copy:");
+        asm.asm(&format!("cmp  {RCX}, rbx"));
+        asm.asm("jae  .copied");
+        asm.comment("eight bytes wide in a list, four in a string");
+        asm.asm(&format!("mov  edx, [rsi+{RCX}*8]"));
+        asm.asm(&format!("mov  [{RAX}+{RCX}*4], edx"));
+        asm.asm(&format!("inc  {RCX}"));
+        asm.asm("jmp  .copy");
+        asm.line(".copied:");
+        asm.asm("add  rsp, 40");
+        asm.asm("pop  rsi");
+        asm.asm("pop  rbx");
+        asm.asm("ret");
+    }
+
+    if used.list_clone {
+        asm.blank();
+        asm.comment("a second list holding the same elements — what assigning one costs");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::ListClone)));
+        asm.comment("rcx = the list -> rax = a list of its own");
+        asm.asm("push rbx");
+        asm.asm("push rsi");
+        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        asm.asm(&format!("mov  rsi, {RCX}"));
+        asm.asm("mov  rbx, [rsi-8]");
+        asm.asm(&format!("mov  {RCX}, rbx"));
+        asm.asm(&format!("call {}", runtime_symbol(Runtime::ListNew)));
+        asm.asm(&format!("xor  {RCX}, {RCX}"));
+        asm.line(".copy:");
+        asm.asm(&format!("cmp  {RCX}, rbx"));
+        asm.asm("jae  .copied");
+        asm.asm(&format!("mov  {RDX}, [rsi+{RCX}*8]"));
+        asm.asm(&format!("mov  [{RAX}+{RCX}*8], {RDX}"));
+        asm.asm(&format!("inc  {RCX}"));
+        asm.asm("jmp  .copy");
+        asm.line(".copied:");
+        asm.asm("add  rsp, 40");
         asm.asm("pop  rsi");
         asm.asm("pop  rbx");
         asm.asm("ret");
@@ -1453,10 +1622,10 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             }
             // The count a string carries in the eight bytes before its
             // characters. One load, which is why `len` is not a routine.
-            Instr::StrLen { dst, str } => {
-                let str = self.in_register(str, SCRATCH0);
+            Instr::Count { dst, of } => {
+                let of = self.in_register(of, SCRATCH0);
                 let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("mov  {work}, [{str}-8]"));
+                self.asm.asm(&format!("mov  {work}, [{of}-8]"));
                 self.store_back(*dst, &work);
             }
             Instr::Store { addr, value } => {
@@ -2229,6 +2398,24 @@ mod tests {
         let setup = asm.find("call SetConsoleOutputCP").expect("the console setup");
         let print = asm.find(PRINT_CHAR).expect("the print routine");
         assert!(main < setup && setup < print, "{asm}");
+    }
+
+    #[test]
+    fn cloning_a_list_brings_the_routine_that_builds_one_with_it() {
+        // `list_clone` calls `list_new`, and no instruction says so — the kind
+        // of dependency that only shows up when the assembler cannot find a
+        // symbol, so it is asserted here instead.
+        let asm = compile("int[] a = [1];\nint[] b = a;\nprint(len(b));");
+        assert!(asm.contains(&format!("{}:", runtime_symbol(Runtime::ListClone))), "{asm}");
+        assert!(asm.contains(&format!("{}:", runtime_symbol(Runtime::ListNew))), "{asm}");
+    }
+
+    #[test]
+    fn a_program_without_lists_carries_none_of_their_routines() {
+        let asm = compile("int[3] a = [1, 2, 3];\nprint(a[0]);");
+        for routine in [Runtime::ListNew, Runtime::ListPush, Runtime::ListClone] {
+            assert!(!asm.contains(&runtime_symbol(routine)), "{routine:?} in {asm}");
+        }
     }
 
     #[test]

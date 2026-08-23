@@ -27,7 +27,7 @@ use tinyc::codegen::Target;
 
 /// Programs that must keep printing exactly what `examples/expected/<name>.txt`
 /// says, and the source of truth for what a working TinyC program looks like.
-const EXAMPLES: [&str; 11] = [
+const EXAMPLES: [&str; 12] = [
     "hello.tc",
     "arith.tc",
     "spill.tc",
@@ -39,6 +39,7 @@ const EXAMPLES: [&str; 11] = [
     "arrays.tc",
     "classes.tc",
     "strings.tc",
+    "lists.tc",
 ];
 
 #[test]
@@ -119,7 +120,7 @@ fn the_awkward_corners_of_code_generation_still_compute() {
 fn strings_hold_characters_rather_than_bytes() {
     let Some(tools) = Tools::find() else { return };
 
-    let cases: [(&str, &str); 16] = [
+    let cases: [(&str, &str); 17] = [
         // A length is a count of characters, whatever they cost to write.
         (r#"print(len("héllo"));"#, "5"),
         (r#"print(len("日本語"));"#, "3"),
@@ -146,15 +147,113 @@ fn strings_hold_characters_rather_than_bytes() {
         (r#"print(string(char(int('語'))) == "語");"#, "true"),
         // A number written out, including the one with no positive twin.
         (r#"print(string(0 - 9223372036854775807 - 1) == "-9223372036854775808");"#, "true"),
-        // Enough joining to send the arena back to `malloc` for another chunk.
+        // Enough joining to send the arena back to `malloc` for more chunks.
+        // Deliberately modest: `s = s + x` abandons every intermediate, so the
+        // memory this costs grows with the *square* of the loop count.
         (r#"string s = "";
-            for (int i = 0; i < 5000; i = i + 1) {
+            for (int i = 0; i < 300; i = i + 1) {
               s = s + "0123456789";
             }
-            print(len(s));"#, "50000"),
+            print(len(s));"#, "3000"),
+        // Doubling, which asks for one block larger than a whole chunk — the
+        // path where the arena gives up on its usual size and asks for what was
+        // wanted instead. It also joins a string to *itself*, so the two source
+        // pointers the copy loops walk are the same one.
+        (r#"string s = "0123456789abcdef";
+            for (int i = 0; i < 11; i = i + 1) {
+              s = s + s;
+            }
+            print(len(s));"#, "32768"),
     ];
 
     run_each(&tools, "string", &cases);
+}
+
+/// What a list does, checked by running it.
+///
+/// The cases that matter most are the ones where growing *moves* the elements:
+/// a list that never outgrows its first block would hide every mistake in the
+/// copy, so several of these deliberately push past it.
+#[test]
+fn lists_grow_and_stay_their_owners() {
+    let Some(tools) = Tools::find() else { return };
+
+    let cases: [(&str, &str); 12] = [
+        (r#"int[] xs = [];
+            print(len(xs));"#, "0"),
+        (r#"int[] xs = [3, 1, 4];
+            print(len(xs) * 100 + xs[2]);"#, "304"),
+        // Past the first block, so the elements are copied at least twice.
+        (r#"int[] xs = [];
+            for (int i = 0; i < 100; i = i + 1) { push(xs, i); }
+            print(len(xs) * 1000 + xs[99]);"#, "100099"),
+        // Every element survives the moves, not just the last one.
+        (r#"int[] xs = [];
+            for (int i = 0; i < 100; i = i + 1) { push(xs, i * i); }
+            int total = 0;
+            for (int i = 0; i < len(xs); i = i + 1) { total = total + xs[i]; }
+            print(total);"#, "328350"),
+        // Assignment copies: growing one must not be visible through the other,
+        // and neither must writing an element.
+        (r#"int[] a = [1, 2];
+            int[] b = a;
+            push(b, 3);
+            print(len(a) * 10 + len(b));"#, "23"),
+        (r#"int[] a = [1, 2];
+            int[] b = a;
+            b[0] = 9;
+            print(a[0] * 10 + b[0]);"#, "19"),
+        // ... even when the copy is made from a list that has already moved.
+        (r#"int[] a = [];
+            for (int i = 0; i < 50; i = i + 1) { push(a, i); }
+            int[] b = a;
+            push(b, 999);
+            print(len(a) * 1000 + b[50]);"#, "50999"),
+        // A parameter borrows: writing an element is visible to the caller.
+        (r#"int[] a = [1, 2];
+            double_each(a);
+            print(a[0] + a[1]);"#, "6"),
+        // A returned list outlives the call that built it.
+        (r#"int[] a = squares(30);
+            print(len(a) * 10000 + a[29]);"#, "300900"),
+        // Lists of the other things that fit in a register.
+        (r#"string[] w = [];
+            push(w, "a");
+            push(w, "bé");
+            print(len(w) * 10 + len(w[1]));"#, "22"),
+        (r#"char[] cs = ['a', 'b'];
+            push(cs, 'c');
+            print(string(cs) == "abc");"#, "true"),
+        // The reason lists come before `read_line`: building a string this way
+        // is linear, where `s = s + x` in a loop is quadratic in both time and
+        // memory. 20000 characters would cost gigabytes the other way.
+        (r#"char[] cs = [];
+            for (int i = 0; i < 20000; i = i + 1) { push(cs, '0'); }
+            string s = string(cs);
+            print(len(s));"#, "20000"),
+    ];
+
+    // Two of the cases call helpers, so they are compiled with them in scope.
+    for (index, (body, expected)) in cases.iter().enumerate() {
+        let name = format!("list{index}");
+        let source = tools.scratch.join(format!("{name}.tc"));
+        let program = format!(
+            "fn double_each(int[] xs) {{\n\
+             \x20 for (int i = 0; i < len(xs); i = i + 1) {{ xs[i] = xs[i] * 2; }}\n\
+             }}\n\
+             fn squares(int n) -> int[] {{\n\
+             \x20 int[] out = [];\n\
+             \x20 for (int i = 1; i <= n; i = i + 1) {{ push(out, i * i); }}\n\
+             \x20 return out;\n\
+             }}\n\
+             fn main() {{\n{body}\n}}\n"
+        );
+        std::fs::write(&source, program).unwrap();
+
+        let run = tools.build_and_run(&source, &name);
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
 }
 
 /// Compile each body as the whole of `main`, run it, and check what it printed.

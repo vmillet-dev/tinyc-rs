@@ -118,14 +118,15 @@ pub enum Instr {
     /// which is the one case where the address is not a single `lea`, because
     /// x86 scales by 1, 2, 4 or 8 and nothing else.
     Elem { dst: VReg, base: Value, index: Value, len: Value, scale: u32 },
-    /// `dst = len(str)`: the character count a string carries in front of its
-    /// characters.
+    /// `dst = len(of)`: the count that a string or a list carries in the eight
+    /// bytes in front of its elements.
     ///
     /// The one place the compiler reads *behind* an address it was given. That
-    /// is the whole reason the count lives there: a string stays one pointer,
+    /// is the whole reason the count lives there: the value stays one pointer,
     /// so it still travels in a register and still fits in an array slot, and
-    /// yet knows its own length.
-    StrLen { dst: VReg, str: Value },
+    /// yet knows its own length. It is also what makes strings and lists one
+    /// question here — `len` never asks which of the two it was handed.
+    Count { dst: VReg, of: Value },
     /// `dst = *addr`, reading four bytes and widening them.
     ///
     /// Only a string's characters are narrower than a machine word. Everywhere
@@ -196,6 +197,21 @@ pub enum Runtime {
     CharToStr,
     /// `(n) -> string`: the number written out in decimal.
     IntToStr,
+    /// `(n) -> list`: room for `n` elements, with the length already set —
+    /// what a list literal fills in.
+    ListNew,
+    /// `(list, value) -> list`: one more element on the end, **answering where
+    /// the list now is**. Growing copies the elements into a larger block, so
+    /// the address may change and the caller has to be told.
+    ListPush,
+    /// `(chars) -> string`: the characters of a `char[]`, sealed into a string.
+    ///
+    /// The way to build a string a character at a time without paying for a
+    /// whole new string on each one.
+    CharsToStr,
+    /// `(list) -> list`: a new list holding the same elements. What makes
+    /// assigning a list a copy rather than a second name for one.
+    ListClone,
 }
 
 impl Runtime {
@@ -207,6 +223,10 @@ impl Runtime {
             Runtime::CheckChar => "check_char",
             Runtime::CharToStr => "char_str",
             Runtime::IntToStr => "int_str",
+            Runtime::ListNew => "list_new",
+            Runtime::ListPush => "list_push",
+            Runtime::ListClone => "list_clone",
+            Runtime::CharsToStr => "chars_str",
         }
     }
 }
@@ -338,7 +358,7 @@ impl Instr {
             Instr::Copy { src, .. }
             | Instr::Load { addr: src, .. }
             | Instr::LoadChar { addr: src, .. }
-            | Instr::StrLen { str: src, .. } => reg(src),
+            | Instr::Count { of: src, .. } => reg(src),
             Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => {
                 reg(lhs);
                 reg(rhs);
@@ -380,7 +400,7 @@ impl Instr {
             | Instr::Field { dst, .. }
             | Instr::Load { dst, .. }
             | Instr::LoadChar { dst, .. }
-            | Instr::StrLen { dst, .. }
+            | Instr::Count { dst, .. }
             | Instr::Cmp { dst, .. } => Some(*dst),
             Instr::Call { dst, .. } | Instr::CallVirtual { dst, .. } | Instr::RtCall { dst, .. } => {
                 *dst
@@ -560,8 +580,8 @@ impl Program {
                 value(index),
                 value(len)
             ),
-            Instr::StrLen { dst, str } => {
-                format!("%{} = strlen {}", function.name_of(*dst), value(str))
+            Instr::Count { dst, of } => {
+                format!("%{} = count {}", function.name_of(*dst), value(of))
             }
             Instr::LoadChar { dst, addr } => {
                 format!("%{} = loadchar {}", function.name_of(*dst), value(addr))
@@ -1042,7 +1062,7 @@ impl Lowering<'_> {
                 let ty = self.types.of(*id);
                 let dst = self.declare(name, ty);
                 match ty.fits_in_a_register() {
-                    true => self.expr_into(dst, init),
+                    true => self.keep_into(dst, init),
                     // An aggregate variable owns its room. An expression that
                     // reserved some already moves in; anything else names room
                     // that belongs to something else, and is copied out of it.
@@ -1059,7 +1079,7 @@ impl Lowering<'_> {
                     match ty.fits_in_a_register() {
                         // The variable keeps its register; the assignment
                         // overwrites it.
-                        true => self.expr_into(dst, value),
+                        true => self.keep_into(dst, value),
                         // An aggregate variable keeps its *room*, so the value
                         // is copied into it rather than the address swapped.
                         // Anything else would make assignment aliasing.
@@ -1073,6 +1093,37 @@ impl Lowering<'_> {
                     self.write_through(Value::Reg(addr), value);
                 }
             },
+            // The routine answers where the list *now* is, and that answer has
+            // to land back where the list is named — which is the whole reason
+            // `push` takes a place rather than a value.
+            Stmt::Push { target, value, .. } => {
+                let value = self.expr(value);
+                match target {
+                    Place::Var { name, .. } => {
+                        let (dst, _) = self.binding(name);
+                        self.emit(Instr::RtCall {
+                            dst: Some(dst),
+                            callee: Runtime::ListPush,
+                            args: vec![Value::Reg(dst), value],
+                        });
+                    }
+                    target => {
+                        let addr = self.place_address(target);
+                        let held = self.fresh_temp();
+                        self.emit(Instr::Load { dst: held, addr: Value::Reg(addr) });
+                        let grown = self.fresh_temp();
+                        self.emit(Instr::RtCall {
+                            dst: Some(grown),
+                            callee: Runtime::ListPush,
+                            args: vec![Value::Reg(held), value],
+                        });
+                        self.emit(Instr::Store {
+                            addr: Value::Reg(addr),
+                            value: Value::Reg(grown),
+                        });
+                    }
+                }
+            }
             Stmt::Print { value, .. } => {
                 let ty = self.types.of(value.id);
                 let val = self.expr(value);
@@ -1098,7 +1149,18 @@ impl Lowering<'_> {
                 self.new_block(BlockKind::Unreachable);
             }
             Stmt::Return { value, .. } => {
-                let value = value.as_ref().map(|expr| self.expr(expr));
+                // Handed *outward*, so a list somebody else owns is copied
+                // here rather than at the call site — which is what lets the
+                // caller treat every returned list as its own. Nothing else
+                // needs a register of its own: `return 0` stays an immediate.
+                let value = value.as_ref().map(|expr| match self.types.of(expr.id) {
+                    Ty::List(_) => {
+                        let dst = self.fresh_temp();
+                        self.keep_into(dst, expr);
+                        Value::Reg(dst)
+                    }
+                    _ => self.expr(expr),
+                });
                 self.terminate(Terminator::Return(value));
                 // Anything written after a `return` still needs somewhere to
                 // go. This block has no predecessor, so it is dead code the
@@ -1369,15 +1431,42 @@ impl Lowering<'_> {
                 (Value::Const(i64::from(info.len)), self.table.size_of(info.elem))
             }
             Ty::Str => (self.length_of(base), CHAR_BYTES),
-            _ => unreachable!("sema rejects indexing anything but an array or a string"),
+            // A list holds only what fits in a register, so its elements are
+            // eight bytes each and the address is always a single `lea`.
+            Ty::List(_) => (self.length_of(base), 8),
+            _ => unreachable!("sema rejects indexing anything without elements"),
         }
     }
 
-    /// The character count in front of a string's characters.
-    fn length_of(&mut self, str: Value) -> Value {
+    /// The count in front of a string's characters or a list's elements.
+    fn length_of(&mut self, of: Value) -> Value {
         let dst = self.fresh_temp();
-        self.emit(Instr::StrLen { dst, str });
+        self.emit(Instr::Count { dst, of });
         Value::Reg(dst)
+    }
+
+    /// Lower a value that is about to be **kept** — put in a variable, or
+    /// handed back from a function.
+    ///
+    /// A list is one pointer, so lowering one straight into a variable would
+    /// give two names to one run of elements. Every other type in the language
+    /// either cannot be written to, so the sharing could not be observed, or is
+    /// too big to fit in a register and is copied by the code above. A list is
+    /// neither, so this is where "assignment copies, never aliases" is paid
+    /// for.
+    ///
+    /// Something that built its own is nobody else's already, and moves in as
+    /// it is — which is why a function that returns a list costs no copy at the
+    /// call site: it cloned at its own `return`, if it had anything to clone.
+    fn keep_into(&mut self, dst: VReg, expr: &Expr) {
+        self.expr_into(dst, expr);
+        if matches!(self.types.of(expr.id), Ty::List(_)) && !builds_its_own(expr) {
+            self.emit(Instr::RtCall {
+                dst: Some(dst),
+                callee: Runtime::ListClone,
+                args: vec![Value::Reg(dst)],
+            });
+        }
     }
 
     /// Whether this is one of the operators a string gives a second meaning to,
@@ -1440,6 +1529,7 @@ impl Lowering<'_> {
             (Ty::Int, Prim::Char) if !settled => Runtime::CheckChar,
             (Ty::Char, Prim::Str) => Runtime::CharToStr,
             (Ty::Int, Prim::Str) => Runtime::IntToStr,
+            (Ty::List(_), Prim::Str) => Runtime::CharsToStr,
             // A code point *is* the character's representation, so reading one
             // as the other moves nothing at all.
             _ => return self.emit(Instr::Copy { dst, src }),
@@ -1659,6 +1749,28 @@ impl Lowering<'_> {
                 self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
             }
             ExprKind::MethodCall { .. } => self.method_call(Some(dst), expr),
+            // A list literal reserves nothing in the frame: its elements live
+            // in the arena, because how many there will be by the end is not a
+            // question this function can answer.
+            ExprKind::Array { elements, .. } if matches!(self.types.of(expr.id), Ty::List(_)) => {
+                let len = Value::Const(elements.len() as i64);
+                self.emit(Instr::RtCall {
+                    dst: Some(dst),
+                    callee: Runtime::ListNew,
+                    args: vec![len],
+                });
+                for (index, element) in elements.iter().enumerate() {
+                    let addr = self.fresh_temp();
+                    self.emit(Instr::Elem {
+                        dst: addr,
+                        base: Value::Reg(dst),
+                        index: Value::Const(index as i64),
+                        len,
+                        scale: 8,
+                    });
+                    self.write_through(Value::Reg(addr), element);
+                }
+            }
             ExprKind::Array { elements, .. } => {
                 let ty = self.types.of(expr.id);
                 let (len, scale) = self.shape_of(ty, Value::Reg(dst));
@@ -3039,10 +3151,10 @@ mod tests {
     #[test]
     fn an_arrays_length_is_a_constant_and_a_strings_is_a_load() {
         let ir = lower_main("int[3] xs = [1, 2, 3];\nprint(len(xs));");
-        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::StrLen { .. })), "{}", ir.dump());
+        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::Count { .. })), "{}", ir.dump());
 
         let ir = lower_main("print(len(\"abc\"));");
-        assert!(instrs(&ir).iter().any(|i| matches!(i, Instr::StrLen { .. })), "{}", ir.dump());
+        assert!(instrs(&ir).iter().any(|i| matches!(i, Instr::Count { .. })), "{}", ir.dump());
     }
 
     #[test]
@@ -3087,6 +3199,87 @@ mod tests {
             "{}",
             ir.dump()
         );
+    }
+
+    /// Every runtime routine a lowering reached.
+    fn routines(ir: &Program) -> Vec<Runtime> {
+        instrs(ir)
+            .iter()
+            .filter_map(|i| match i {
+                Instr::RtCall { callee, .. } => Some(*callee),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assigning_a_list_copies_it_and_passing_one_does_not() {
+        // The whole of "assignment copies, never aliases" for the one mutable
+        // thing in the language, in two lowerings.
+        let ir = lower_main("int[] a = [1];\nint[] b = a;\nprint(len(b));");
+        assert!(routines(&ir).contains(&Runtime::ListClone), "{}", ir.dump());
+
+        let ir = lower_src(
+            "fn f(int[] xs) -> int {\n  return len(xs);\n}\n\
+             fn main() {\n  int[] a = [1];\n  print(f(a));\n}\n",
+        );
+        let calls: Vec<Runtime> = ir
+            .functions
+            .iter()
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.instrs)
+            .filter_map(|i| match i {
+                Instr::RtCall { callee, .. } => Some(*callee),
+                _ => None,
+            })
+            .collect();
+        assert!(!calls.contains(&Runtime::ListClone), "a parameter borrows: {}", ir.dump());
+    }
+
+    #[test]
+    fn a_freshly_built_list_moves_in_rather_than_being_copied() {
+        // A literal is nobody else's already, so there is nothing to copy.
+        let ir = lower_main("int[] a = [1, 2];\nprint(len(a));");
+        assert!(!routines(&ir).contains(&Runtime::ListClone), "{}", ir.dump());
+        assert!(routines(&ir).contains(&Runtime::ListNew), "{}", ir.dump());
+    }
+
+    #[test]
+    fn returning_a_borrowed_list_copies_it_at_the_return() {
+        // Copied here rather than at the call site, which is what lets every
+        // caller treat a returned list as its own.
+        let ir = lower_src(
+            "fn f(int[] xs) -> int[] {\n  return xs;\n}\nfn main() {\n  print(len(f([1])));\n}\n",
+        );
+        let returned: Vec<Runtime> = ir.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .filter_map(|i| match i {
+                Instr::RtCall { callee, .. } => Some(*callee),
+                _ => None,
+            })
+            .collect();
+        assert!(returned.contains(&Runtime::ListClone), "{}", ir.dump());
+    }
+
+    #[test]
+    fn push_writes_the_new_address_back_where_the_list_is_named() {
+        let ir = lower_main("int[] a = [];\npush(a, 1);\nprint(len(a));");
+        let pushes: Vec<&Instr> = instrs(&ir)
+            .into_iter()
+            .filter(|i| matches!(i, Instr::RtCall { callee: Runtime::ListPush, .. }))
+            .collect();
+        assert_eq!(pushes.len(), 1);
+        // The list's own register is both what goes in and what comes back.
+        let Instr::RtCall { dst: Some(dst), args, .. } = pushes[0] else { panic!("a push") };
+        assert_eq!(args[0], Value::Reg(*dst), "{}", ir.dump());
+    }
+
+    #[test]
+    fn a_list_index_is_checked_against_a_length_it_has_to_load() {
+        let ir = lower_main("int[] a = [1, 2];\nprint(a[0]);");
+        assert!(instrs(&ir).iter().any(|i| matches!(i, Instr::Count { .. })), "{}", ir.dump());
     }
 
     #[test]

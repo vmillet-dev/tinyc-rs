@@ -115,13 +115,14 @@ field   := type IDENT ";"
 fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 params  := param ("," param)*
 param   := type IDENT | "self"
-type    := ("int" | "string" | "char" | "bool" | IDENT) ("[" INT "]")?
-stmt    := decl | assign | print | if | while | for | match | return
+type    := ("int" | "string" | "char" | "bool" | IDENT) ("[" INT? "]")?
+stmt    := decl | assign | print | push | if | while | for | match | return
          | break | continue | call ";"
 decl    := type IDENT "=" expr ";"
 assign  := place "=" expr ";"
 place   := IDENT (("[" expr "]") | ("." IDENT))*
 print   := "print" "(" expr ")" ";"
+push    := "push" "(" place "," expr ")" ";"
 if      := "if" "(" expr ")" block ("else" (block | if))?
 while   := "while" "(" expr ")" block
 for     := "for" "(" (decl | assign) expr ";" assign ")" block
@@ -152,7 +153,8 @@ arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
 `int` is a 64-bit signed integer, `string` is a run of characters, `char` is one
 Unicode character, `bool` is `true` or `false`, an `enum` declares a type of its
 own with a fixed set of values, a `class` declares one with fields and methods,
-and `int[3]` is a fixed-length array of them. Arithmetic is `int`-only, `+` also
+`int[3]` is a fixed-length array of them and `int[]` a list whose length the
+program decides. Arithmetic is `int`-only, `+` also
 joins two strings, `&&`, `||` and `!` are `bool`-only, `//` starts a comment, and
 a variable keeps the type it was declared with — assigning a `string` to an
 `int` is an error.
@@ -472,6 +474,7 @@ is written out, and these four conversions are the whole list:
 | `char(n)` | the character with that code point | `n` names none — checked at compile time when it is a constant, at run time otherwise |
 | `string(c)` | a string of that one character | never |
 | `string(n)` | a number written out in decimal | never |
+| `string(cs)` | the characters of a `char[]`, sealed into a string | never |
 
 A string is **read-only**: `s[i] = c` is a compile error, and `+` produces a
 third string rather than changing either operand. That is what makes sharing one
@@ -499,6 +502,41 @@ rule existed to answer does not arise. No lifetimes, no reference counts, no
 collector. What it costs is memory a long-running program stops using and never
 reclaims; TinyC programs run and finish, so the trade is a good one, and it is
 the whole reason a string can be a value here at all.
+
+**The sharp edge that buys: building a string in a loop.**
+
+```c
+string s = "";
+for (int i = 0; i < 4000; i = i + 1) {
+  s = s + "0123456789";   // 313 MB peak, for a 160 KB answer
+}
+```
+
+Each turn allocates the whole of the new string and abandons the whole of the
+old one, so both the copying and the *memory* grow with the square of the loop
+count. Java, C# and Python have the same quadratic copying on `s += x`; what is
+different here is that their collectors reclaim the intermediates and this arena
+does not, so the trap that costs time elsewhere costs memory here.
+
+It cannot be fixed inside `+`, and the reason is worth knowing: the length lives
+*with* the characters. `t = s` copies one pointer, so `t` and `s` share the
+count at `[p-8]`, and appending in place would bump a count `t` can see —
+breaking exactly the immutability that makes sharing safe in the first place.
+Fixing it needs either a two-word string value, which would stop a string
+fitting in a register, or knowing that nothing else points at `s`, which needs
+ownership. Both undo more than they buy.
+
+What fixes it is a [list](#lists) of characters: `push` doubles the capacity, so
+n characters cost O(n) work and O(n) garbage instead of O(n²) of each. Building
+400 000 characters both ways, measured:
+
+| | peak memory | time |
+|---|---|---|
+| `s = s + x` in a loop | 2.3 GB, then `runtime error: out of memory` | did not finish |
+| `push` onto a `char[]`, then `string(cs)` | 11.9 MB | 76 ms |
+
+Accumulating characters and reading an unknown quantity of input are the same
+problem, and one answer serves both.
 
 **A string is one pointer, with its length in front of it.**
 
@@ -536,6 +574,96 @@ prints allocates once — and handed to the same `printf` everything else uses, 
 nothing interleaves. The entry point of a program that writes text also calls
 `SetConsoleOutputCP(65001)` first: without it a Windows console renders `é` as
 mojibake, and the language's promise about characters would stop at the terminal.
+
+### Lists
+
+An array's length is part of its type. A **list**'s is not
+([`examples/lists.tc`](examples/lists.tc)):
+
+```c
+int[] xs = [];
+for (int i = 1; i <= 3; i = i + 1) {
+  push(xs, i * i);
+}
+print(len(xs));    // 3
+print(xs[2]);      // 9
+```
+
+`int[3]` and `int[]` are different types, and neither replaces the other: use
+the array when the count is a fact about the *program*, the list when it is a
+fact about the *data*. What you give up is the compile-time index check — a
+list's length is not knowable until it exists, so every index costs the same
+single unsigned comparison a computed one costs on an array. What you get is the
+only thing an array cannot do: hold a quantity nobody knew in advance, and be
+returned from the function that built it.
+
+**`push` takes a place, not a value**, and that is the whole design in one
+detail. Growing a list may *move* it — the elements are copied into a larger
+block — so whoever names the list has to be told where it went. A variable can
+be told; an expression cannot. For the same reason `push` onto a **parameter**
+is a compile error:
+
+```
+error: cannot push onto `xs`, which is a parameter
+  |
+2 |   push(xs, 1);
+  |        ^^ a parameter is the caller's list, and growing it may move it
+```
+
+Left alone that would be the worst kind of bug. The length lives *with* the
+elements, so a push that happened to fit would be visible to the caller and a
+push that had to move would silently not be. Writing an *element* through a
+parameter is fine, and visible, exactly as it is for an array — nothing moves.
+
+**Assigning a list copies its elements.** A list is the one thing in the
+language that can be written to *and* travels as an address, so without the copy
+two names for one list would be observable the moment either was written
+through. Every other type either cannot be written to (a string) or is copied
+outright (an array, an object). This is what keeps "assignment copies, never
+aliases" true without exception.
+
+A list holds what fits in a register: `int`, `string`, `char`, `bool`, and any
+enum. Not an object, which would have to be copied rather than moved on every
+growth — and not another list, which would put the aliasing back by the side
+door. A field of a class cannot be a list yet for that second reason.
+
+### What lists changed underneath
+
+**A list is laid out like a string, on purpose.**
+
+```
+[ capacity : 8 ][ length : 8 ][ elements, 8 bytes each ]
+                              ^ this is the value
+```
+
+The length sits at `[p-8]` for both, so `len` is one instruction that never asks
+which of the two it was handed. `Instr::Count` is that instruction, and it is
+the only place in the compiler that reads *behind* an address it was given —
+which is exactly what lets a list stay one pointer, travel in a register, and
+still know how long it is.
+
+**Three routines, and all of them are loops.** `list_new` cuts a block from the
+arena, `list_push` appends and doubles when full, `list_clone` is what an
+assignment costs. Everything else is inline: indexing is a bounds check and a
+`lea`, `len` is a load. The rule is the same one the strings follow — a call
+only where there is a loop.
+
+**Growing abandons the old block**, like everything else on this arena. Doubling
+is what keeps that honest: n pushes copy 2n elements in total and leave n behind,
+so both stay linear.
+
+**A literal now takes its shape from the type it is given to.** `[1, 2, 3]` is an
+`int[3]` on its own and an `int[]` where a list is wanted, and nothing in the
+literal could say which — so `sema` checks a value against the type it is going
+to at the four places one can be handed over: a declaration, an assignment, a
+return, and an argument. It is the only expression in the language whose type
+depends on its context, and `[]` — a list with nothing in it — is the case that
+makes it necessary rather than merely convenient.
+
+**A name now knows whether it is a parameter.** The scope holds a `Binding`
+rather than a bare type, for one question asked in one place: `push` onto a
+parameter is refused. That is the smallest amount of ownership tracking that
+makes the arena safe to grow things in.
 
 ### Enums and exhaustive matching
 

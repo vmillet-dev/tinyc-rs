@@ -46,7 +46,8 @@
 use crate::ast;
 use crate::ast::{
     ArmBody, BinOp, Block, ClassDecl, CmpOp, EnumDecl, Expr, ExprKind, FieldDecl, FieldInit,
-    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Prim, Program, Stmt, TypeRef, Variant,
+    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Prim, Program, Shape, Stmt, TypeRef,
+    Variant,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{Token, TokenKind};
@@ -232,8 +233,14 @@ impl<'a> Parser<'a> {
 
         // `int[3]`. The length is a literal rather than an expression: it is
         // part of the *type*, and a type is not something the program computes.
+        // `int[]` says the opposite — that the length is not knowable here —
+        // and the brackets are empty for exactly that reason.
         if !self.eat(&TokenKind::LBracket) {
-            return Ok(TypeRef { name, array_len: None, span });
+            return Ok(TypeRef { name, shape: Shape::One, span });
+        }
+        if let TokenKind::RBracket = self.peek().kind {
+            let close = self.bump().span;
+            return Ok(TypeRef { name, shape: Shape::List, span: span.to(close) });
         }
         let token = self.peek();
         let TokenKind::Int(len) = token.kind else {
@@ -242,11 +249,11 @@ impl<'a> Parser<'a> {
                 token.span,
             )
             .with_label("a length has to be written out here")
-            .with_note("`int[3]` is an array of three ints", None));
+            .with_note("`int[3]` is an array of three ints, and `int[]` a list of them", None));
         };
         let len_span = self.bump().span;
         let close = self.expect(TokenKind::RBracket)?.span;
-        Ok(TypeRef { name, array_len: Some((len, len_span)), span: span.to(close) })
+        Ok(TypeRef { name, shape: Shape::Array(len, len_span), span: span.to(close) })
     }
 
     /// Whether a declaration starts at the current token.
@@ -264,11 +271,16 @@ impl<'a> Parser<'a> {
             TokenKind::KwInt | TokenKind::KwString | TokenKind::KwChar | TokenKind::KwBool => true,
             TokenKind::Ident(_) => match self.peek_at(1).kind {
                 TokenKind::Ident(_) => true,
-                TokenKind::LBracket => {
-                    matches!(self.peek_at(2).kind, TokenKind::Int(_))
-                        && matches!(self.peek_at(3).kind, TokenKind::RBracket)
-                        && matches!(self.peek_at(4).kind, TokenKind::Ident(_))
-                }
+                TokenKind::LBracket => match self.peek_at(2).kind {
+                    // `Colour[] cs` — nothing between the brackets, so the
+                    // third token settles it: an index always has something.
+                    TokenKind::RBracket => matches!(self.peek_at(3).kind, TokenKind::Ident(_)),
+                    TokenKind::Int(_) => {
+                        matches!(self.peek_at(3).kind, TokenKind::RBracket)
+                            && matches!(self.peek_at(4).kind, TokenKind::Ident(_))
+                    }
+                    _ => false,
+                },
                 _ => false,
             },
             _ => false,
@@ -438,6 +450,7 @@ impl<'a> Parser<'a> {
         }
         match self.peek().kind {
             TokenKind::KwPrint => self.print_stmt(),
+            TokenKind::KwPush => self.push_stmt(),
             TokenKind::KwIf => self.if_stmt(),
             TokenKind::KwWhile => self.while_stmt(),
             TokenKind::KwFor => self.for_stmt(),
@@ -706,6 +719,23 @@ impl<'a> Parser<'a> {
         self.expect_closing_paren(open)?;
         self.expect(TokenKind::Semi)?;
         Ok(Stmt::Print { span, value })
+    }
+
+    /// `push(xs, value);`
+    ///
+    /// The first argument is parsed as an expression and then required to be a
+    /// place, which is how the assignment statement does it too — the two are
+    /// indistinguishable until the shape of the whole statement is known, and
+    /// `into_place` is where the demand is made.
+    fn push_stmt(&mut self) -> PResult<Stmt> {
+        let span = self.bump().span;
+        let open = self.expect(TokenKind::LParen)?.span;
+        let target = Self::into_place(self.primary()?)?;
+        self.expect(TokenKind::Comma)?;
+        let value = self.expr()?;
+        self.expect_closing_paren(open)?;
+        self.expect(TokenKind::Semi)?;
+        Ok(Stmt::Push { span, target, value })
     }
 
     /// `||` binds loosest of all, so `a < 1 || b < 2` is one disjunction of two

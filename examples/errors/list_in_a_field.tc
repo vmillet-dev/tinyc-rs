@@ -1,0 +1,8 @@
+// Copying the object would copy the handle, so two objects would share one
+// list — and writing through either would be visible through the other.
+class Bag {
+  int[] items;
+}
+
+fn main() {
+}

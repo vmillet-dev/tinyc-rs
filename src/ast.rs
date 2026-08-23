@@ -10,6 +10,10 @@ pub struct EnumId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ArrayId(pub u32);
 
+/// Index of a list type in [`TypeTable::lists`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ListId(pub u32);
+
 /// What every stage after the parser needs to know about a declared enum: what
 /// it is called, and what its variants are called *in order*.
 ///
@@ -109,12 +113,21 @@ impl ClassInfo {
 pub struct TypeTable {
     pub enums: Vec<EnumInfo>,
     pub arrays: Vec<ArrayInfo>,
+    /// What each list type holds. A list has no length in its type — that is
+    /// the whole difference from an array — so this is one element type and
+    /// nothing else.
+    pub lists: Vec<Ty>,
     pub classes: Vec<ClassInfo>,
 }
 
 impl TypeTable {
     pub fn array(&self, id: ArrayId) -> ArrayInfo {
         self.arrays[id.0 as usize]
+    }
+
+    /// What a list holds.
+    pub fn element(&self, id: ListId) -> Ty {
+        self.lists[id.0 as usize]
     }
 
     pub fn enum_info(&self, id: EnumId) -> &EnumInfo {
@@ -229,6 +242,18 @@ pub enum Ty {
     /// The one type that does not fit in a register: a value of one lives in
     /// the frame, and what travels in a register is its address.
     Array(ArrayId),
+    /// A run of values whose length is only known while the program runs.
+    ///
+    /// Where an [`Ty::Array`] lives in the frame and carries its length in its
+    /// *type*, a list lives in the arena and carries its length in front of its
+    /// elements — exactly as a [`Ty::Str`] carries its own. So a list is one
+    /// pointer, it fits in a register, and `len` is a load rather than a
+    /// literal.
+    ///
+    /// It is the one **mutable** thing that is shared by address, which is why
+    /// assigning one copies its elements: without that, two names for one list
+    /// would be observable the moment either was written to.
+    List(ListId),
     /// An instance of a declared class. Like an array, it lives in the frame
     /// and travels as an address.
     Class(ClassId),
@@ -253,6 +278,9 @@ impl Ty {
                 let info = types.array(id);
                 format!("{}[{}]", info.elem.name(types), info.len)
             }
+            // The missing length *is* the name: `int[]` says "as many as the
+            // program turns out to need".
+            Ty::List(id) => format!("{}[]", types.element(id).name(types)),
         }
     }
 
@@ -290,7 +318,16 @@ impl Ty {
     /// call. Arrays and objects cannot — element by element is a loop nobody
     /// asked for, and the addresses are not what anybody meant.
     pub fn has_equality(self) -> bool {
-        !matches!(self, Ty::Array(_) | Ty::Class(_))
+        !matches!(self, Ty::Array(_) | Ty::List(_) | Ty::Class(_))
+    }
+
+    /// Whether `print` can render a value of this type.
+    ///
+    /// Not the same question as whether it fits in a register: a list does, and
+    /// printing it would show the address of its elements rather than the
+    /// elements — which is the answer to a question nobody asked.
+    pub fn is_printable(self) -> bool {
+        self.fits_in_a_register() && !matches!(self, Ty::List(_))
     }
 
     /// Whether a value of this type travels in a register.
@@ -313,11 +350,22 @@ impl Ty {
 #[derive(Clone, Debug)]
 pub struct TypeRef {
     pub name: String,
-    /// `Some((n, span))` when written `name[n]`, with the span of the length so
-    /// a nonsensical one can be underlined on its own.
-    pub array_len: Option<(i64, Span)>,
+    /// What the brackets after the name said, if there were any.
+    pub shape: Shape,
     /// The whole type as written, brackets included.
     pub span: Span,
+}
+
+/// What follows a type's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// `int` — the type itself.
+    One,
+    /// `int[3]` — an array, whose length is part of its type. The span is the
+    /// length's own, so a nonsensical one can be underlined by itself.
+    Array(i64, Span),
+    /// `int[]` — a list, whose length is not known until the program runs.
+    List,
 }
 
 /// A type written where a value is expected, which is how TinyC spells a
@@ -637,6 +685,18 @@ pub enum Stmt {
         span: Span,
         value: Expr,
     },
+    /// `push(xs, value);` — one more element on the end of a list.
+    ///
+    /// A statement rather than an expression, and its target a [`Place`] rather
+    /// than an [`Expr`], because growing a list may **move** it: the elements
+    /// are copied into a larger block, and whoever names the list has to be
+    /// told where it went. Only a place can be told.
+    Push {
+        /// Span of the `push` keyword, which is what a diagnostic underlines.
+        span: Span,
+        target: Place,
+        value: Expr,
+    },
     If {
         cond: Expr,
         then_block: Block,
@@ -926,9 +986,10 @@ fn place_text(place: &Place) -> String {
 /// A type as the program spelled it, for the AST dump — which has no table to
 /// resolve names against and does not need one.
 fn written_type(ty: &TypeRef) -> String {
-    match ty.array_len {
-        Some((len, _)) => format!("{}[{len}]", ty.name),
-        None => ty.name.clone(),
+    match ty.shape {
+        Shape::One => ty.name.clone(),
+        Shape::Array(len, _) => format!("{}[{len}]", ty.name),
+        Shape::List => format!("{}[]", ty.name),
     }
 }
 
@@ -956,6 +1017,10 @@ fn dump_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
         Stmt::Decl { ty, name, init, .. } => {
             out.push_str(&format!("{pad}decl {} {name}\n", written_type(ty)));
             dump_expr(out, init, depth + 1);
+        }
+        Stmt::Push { target, value, .. } => {
+            out.push_str(&format!("{pad}push {}\n", place_text(target)));
+            dump_expr(out, value, depth + 1);
         }
         Stmt::Assign { target, value } => {
             out.push_str(&format!("{pad}assign {}\n", place_text(target)));

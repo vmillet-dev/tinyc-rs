@@ -1,0 +1,107 @@
+// Lists: a run of values whose length the program decides.
+//
+// An array's length is part of its type, which is what lets the compiler check
+// a constant index before the program is built. A list gives that up in
+// exchange for the one thing an array cannot do: hold a quantity nobody knew in
+// advance. It lives in the same arena the strings do, so it can be returned —
+// and every index into it is checked where it lands, since there is nothing to
+// settle at compile time.
+//
+// `int[3]` and `int[]` are different types on purpose. Neither replaces the
+// other: use the array when the count is a fact about the program, the list
+// when it is a fact about the data.
+
+fn total(int[] xs) -> int {
+  int sum = 0;
+  for (int i = 0; i < len(xs); i = i + 1) {
+    sum = sum + xs[i];
+  }
+  return sum;
+}
+
+// A list may be returned, exactly as a string may: what comes back is a piece
+// of the arena, and the arena outlives every call.
+fn squares(int n) -> int[] {
+  int[] out = [];
+  for (int i = 1; i <= n; i = i + 1) {
+    push(out, i * i);
+  }
+  return out;
+}
+
+// A parameter is the caller's list, so writing *through* an element is visible
+// to the caller — the same rule an array parameter follows. Growing it is not
+// allowed at all, because growing may move the list and only the variable that
+// names it can be told where it went.
+fn double_each(int[] xs) {
+  for (int i = 0; i < len(xs); i = i + 1) {
+    xs[i] = xs[i] * 2;
+  }
+}
+
+// Building a string a character at a time. This is what a list is *for*: the
+// characters accumulate in one place that grows, and become a string once, at
+// the end. Writing `out = out + string(c)` instead would build a whole new
+// string on every character.
+fn shout(string text) -> string {
+  char[] out = [];
+  for (int i = 0; i < len(text); i = i + 1) {
+    char c = text[i];
+    if (c >= 'a' && c <= 'z') {
+      c = char(int(c) - 32);
+    }
+    push(out, c);
+  }
+  return string(out);
+}
+
+fn main() {
+  // A list starts from a literal — possibly an empty one, which is the only
+  // way to write a run of values with nothing in it.
+  int[] xs = [3, 1, 4];
+  print(len(xs));            // 3
+  print(xs[2]);              // 4
+
+  push(xs, 1);
+  push(xs, 5);
+  print(len(xs));            // 5
+  print(total(xs));          // 14
+
+  // Assignment copies the elements, so growing one list cannot be seen through
+  // the other. A list is the one thing in the language that can be written to
+  // *and* shared by address, so this copy is what keeps "assignment copies,
+  // never aliases" true.
+  int[] ys = xs;
+  push(ys, 100);
+  print(len(xs));            // 5
+  print(len(ys));            // 6
+
+  // Passing does not copy: the callee writes through the caller's own.
+  double_each(xs);
+  print(xs[0]);              // 6
+  print(total(xs));          // 28
+
+  // Writing an element, as in an array.
+  xs[0] = 30;
+  print(xs[0]);              // 30
+
+  // A thousand elements, none of them known when the program was compiled.
+  int[] big = squares(1000);
+  print(len(big));           // 1000
+  print(big[999]);           // 1000000
+
+  // Lists of the other things that fit in a register.
+  string[] words = ["un", "deux"];
+  push(words, "trois");
+  print(words[2]);           // trois
+  print(len(words));         // 3
+
+  bool[] flags = [];
+  push(flags, true);
+  push(flags, false);
+  print(flags[0]);           // true
+  print(len(flags));         // 2
+
+  // And the one that pays for the rest.
+  print(shout("héllo wörld"));   // HéLLO WöRLD
+}

@@ -1,0 +1,7 @@
+fn grow(int[] xs) {
+  push(xs, 1);
+}
+fn main() {
+  int[] xs = [1];
+  grow(xs);
+}

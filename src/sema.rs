@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     ArmBody, ArrayId, ArrayInfo, BinOp, Block, ClassId, ClassInfo, EnumId, EnumInfo, Expr,
+    ListId, Shape,
     ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Prim, Program,
     Stmt, Ty, TypeRef, TypeTable, is_scalar_value,
 };
@@ -80,6 +81,7 @@ struct Declared {
     enum_spans: Vec<Span>,
     enums_by_name: HashMap<String, EnumId>,
     arrays_by_shape: HashMap<(Ty, u32), ArrayId>,
+    lists_by_element: HashMap<Ty, ListId>,
     classes_by_name: HashMap<String, ClassId>,
     /// Where each class was declared.
     class_spans: Vec<Span>,
@@ -115,6 +117,18 @@ impl Declared {
         });
         Ty::Array(id)
     }
+
+    /// Interned like an array type, and for the same reason: `Ty` compares as
+    /// an integer, so two `int[]`s written apart have to reach the same id or
+    /// the type checker would say they differ.
+    fn list_of(&mut self, elem: Ty) -> Ty {
+        let id = *self.lists_by_element.entry(elem).or_insert_with(|| {
+            let id = ListId(self.table.lists.len() as u32);
+            self.table.lists.push(elem);
+            id
+        });
+        Ty::List(id)
+    }
 }
 
 /// Pass 0: one entry per enum name, with the first declaration winning.
@@ -128,6 +142,7 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
         enum_spans: Vec::new(),
         enums_by_name: HashMap::new(),
         arrays_by_shape: HashMap::new(),
+        lists_by_element: HashMap::new(),
         classes_by_name: HashMap::new(),
         class_spans: Vec::new(),
         method_of: HashMap::new(),
@@ -257,14 +272,23 @@ fn collect_classes(program: &Program, declared: &mut Declared, errors: &mut Vec<
 
         for field in &class.fields {
             let ty = resolve_type(declared, &field.ty, errors).unwrap_or(Ty::Int);
-            if !ty.fits_in_a_register() {
+            // A list would *fit* — it is one pointer — and that is exactly the
+            // trap. Copying an object copies its fields, so two objects would
+            // end up naming one list, and writing through either would be
+            // visible through the other. Every other type in the language
+            // either cannot be written to or is copied outright.
+            if !ty.fits_in_a_register() || matches!(ty, Ty::List(_)) {
                 errors.push(
                     Diagnostic::new(
                         format!("a field cannot be {}", ty.with_article(&declared.table)),
                         field.ty.span,
                     )
                     .with_label("every field of an object is one value")
-                    .with_note("arrays and objects do not nest yet", None),
+                    .with_note(
+                        "arrays, objects and lists do not nest in an object yet — copying one \
+                         would share what it holds rather than copy it",
+                        None,
+                    ),
                 );
                 continue;
             }
@@ -452,7 +476,33 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
             }),
     }?;
 
-    let Some((len, len_span)) = ty.array_len else { return Some(element) };
+    let (len, len_span) = match ty.shape {
+        Shape::One => return Some(element),
+        Shape::Array(len, len_span) => (len, len_span),
+        // A list holds what fits in a register and nothing else. An aggregate
+        // element would have to be copied rather than moved every time the list
+        // grew; a list *of* lists would let one be reached through another,
+        // and assigning the outer one would copy handles rather than elements —
+        // which is exactly the aliasing the copy exists to prevent.
+        Shape::List => {
+            if !element.fits_in_a_register() || matches!(element, Ty::List(_)) {
+                errors.push(
+                    Diagnostic::new(
+                        format!("a list cannot hold {}", element.with_article(&declared.table)),
+                        ty.span,
+                    )
+                    .with_label("a list holds values that fit in a register")
+                    .with_note(
+                        "`int`, `string`, `char`, `bool` and any enum can be held; arrays, \
+                         objects and other lists cannot yet",
+                        None,
+                    ),
+                );
+                return None;
+            }
+            return Some(declared.list_of(element));
+        }
+    };
 
     // A length is part of the type, so it has to be a length a type could have.
     // `MAX_ARRAY_LEN` is a limit on the *generated code*: an array literal is
@@ -464,7 +514,8 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
                     "an array needs at least one element".to_string()
                 } else {
                     format!("at most {MAX_ARRAY_LEN} are supported")
-                }),
+                })
+                .with_note("`int[]` is a list, whose length the program decides", None),
         );
         return None;
     }
@@ -478,11 +529,28 @@ fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnost
 /// form like `[0; 1000]` lowered to a loop is what would lift it.
 pub const MAX_ARRAY_LEN: i64 = 1024;
 
+/// How a parameter is described where a declaration is, which is also how one
+/// is told from a local afterwards. See [`Binding::parameter`].
+const PARAMETER: &str = "a parameter";
+
+/// What a name in scope stands for.
+///
+/// The last field is the only one that is not merely bookkeeping: a parameter
+/// names a value **the caller owns**, and there is one operation that needs to
+/// know the difference — see [`FnChecker::push_stmt`].
+#[derive(Clone, Copy, Debug)]
+struct Binding {
+    ty: Ty,
+    name_span: Span,
+    parameter: bool,
+}
+
 /// Every conversion the language has, listed wherever one is refused.
 ///
 /// It is a short list on purpose: nothing converts on its own, so this is also
 /// the complete answer to "how do I turn this into that".
-const CONVERSIONS: &str = "the conversions are `int(c)`, `char(n)`, `string(c)` and `string(n)`";
+const CONVERSIONS: &str = "the conversions are `int(c)`, `char(n)`, `string(c)`, `string(n)`, \
+                           and `string(cs)` for a `char[]`";
 
 /// Why a particular number is not a character, which is a different sentence
 /// depending on where it lands.
@@ -868,7 +936,7 @@ struct FnChecker<'a, 'c> {
     ret_span: Span,
     /// One map per open block, innermost last. A name is looked up from the
     /// inside out, and a block's declarations disappear when it closes.
-    scopes: Vec<HashMap<String, (Ty, Span)>>,
+    scopes: Vec<HashMap<String, Binding>>,
     /// Names already reported as undeclared. One missing declaration is one
     /// mistake, however many times the name is mentioned afterwards.
     undeclared: HashSet<String>,
@@ -928,6 +996,10 @@ impl<'a, 'c> FnChecker<'a, 'c> {
 
     /// The type and declaration span of a visible variable.
     fn lookup(&self, name: &str) -> Option<(Ty, Span)> {
+        self.binding(name).map(|b| (b.ty, b.name_span))
+    }
+
+    fn binding(&self, name: &str) -> Option<Binding> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name).copied())
     }
 
@@ -936,15 +1008,16 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     /// [`crate::ast::Param`] carries the same spans as a `Decl`.
     fn declare(&mut self, name: &str, ty: Ty, name_span: Span, what: &str) {
         let innermost = self.scopes.last_mut().expect("a scope is always open");
-        if let Some((_, previous)) = innermost.get(name) {
-            let previous = *previous;
+        if let Some(previous) = innermost.get(name) {
+            let previous = previous.name_span;
             self.error(
                 Diagnostic::new(format!("`{name}` is already declared"), name_span)
                     .with_label(format!("declared a second time here, as {what}"))
                     .with_note("previous declaration", Some(previous)),
             );
         } else {
-            innermost.insert(name.to_string(), (ty, name_span));
+            let parameter = what == PARAMETER;
+            innermost.insert(name.to_string(), Binding { ty, name_span, parameter });
         }
     }
 
@@ -972,7 +1045,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         // Pass 1 resolved these too, and reported any that named nothing.
         let params = self.shared.types.fn_params[self.at].clone();
         for (param, ty) in function.params.iter().zip(params) {
-            self.declare(&param.name, ty, param.name_span, "a parameter");
+            self.declare(&param.name, ty, param.name_span, PARAMETER);
         }
         for stmt in &function.body.stmts {
             self.stmt(stmt);
@@ -1023,7 +1096,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             Stmt::Decl { id, ty, name, name_span, init } => {
                 let declared = self.resolve(ty);
                 self.record(*id, declared);
-                let actual = self.expr(init);
+                let actual = self.value_of_type(init, declared);
                 if !self.coerces(actual, declared) {
                     self.error(
                         Diagnostic::new(
@@ -1044,17 +1117,18 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 self.declare(name, declared, *name_span, "a variable");
             }
             Stmt::Assign { target, value } => self.assign(target, value),
+            Stmt::Push { span, target, value } => self.push_stmt(*span, target, value),
             Stmt::Print { value, .. } => {
                 let ty = self.expr(value);
-                // An array has no rendering, and printing its address would
-                // answer a question nobody asked.
-                if !ty.fits_in_a_register() {
+                // A run of values has no rendering, and printing its address
+                // would answer a question nobody asked.
+                if !ty.is_printable() {
                     self.error(
                         Diagnostic::new(
                             format!("cannot print {}", self.ty_article(ty)),
                             value.span,
                         )
-                        .with_label("`print` takes one value, and an array is many")
+                        .with_label("`print` takes one value, and this is many")
                         .with_note("print the elements in a loop instead", None),
                     );
                 }
@@ -1285,7 +1359,10 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         };
 
         let expected = self.place_type(target);
-        let actual = self.expr(value);
+        let actual = match expected {
+            Some(expected) => self.value_of_type(value, expected),
+            None => self.expr(value),
+        };
         // A variable keeps the type it was declared with. An undeclared one has
         // no type to disagree with, and was reported above.
         if let Some(expected) = expected
@@ -1422,6 +1499,111 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     /// Its length is its element count — there is nothing to infer and nothing
     /// to declare. What a declaration does is *agree* with it, and the mismatch
     /// is caught where the two meet.
+    /// Check a value against the type it is being given to.
+    ///
+    /// Exactly one thing needs this, and it needs it because nothing in the
+    /// literal itself could say: `[1, 2, 3]` is an `int[3]` on its own and an
+    /// `int[]` where a list was asked for. So an array literal takes its shape
+    /// from the type it is handed to — a declaration, an assignment, a return
+    /// or a parameter — and everywhere else an expression's own type is the
+    /// whole answer.
+    ///
+    /// It is also the only way to write an *empty* list, since `[]` has no
+    /// element to read a type off.
+    fn value_of_type(&mut self, expr: &Expr, expected: Ty) -> Ty {
+        let (ExprKind::Array { elements, .. }, Ty::List(id)) = (&expr.kind, expected) else {
+            return self.expr(expr);
+        };
+        let elem = self.shared.declared.table.element(id);
+        for element in elements {
+            let ty = self.expr(element);
+            if !self.coerces(ty, elem) {
+                self.error(
+                    Diagnostic::new(
+                        format!(
+                            "this element is {}, but the list holds {}",
+                            self.ty_article(ty),
+                            self.ty_article(elem)
+                        ),
+                        element.span,
+                    )
+                    .with_label(format!(
+                        "expected {}, found {}",
+                        self.ty_name(elem),
+                        self.ty_name(ty)
+                    )),
+                );
+            }
+        }
+        self.record(expr.id, expected)
+    }
+
+    /// Check `push(xs, value);`.
+    fn push_stmt(&mut self, span: Span, target: &Place, value: &Expr) {
+        let Some(ty) = self.place_type(target) else {
+            self.expr(value);
+            return;
+        };
+        let Ty::List(id) = ty else {
+            self.expr(value);
+            self.error(
+                Diagnostic::new(
+                    format!("`push` needs a list, but this is {}", self.ty_article(ty)),
+                    span,
+                )
+                .with_label("only a list can grow")
+                .with_note(
+                    "an array's length is part of its type and cannot change; `int[]` is the \
+                     one that can",
+                    None,
+                ),
+            );
+            return;
+        };
+
+        // Growing may move the list: the elements are copied into a larger
+        // block, and the old one is left behind. Whoever *owns* the list can be
+        // told the new address; a caller cannot, because what it handed over
+        // was a copy of the address and not the variable holding it.
+        //
+        // Left alone this would be the worst kind of bug — the length lives
+        // with the elements, so a push that happens to fit would be visible to
+        // the caller and a push that had to move would silently not be.
+        if let Place::Var { name, name_span } = target
+            && self.binding(name).is_some_and(|b| b.parameter)
+        {
+            self.error(
+                Diagnostic::new(format!("cannot push onto `{name}`, which is a parameter"), *name_span)
+                    .with_label("a parameter is the caller's list, and growing it may move it")
+                    .with_note(
+                        "copy it first — `int[] mine = xs;` — and return the copy, or build the \
+                         list here and return that",
+                        None,
+                    ),
+            );
+        }
+
+        let elem = self.shared.declared.table.element(id);
+        let actual = self.value_of_type(value, elem);
+        if !self.coerces(actual, elem) {
+            self.error(
+                Diagnostic::new(
+                    format!(
+                        "cannot push {} value onto {}",
+                        self.ty_article(actual),
+                        self.ty_article(ty)
+                    ),
+                    value.span,
+                )
+                .with_label(format!(
+                    "expected {}, found {}",
+                    self.ty_name(elem),
+                    self.ty_name(actual)
+                )),
+            );
+        }
+    }
+
     fn array_literal(&mut self, elements: &[Expr], span: Span) -> Ty {
         if elements.is_empty() {
             self.error(
@@ -1462,7 +1644,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         // An object element is fine — it takes its hierarchy's room, and the
         // index arithmetic scales by that instead of by eight. An array element
         // is not: nothing yet says how long the inner one is.
-        if matches!(first, Ty::Array(_)) {
+        if matches!(first, Ty::Array(_) | Ty::List(_)) {
             // Pointed at the whole literal rather than at one element: what
             // follows is a declaration complaining that the type it got is not
             // the type it wanted, and the two sort together with the real
@@ -1472,8 +1654,8 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     format!("cannot make an array of {}", self.ty_article(first)),
                     span,
                 )
-                .with_label("an array's elements may not themselves be arrays")
-                .with_note("arrays do not nest yet", None),
+                .with_label("an array's elements may not themselves be a run of values")
+                .with_note("arrays and lists do not nest yet", None),
             );
             return Ty::Int;
         }
@@ -1494,13 +1676,14 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     fn element_type(&mut self, ty: Ty, declared_span: Span, name: &str, at: Span) -> Option<Ty> {
         match ty {
             Ty::Array(id) => Some(self.shared.declared.table.array(id).elem),
+            Ty::List(id) => Some(self.shared.declared.table.element(id)),
             // A string is a run of characters, so indexing one produces a
             // character — never a byte and never a string of length one.
             Ty::Str => Some(Ty::Char),
             other => {
                 let mut diagnostic =
                     Diagnostic::new(format!("cannot index {}", self.ty_article(other)), at)
-                        .with_label("only an array or a string has elements");
+                        .with_label("an array, a list and a string have elements; nothing else does");
                 if !name.is_empty() {
                     diagnostic = diagnostic
                         .with_note(format!("`{name}` was declared here"), Some(declared_span));
@@ -1711,6 +1894,11 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             // decimal. Both exist because `+` converts nothing, so a message
             // with a value in it has to say where the value became text.
             (Ty::Char | Ty::Int, Ty::Str) => {}
+            // And a whole list of characters at once, which is how a string is
+            // built a character at a time without paying for a new string on
+            // every one — see the note on `+` in the README.
+            (Ty::List(id), Ty::Str)
+                if self.shared.declared.table.element(id) == Ty::Char => {}
             (Ty::Int, Ty::Char) => {
                 // A constant that names no character is settled here, exactly
                 // as a constant index out of range is: what reaches the emitted
@@ -1971,7 +2159,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     fn return_stmt(&mut self, span: Span, value: Option<&Expr>) {
         match (self.ret, value) {
             (Some(expected), Some(expr)) => {
-                let actual = self.expr(expr);
+                let actual = self.value_of_type(expr, expected);
                 if !self.coerces(actual, expected) {
                     self.error(
                         Diagnostic::new(
@@ -2022,8 +2210,24 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         };
 
         // Arguments are checked first, so their own mistakes are reported even
-        // when the callee turns out not to exist.
-        let actual: Vec<Ty> = args.iter().map(|arg| self.expr(arg)).collect();
+        // when the callee turns out not to exist — but each against the
+        // parameter it is going to, so `f([1, 2])` builds a list when `f` wants
+        // one. An unknown callee has no parameters to check against, and the
+        // arguments are still worth checking on their own.
+        let wanted: Vec<Option<Ty>> = match self.signature(name) {
+            Some(signature) if signature.params.len() == args.len() => {
+                signature.params.iter().copied().map(Some).collect()
+            }
+            _ => vec![None; args.len()],
+        };
+        let actual: Vec<Ty> = args
+            .iter()
+            .zip(&wanted)
+            .map(|(arg, wanted)| match wanted {
+                Some(wanted) => self.value_of_type(arg, *wanted),
+                None => self.expr(arg),
+            })
+            .collect();
 
         // The signature table outlives this checker, so holding a signature does
         // not borrow `self` for the rest of the call.
@@ -2287,16 +2491,13 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 // because from the source's point of view they are the same
                 // question.
                 let of = self.expr(array);
-                if !matches!(of, Ty::Array(_) | Ty::Str) {
+                if !matches!(of, Ty::Array(_) | Ty::List(_) | Ty::Str) {
                     self.error(
                         Diagnostic::new(
-                            format!(
-                                "`len` needs an array or a string, but this is {}",
-                                self.ty_article(of)
-                            ),
+                            format!("`len` needs something with a length, but this is {}", self.ty_article(of)),
                             *span,
                         )
-                        .with_label("only an array or a string has a length"),
+                        .with_label("an array, a list and a string have one; nothing else does"),
                     );
                 }
                 Ty::Int
@@ -2540,10 +2741,10 @@ mod tests {
     }
 
     #[test]
-    fn a_string_has_a_length_and_so_does_an_array() {
+    fn a_string_a_list_and_an_array_all_have_a_length() {
         assert!(check_main("print(len(\"abc\"));").is_ok());
         let errors = errors_in_main("print(len(1));");
-        assert!(errors[0].message.contains("array or a string"), "{}", errors[0].message);
+        assert!(errors[0].message.contains("something with a length"), "{}", errors[0].message);
     }
 
     #[test]
@@ -2580,6 +2781,77 @@ mod tests {
 
         let errors = errors_in_main("print(int(true));");
         assert!(errors[0].message.contains("no conversion from `bool`"), "{}", errors[0].message);
+    }
+
+    // -- lists -------------------------------------------------------------
+
+    #[test]
+    fn a_list_takes_its_element_type_from_the_declaration() {
+        assert!(check_main("int[] xs = [];\npush(xs, 1);\nprint(len(xs));").is_ok());
+        assert!(check_main("int[] xs = [1, 2, 3];\nprint(xs[0]);").is_ok());
+        // The same literal is an array where an array was asked for.
+        assert!(check_main("int[3] xs = [1, 2, 3];\nprint(xs[0]);").is_ok());
+
+        let errors = errors_in_main("int[] xs = [1, true];");
+        assert!(errors[0].message.contains("this element is a `bool`"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn an_empty_literal_is_a_list_and_nothing_else() {
+        // An array cannot be empty, so `[]` on its own has no type to read.
+        let errors = errors_in_main("int[3] xs = [];");
+        assert!(errors[0].message.contains("no elements"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_list_and_an_array_of_the_same_thing_are_different_types() {
+        let errors = errors_in_main("int[3] a = [1, 2, 3];\nint[] b = a;");
+        assert!(errors[0].message.contains("cannot initialize"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn push_needs_a_list_that_the_function_owns() {
+        assert!(check_main("int[] xs = [];\npush(xs, 1);").is_ok());
+
+        let errors = errors_in_main("int[3] xs = [1, 2, 3];\npush(xs, 4);");
+        assert!(errors[0].message.contains("`push` needs a list"), "{}", errors[0].message);
+
+        // A parameter is the caller's, and growing may move it.
+        let errors = check_src("fn f(int[] xs) {\n  push(xs, 1);\n}\nfn main() {\n}\n")
+            .expect_err("pushing onto a parameter is refused");
+        assert!(errors[0].message.contains("which is a parameter"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_list_cannot_be_printed_or_compared() {
+        // Both would answer a question about the address rather than about the
+        // elements, which is the same reason an array answers neither.
+        let errors = errors_in_main("int[] xs = [1];\nprint(xs);");
+        assert!(errors[0].message.contains("cannot print"), "{}", errors[0].message);
+
+        let errors = errors_in_main("int[] xs = [1];\nprint(xs == xs);");
+        assert!(errors[0].message.contains("cannot be compared"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_list_holds_only_what_fits_in_a_register() {
+        // An object would have to be copied rather than moved every time the
+        // list grew. A list of arrays or of lists cannot even be *written*:
+        // a type carries at most one pair of brackets.
+        let errors =
+            check_src("class Shape {\n  int n;\n}\nfn main() {\n  Shape[] xs = [];\n}\n")
+                .expect_err("a list of objects is refused");
+        assert!(errors[0].message.contains("a list cannot hold"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_char_list_seals_into_a_string() {
+        // The point of the whole feature: characters accumulate in one place
+        // that grows, and become a string once.
+        assert!(check_main("char[] cs = ['a'];\nprint(string(cs));").is_ok());
+
+        let errors = errors_in_main("int[] ns = [1];\nprint(string(ns));");
+        assert!(errors[0].message.contains("no conversion from `int[]`"), "{}", errors[0].message);
     }
 
     #[test]
@@ -3169,7 +3441,8 @@ mod tests {
             let errors = errors_in_main(body);
             assert!(errors[0].message.contains("cannot index"), "{body}: {}", errors[0].message);
         }
-        assert!(errors_in_main("int n = 1;\nprint(len(n));")[0].message.contains("`len` needs an array"));
+        assert!(errors_in_main("int n = 1;
+print(len(n));")[0].message.contains("`len` needs"));
     }
 
     #[test]

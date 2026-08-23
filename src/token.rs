@@ -34,6 +34,7 @@ pub enum TokenKind {
     KwEnum,
     KwMatch,
     KwLen,
+    KwPush,
     KwClass,
 
     // Punctuation.
@@ -117,6 +118,7 @@ impl TokenKind {
             TokenKind::KwEnum => "enum",
             TokenKind::KwMatch => "match",
             TokenKind::KwLen => "len",
+            TokenKind::KwPush => "push",
             TokenKind::KwClass => "class",
 
             // Punctuation.

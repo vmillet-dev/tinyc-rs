@@ -187,6 +187,7 @@ impl<'a> Lexer<'a> {
             "enum" => TokenKind::KwEnum,
             "match" => TokenKind::KwMatch,
             "len" => TokenKind::KwLen,
+            "push" => TokenKind::KwPush,
             "class" => TokenKind::KwClass,
             name => TokenKind::Ident(name.to_string()),
         }

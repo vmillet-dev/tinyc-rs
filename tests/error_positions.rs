@@ -12,7 +12,7 @@ use tinyc::diag::SourceFile;
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 10] = [
+const EXAMPLES: [&str; 11] = [
     "arith.tc",
     "spill.tc",
     "reassign.tc",
@@ -23,6 +23,7 @@ const EXAMPLES: [&str; 10] = [
     "arrays.tc",
     "classes.tc",
     "strings.tc",
+    "lists.tc",
 ];
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
@@ -251,6 +252,30 @@ fn a_number_that_names_no_character_points_at_the_number() {
 #[test]
 fn joining_a_number_to_a_string_points_at_the_number() {
     assert_error_at("joining_a_number.tc", "3:22");
+}
+
+// -- lists ----------------------------------------------------------------
+
+#[test]
+fn pushing_onto_a_parameter_points_at_the_parameter() {
+    // Growing may move the list, and a caller cannot be told where it went —
+    // so this is refused rather than silently working when it happens to fit.
+    assert_error_at("push_onto_parameter.tc", "2:8");
+}
+
+#[test]
+fn pushing_onto_an_array_points_at_the_keyword() {
+    assert_error_at("push_onto_array.tc", "3:3");
+}
+
+#[test]
+fn a_list_in_a_field_points_at_the_field() {
+    assert_error_at("list_in_a_field.tc", "4:3");
+}
+
+#[test]
+fn printing_a_list_points_at_the_list() {
+    assert_error_at("printing_a_list.tc", "3:9");
 }
 
 // -- classes --------------------------------------------------------------
