@@ -1,0 +1,14 @@
+// A name answers with one type, so a class and an enum cannot both claim it:
+// whichever lost would be a declaration no program could ever name.
+enum Shape {
+  Round,
+  Square
+}
+
+class Shape {
+  int side;
+}
+
+fn main() {
+  print(Shape::Round);
+}

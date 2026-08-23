@@ -107,6 +107,18 @@ impl Declared {
         self.table.class(id)
     }
 
+    /// Where this type name was already claimed, if it was.
+    ///
+    /// Enums and classes share one namespace, because [`resolve_type`] answers
+    /// a name with one type and there is nowhere for a second to go. Asking
+    /// both tables in one question is what keeps a class named after an enum
+    /// from being quietly unreachable instead of reported.
+    fn type_named(&self, name: &str) -> Option<Span> {
+        self.enum_id(name)
+            .map(|id| self.enum_spans[id.0 as usize])
+            .or_else(|| self.class_id(name).map(|id| self.class_spans[id.0 as usize]))
+    }
+
     /// The type of an array of `len` `elem`s, made if this is the first time
     /// the program has asked for one.
     fn array_of(&mut self, elem: Ty, len: u32) -> Ty {
@@ -177,16 +189,8 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
             variants.push(variant.name.clone());
         }
 
-        if let Some(&previous) = enums.enums_by_name.get(&declaration.name) {
-            let previous = enums.enum_spans[previous.0 as usize];
-            errors.push(
-                Diagnostic::new(
-                    format!("`{}` is already declared", declaration.name),
-                    declaration.name_span,
-                )
-                .with_label("declared a second time here")
-                .with_note("previous declaration", Some(previous)),
-            );
+        if let Some(previous) = enums.type_named(&declaration.name) {
+            errors.push(already_declared(&declaration.name, declaration.name_span, previous));
             continue;
         }
 
@@ -197,6 +201,22 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
     }
 
     enums
+}
+
+/// "`X` is already declared", underlining both places.
+///
+/// Enums are collected before classes, so the two spans may arrive here in the
+/// opposite order from the source. What a reader wants underlined is the
+/// *second* declaration, whichever kind it turned out to be, so the spans are
+/// put back in the order they were written.
+fn already_declared(name: &str, at: Span, previous: Span) -> Diagnostic {
+    let (at, previous) = match at.offset < previous.offset {
+        true => (previous, at),
+        false => (at, previous),
+    };
+    Diagnostic::new(format!("`{name}` is already declared"), at)
+        .with_label("declared a second time here")
+        .with_note("previous declaration", Some(previous))
 }
 
 /// Bytes an object spends on its vtable pointer, which sits at offset 0.
@@ -211,13 +231,8 @@ const VPTR_SIZE: u32 = 8;
 fn collect_classes(program: &Program, declared: &mut Declared, errors: &mut Vec<Diagnostic>) {
     // Every name first, with a placeholder layout, so the rest can refer to it.
     for class in &program.classes {
-        if let Some(&previous) = declared.classes_by_name.get(&class.name) {
-            let previous = declared.class_spans[previous.0 as usize];
-            errors.push(
-                Diagnostic::new(format!("`{}` is already declared", class.name), class.name_span)
-                    .with_label("declared a second time here")
-                    .with_note("previous declaration", Some(previous)),
-            );
+        if let Some(previous) = declared.type_named(&class.name) {
+            errors.push(already_declared(&class.name, class.name_span, previous));
             continue;
         }
         let id = ClassId(declared.table.classes.len() as u32);
@@ -569,6 +584,23 @@ fn missing_verb(missing: &[&str]) -> String {
     format!("{} {verb}", list(missing))
 }
 
+/// "`Circle` has no field `q`", with the ones it does have listed underneath.
+///
+/// A field and a method are looked up the same way and are missed the same way,
+/// so the message is written once and told which noun to use — `kind` is the
+/// singular, and both of them take a plain `s`. Listing the real ones is what
+/// turns "no such field" into an answer: the mistake is nearly always a
+/// misspelling, and the right spelling is right there.
+fn no_such_member(class: &str, kind: &str, name: &str, at: Span, known: &[&str]) -> Diagnostic {
+    let note = match known.is_empty() {
+        true => format!("`{class}` has no {kind}s"),
+        false => format!("`{class}` has {}", list(known)),
+    };
+    Diagnostic::new(format!("`{class}` has no {kind} `{name}`"), at)
+        .with_label(format!("not one of its {kind}s"))
+        .with_note(note, None)
+}
+
 /// `A`, `A` and `B`, `A`, `B` and `C` — so a list reads as prose.
 fn list(items: &[&str]) -> String {
     let quoted: Vec<String> = items.iter().map(|item| format!("`{item}`")).collect();
@@ -690,7 +722,7 @@ fn collect_signatures(
         .collect();
 
     for (at, function) in program.functions.iter().enumerate() {
-        if declared.method_of.get(&at).is_none()
+        if !declared.method_of.contains_key(&at)
             && let Some(builtin) = Builtin::from_name(&function.name)
         {
             errors.push(
@@ -1526,16 +1558,8 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             return Some(field.ty);
         }
         let known: Vec<&str> = class.fields.iter().map(|f| f.name.as_str()).collect();
-        let note = match known.is_empty() {
-            true => format!("`{}` has no fields", class.name),
-            false => format!("`{}` has {}", class.name, list(&known)),
-        };
-        let class = class.name.clone();
-        self.error(
-            Diagnostic::new(format!("`{class}` has no field `{name}`"), at)
-                .with_label("not one of its fields")
-                .with_note(note, None),
-        );
+        let diagnostic = no_such_member(&class.name, "field", name, at, &known);
+        self.error(diagnostic);
         None
     }
 
@@ -1774,15 +1798,8 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             let Some(at) = declared.iter().position(|f| f.name == field.name) else {
                 readable = false;
                 let known: Vec<&str> = declared.iter().map(|f| f.name.as_str()).collect();
-                let note = match known.is_empty() {
-                    true => format!("`{class}` has no fields"),
-                    false => format!("`{class}` has {}", list(&known)),
-                };
-                self.error(
-                    Diagnostic::new(format!("`{class}` has no field `{}`", field.name), field.name_span)
-                        .with_label("not one of its fields")
-                        .with_note(note, None),
-                );
+                let at = field.name_span;
+                self.error(no_such_member(class, "field", &field.name, at, &known));
                 continue;
             };
 
@@ -1863,16 +1880,8 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         let class = self.shared.declared.class(id);
         let Some(method) = class.method(name) else {
             let known: Vec<&str> = class.methods.iter().map(|m| m.name.as_str()).collect();
-            let note = match known.is_empty() {
-                true => format!("`{}` has no methods", class.name),
-                false => format!("`{}` has {}", class.name, list(&known)),
-            };
-            let class = class.name.clone();
-            self.error(
-                Diagnostic::new(format!("`{class}` has no method `{name}`"), *name_span)
-                    .with_label("not one of its methods")
-                    .with_note(note, None),
-            );
+            let diagnostic = no_such_member(&class.name, "method", name, *name_span, &known);
+            self.error(diagnostic);
             return Some(Ty::Int);
         };
 
@@ -3301,6 +3310,24 @@ mod tests {
         assert!(errors[0].note.as_ref().unwrap().1.is_some());
     }
 
+    /// A name answers with one type, so a class and an enum cannot both have
+    /// it: whichever lost would be a declaration no program could ever name.
+    #[test]
+    fn an_enum_and_a_class_cannot_share_a_name() {
+        for src in [
+            "enum A {\n  X\n}\nclass A {\n}\nfn main() {\n}",
+            "class A {\n}\nenum A {\n  X\n}\nfn main() {\n}",
+        ] {
+            let errors = check_src(src).unwrap_err();
+            assert!(errors[0].message.contains("`A` is already declared"), "{src}: {errors:?}");
+
+            // Whichever pass noticed, the caret goes on the one written second
+            // and the note on the one written first.
+            let previous = errors[0].note.as_ref().unwrap().1.expect("a span to point at");
+            assert!(previous.offset < errors[0].span.offset, "{src}: reported back to front");
+        }
+    }
+
     #[test]
     fn a_field_may_not_be_named_twice_base_included() {
         let errors = check_src("class A {\n  int x;\n  int x;\n}\nfn main() {\n}").unwrap_err();
@@ -3319,6 +3346,33 @@ mod tests {
         )
         .unwrap_err();
         assert!(errors[0].message.contains("does not match"), "{}", errors[0].message);
+    }
+
+    /// A field and a method of one class may share a name, and this is the one
+    /// place the compiler is not guessing when two things answer to one: the
+    /// syntax decides, because a `(` is what makes `a.f` a call.
+    ///
+    /// Nothing else in the language would let the two be confused — there are
+    /// no function values, so a method's name in a value position could only
+    /// ever have meant the field.
+    #[test]
+    fn a_field_and_a_method_may_share_a_name_because_the_syntax_tells_them_apart() {
+        let checked = check_src(
+            "class A {\n  int f;\n  fn f(self) -> int { return self.f * 2; }\n}\n\
+             fn main() {\n  A a = A { f: 5 };\n  print(a.f);\n  print(a.f());\n}",
+        );
+        assert!(checked.is_ok(), "{:?}", checked.err());
+    }
+
+    /// `self` is the receiver's name inside a method and an ordinary field name
+    /// everywhere else — including on a class whose methods use both.
+    #[test]
+    fn a_field_may_be_called_self() {
+        let checked = check_src(
+            "class A {\n  int self;\n  fn get(self) -> int { return self.self; }\n}\n\
+             fn main() {\n  A a = A { self: 5 };\n  print(a.self + a.get());\n}",
+        );
+        assert!(checked.is_ok(), "{:?}", checked.err());
     }
 
     #[test]
@@ -3569,6 +3623,20 @@ print(len(n));")[0].message.contains("`len` needs"));
     fn rejects_a_length_no_array_could_have() {
         assert!(errors_in_main("int[0] xs = [1];")[0].message.contains("not a valid array length"));
         let errors = errors_in_main("int[99999] xs = [1];");
+        assert!(errors[0].message.contains("not a valid array length"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn the_longest_array_is_accepted_and_the_next_one_is_not() {
+        // `MAX_ARRAY_LEN` is a limit on the emitted *code* — a literal is
+        // unrolled into one store per element — so the boundary is worth
+        // pinning: one either way is where an off-by-one would show.
+        let elements = vec!["1"; MAX_ARRAY_LEN as usize].join(", ");
+        let longest = format!("int[{MAX_ARRAY_LEN}] xs = [{elements}];\nprint(xs[0]);");
+        assert!(check_main(&longest).is_ok(), "the longest array should be allowed");
+
+        let too_long = MAX_ARRAY_LEN + 1;
+        let errors = errors_in_main(&format!("int[{too_long}] xs = [1];"));
         assert!(errors[0].message.contains("not a valid array length"), "{}", errors[0].message);
     }
 

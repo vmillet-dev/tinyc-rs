@@ -115,7 +115,7 @@ fn the_awkward_corners_of_code_generation_still_compute() {
         ("int a = 17;\nint b = 5;\na = a % b;\nprint(a);", "2"),
     ];
 
-    run_each(&tools, "corner", &cases);
+    run_each(tools, "corner", &cases);
 }
 
 /// What a string does, checked by running it rather than by reading assembly.
@@ -173,7 +173,7 @@ fn strings_hold_characters_rather_than_bytes() {
             print(len(s));"#, "32768"),
     ];
 
-    run_each(&tools, "string", &cases);
+    run_each(tools, "string", &cases);
 }
 
 /// What a list does, checked by running it.
@@ -241,26 +241,15 @@ fn lists_grow_and_stay_their_owners() {
     ];
 
     // Two of the cases call helpers, so they are compiled with them in scope.
-    for (index, (body, expected)) in cases.iter().enumerate() {
-        let name = format!("list{index}");
-        let source = tools.scratch.join(format!("{name}.tc"));
-        let program = format!(
-            "fn double_each(int[] xs) {{\n\
-             \x20 for (int i = 0; i < len(xs); i = i + 1) {{ xs[i] = xs[i] * 2; }}\n\
-             }}\n\
-             fn squares(int n) -> int[] {{\n\
-             \x20 int[] out = [];\n\
-             \x20 for (int i = 1; i <= n; i = i + 1) {{ push(out, i * i); }}\n\
-             \x20 return out;\n\
-             }}\n\
-             fn main() {{\n{body}\n}}\n"
-        );
-        std::fs::write(&source, program).unwrap();
-
-        let run = tools.build_and_run(&source, &name);
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
-    }
+    let prelude = "fn double_each(int[] xs) {\n\
+                   \x20 for (int i = 0; i < len(xs); i = i + 1) { xs[i] = xs[i] * 2; }\n\
+                   }\n\
+                   fn squares(int n) -> int[] {\n\
+                   \x20 int[] out = [];\n\
+                   \x20 for (int i = 1; i <= n; i = i + 1) { push(out, i * i); }\n\
+                   \x20 return out;\n\
+                   }\n";
+    run_each_after(tools, "list", prelude, &cases);
 }
 
 /// Reading input, which is the one thing that cannot be checked by looking at
@@ -313,15 +302,7 @@ fn reading_the_input_sees_characters_and_knows_when_to_stop() {
         ),
     ];
 
-    for (index, (input, body, expected)) in cases.iter().enumerate() {
-        let name = format!("input{index}");
-        let source = tools.scratch.join(format!("{name}.tc"));
-        std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run_on(&source, &name, input);
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(normalise(&run.stdout), normalise(expected), "case {index}:\n{body}");
-    }
+    run_each_on(tools, "input", &cases);
 }
 
 /// Asking for a line that is not there stops the program, rather than answering
@@ -354,16 +335,65 @@ fn input_that_is_not_utf8_reports_and_exits() {
     assert!(run.stderr.contains("not valid UTF-8"), "{}", run.stderr);
 }
 
+// -- running a table of cases ----------------------------------------------
+//
+// Every test in this file is a table of small programs, and there are only
+// three things one can be asked: print this, print this given that input, or
+// stop and say why. One runner each, so that a test is its table and nothing
+// else — and so that a case added to any of them cannot forget to check
+// whether the program actually succeeded.
+
 /// Compile each body as the whole of `main`, run it, and check what it printed.
 fn run_each(tools: &Tools, stem: &str, cases: &[(&str, &str)]) {
+    run_each_after(tools, stem, "", cases);
+}
+
+/// The same, with `prelude` — the functions and classes the bodies need —
+/// written above `main`.
+fn run_each_after(tools: &Tools, stem: &str, prelude: &str, cases: &[(&str, &str)]) {
     for (index, (body, expected)) in cases.iter().enumerate() {
         let name = format!("{stem}{index}");
         let source = tools.scratch.join(format!("{name}.tc"));
-        std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
+        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
 
         let run = tools.build_and_run(&source, &name);
         assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
+    }
+}
+
+/// Run each body on the input written beside it.
+///
+/// The one thing that cannot be checked by looking at a program alone: what it
+/// does depends on what it is given.
+fn run_each_on(tools: &Tools, stem: &str, cases: &[(&[u8], &str, &str)]) {
+    for (index, (input, body, expected)) in cases.iter().enumerate() {
+        let name = format!("{stem}{index}");
+        let source = tools.scratch.join(format!("{name}.tc"));
+        std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
+
+        let run = tools.build_and_run_on(&source, &name, input);
+        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
+        assert_eq!(normalise(&run.stdout), normalise(expected), "case {index}:\n{body}");
+    }
+}
+
+/// Each whole program here must *stop*, and say so: these are the operations
+/// with no right answer to hand back, and the check is that none of them hands
+/// one back anyway.
+fn each_stops_with(tools: &Tools, stem: &str, cases: &[(&str, &str)]) {
+    for (index, (program, expected)) in cases.iter().enumerate() {
+        let name = format!("{stem}{index}");
+        let source = tools.scratch.join(format!("{name}.tc"));
+        std::fs::write(&source, program).unwrap();
+
+        let run = tools.build_and_run(&source, &name);
+        assert!(!run.status.success(), "case {index} was expected to fail: {}", run.stdout);
+        assert!(
+            run.stderr.contains(expected),
+            "case {index} should have mentioned `{expected}`, said: {}",
+            run.stderr
+        );
     }
 }
 
@@ -421,18 +451,7 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
         ),
     ];
 
-    for (index, (program, expected)) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("abort{index}.tc"));
-        std::fs::write(&source, program).unwrap();
-
-        let run = tools.build_and_run(&source, &format!("abort{index}"));
-        assert!(!run.status.success(), "case {index} was expected to fail: {}", run.stdout);
-        assert!(
-            run.stderr.contains(expected),
-            "case {index} should have mentioned `{expected}`, said: {}",
-            run.stderr
-        );
-    }
+    each_stops_with(tools, "abort", &cases);
 }
 
 /// Short circuiting and loop jumps are the two features whose whole point is
@@ -501,14 +520,7 @@ fn short_circuits_and_loop_jumps_do_what_they_promise() {
         ("bool ok = 1 > 0;\nprint(!!ok);", "true"),
     ];
 
-    for (index, (body, expected)) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("logic{index}.tc"));
-        std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run(&source, &format!("logic{index}"));
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
-    }
+    run_each(tools, "logic", &cases);
 }
 
 /// Objects: the layout, the dispatch, and the upcast that makes them useful.
@@ -552,14 +564,7 @@ fn objects_dispatch_on_what_they_are() {
         ("Rect r = Rect { w: 3, h: 3 };\nprint(r.area());", "9"),
     ];
 
-    for (index, (body, expected)) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("object{index}.tc"));
-        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run(&source, &format!("object{index}"));
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
-    }
+    run_each_after(tools, "object", prelude, &cases);
 }
 
 /// The three things a polymorphic value could not be until aggregates gained
@@ -612,14 +617,7 @@ fn a_polymorphic_value_keeps_what_it_is_when_it_is_copied() {
         ),
     ];
 
-    for (index, (body, expected)) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("poly{index}.tc"));
-        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run(&source, &format!("poly{index}"));
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
-    }
+    run_each_after(tools, "poly", prelude, &cases);
 }
 
 /// Arrays really read and write the memory they claim to.
@@ -667,47 +665,150 @@ fn arrays_address_the_elements_they_promise() {
         ("string[2] w = [\"no\", \"yes\"];\nprint(w[1]);", "yes"),
     ];
 
-    for (index, (body, expected)) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("array{index}.tc"));
-        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run(&source, &format!("array{index}"));
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
-    }
+    run_each_after(tools, "array", prelude, &cases);
 }
 
 /// An index the compiler could not check must be checked where it lands.
+///
+/// All three indexable types are here. An array is the only one whose length is
+/// in its *type*, so it is the only one a constant index is settled for at
+/// compile time; a string's and a list's are never known until the program
+/// runs, which makes this the only check they have at all.
 #[test]
 fn an_index_out_of_bounds_reports_and_exits() {
     let Some(tools) = Tools::find() else { return };
 
+    let bounds = "index out of bounds";
+    let at = |n: &str| format!("fn at() -> int {{\n  return {n};\n}}\n");
     let cases = [
         // Past the end, and negative — one unsigned comparison catches both.
-        "fn at() -> int {\n  return 3;\n}\n\
-         fn main() {\n  int[3] xs = [1, 2, 3];\n  print(xs[at()]);\n}",
-        "fn at() -> int {\n  return 0 - 1;\n}\n\
-         fn main() {\n  int[3] xs = [1, 2, 3];\n  print(xs[at()]);\n}",
+        (
+            format!("{}fn main() {{\n  int[3] xs = [1, 2, 3];\n  print(xs[at()]);\n}}", at("3")),
+            bounds,
+        ),
+        (
+            format!(
+                "{}fn main() {{\n  int[3] xs = [1, 2, 3];\n  print(xs[at()]);\n}}",
+                at("0 - 1")
+            ),
+            bounds,
+        ),
         // Writing is guarded exactly as reading is.
-        "fn at() -> int {\n  return 9;\n}\n\
-         fn main() {\n  int[3] xs = [1, 2, 3];\n  xs[at()] = 1;\n}",
+        (
+            format!("{}fn main() {{\n  int[3] xs = [1, 2, 3];\n  xs[at()] = 1;\n}}", at("9")),
+            bounds,
+        ),
         // And through a parameter, where the length comes from the type.
-        "fn set(int[2] xs, int i) {\n  xs[i] = 1;\n}\n\
-         fn main() {\n  int[2] xs = [1, 2];\n  set(xs, 5);\n}",
+        (
+            "fn set(int[2] xs, int i) {\n  xs[i] = 1;\n}\n\
+             fn main() {\n  int[2] xs = [1, 2];\n  set(xs, 5);\n}"
+                .to_string(),
+            bounds,
+        ),
+        // A string, whose length is a load rather than a fact about its type.
+        (
+            format!("{}fn main() {{\n  string s = \"abc\";\n  print(s[at()]);\n}}", at("3")),
+            bounds,
+        ),
+        (
+            format!("{}fn main() {{\n  string s = \"abc\";\n  print(s[at()]);\n}}", at("0 - 1")),
+            bounds,
+        ),
+        // A character counts as one however many bytes it took, so the guard
+        // has to be about characters too.
+        (
+            format!("{}fn main() {{\n  string s = \"éé\";\n  print(s[at()]);\n}}", at("2")),
+            bounds,
+        ),
+        // A list, including the empty one, where every index is out of range.
+        (
+            format!("{}fn main() {{\n  int[] xs = [1, 2];\n  print(xs[at()]);\n}}", at("2")),
+            bounds,
+        ),
+        (
+            format!("{}fn main() {{\n  int[] xs = [];\n  print(xs[at()]);\n}}", at("0")),
+            bounds,
+        ),
+        (
+            format!("{}fn main() {{\n  int[] xs = [1];\n  xs[at()] = 5;\n}}", at("1")),
+            bounds,
+        ),
     ];
 
-    for (index, program) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("bounds{index}.tc"));
-        std::fs::write(&source, program).unwrap();
+    let cases: Vec<(&str, &str)> = cases.iter().map(|(p, e)| (p.as_str(), *e)).collect();
+    each_stops_with(tools, "bounds", &cases);
+}
 
-        let run = tools.build_and_run(&source, &format!("bounds{index}"));
-        assert!(!run.status.success(), "case {index} was expected to fail: {}", run.stdout);
-        assert!(
-            run.stderr.contains("out of bounds"),
-            "case {index} should have said so, said: {}",
-            run.stderr
-        );
-    }
+/// The two conversions that can refuse: neither invents an answer for input
+/// that names none.
+///
+/// Both are checked where they land, because both take a value only the running
+/// program knows — a constant is settled by `sema` long before this.
+#[test]
+fn a_conversion_that_has_no_answer_reports_and_exits() {
+    let Some(tools) = Tools::find() else { return };
+
+    let number = |n: &str| format!("fn n() -> int {{\n  return {n};\n}}\n");
+    let text = |s: &str| format!("fn t() -> string {{\n  return \"{s}\";\n}}\n");
+    let bad_char = "this number is not a character";
+    let not_a_number = "this text is not a number";
+    let cases = [
+        // `char(n)`: past the last scalar value, below the first, and inside
+        // the block reserved for UTF-16 surrogates in the middle.
+        (format!("{}fn main() {{\n  print(char(n()));\n}}", number("1114112")), bad_char),
+        (format!("{}fn main() {{\n  print(char(n()));\n}}", number("0 - 1")), bad_char),
+        (format!("{}fn main() {{\n  print(char(n()));\n}}", number("55296")), bad_char),
+        (format!("{}fn main() {{\n  print(char(n()));\n}}", number("57343")), bad_char),
+        // `int(s)`: nothing at all, a sign with no digits, a sign in the wrong
+        // place, and text that is not digits.
+        (format!("{}fn main() {{\n  print(int(t()));\n}}", text("")), not_a_number),
+        (format!("{}fn main() {{\n  print(int(t()));\n}}", text("-")), not_a_number),
+        (format!("{}fn main() {{\n  print(int(t()));\n}}", text("+12")), not_a_number),
+        (format!("{}fn main() {{\n  print(int(t()));\n}}", text("12 ")), not_a_number),
+        (format!("{}fn main() {{\n  print(int(t()));\n}}", text("12a")), not_a_number),
+        // ... and a number no `int` can hold, which is the same refusal: an
+        // answer that had to be truncated would be a wrong one.
+        (
+            format!("{}fn main() {{\n  print(int(t()));\n}}", text("9223372036854775808")),
+            not_a_number,
+        ),
+        (
+            format!("{}fn main() {{\n  print(int(t()));\n}}", text("-9223372036854775809")),
+            not_a_number,
+        ),
+    ];
+
+    let cases: Vec<(&str, &str)> = cases.iter().map(|(p, e)| (p.as_str(), *e)).collect();
+    each_stops_with(tools, "convert", &cases);
+}
+
+/// The boundary values these two conversions *do* answer, next door to the ones
+/// above — a guard one out either way would show up here rather than there.
+#[test]
+fn a_conversion_answers_everything_right_up_to_the_boundary() {
+    let Some(tools) = Tools::find() else { return };
+
+    let cases: [(&str, &str); 8] = [
+        // The first and last characters there are, and the two either side of
+        // the surrogate block.
+        ("print(int(char(n(0))));", "0"),
+        ("print(int(char(n(55295))));", "55295"),
+        ("print(int(char(n(57344))));", "57344"),
+        ("print(int(char(n(1114111))));", "1114111"),
+        // The widest numbers an `int` holds, in and back out again. The most
+        // negative one has no positive twin, which is what a parser that
+        // negated at the end would lose.
+        ("print(int(t(\"9223372036854775807\")));", "9223372036854775807"),
+        ("print(int(t(\"-9223372036854775808\")));", "-9223372036854775808"),
+        ("print(int(t(\"0\")));", "0"),
+        ("print(int(t(\"-0\")));", "0"),
+    ];
+
+    // The values go through calls so that nothing is a constant `sema` could
+    // settle: what is under test is the check in the emitted code.
+    let prelude = "fn n(int v) -> int {\n  return v;\n}\n\
+                   fn t(string v) -> string {\n  return v;\n}\n";
+    run_each_after(tools, "boundary", prelude, &cases);
 }
 
 /// A `match` used as a value, where getting the control flow wrong shows up as
@@ -746,14 +847,7 @@ fn a_match_expression_yields_the_arm_that_ran() {
         ),
     ];
 
-    for (index, (body, expected)) in cases.iter().enumerate() {
-        let source = tools.scratch.join(format!("matchval{index}.tc"));
-        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run(&source, &format!("matchval{index}"));
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
-    }
+    run_each_after(tools, "matchval", prelude, &cases);
 }
 
 /// A TinyC function may be called anything, including the name of the runtime

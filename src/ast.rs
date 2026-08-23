@@ -399,6 +399,20 @@ impl Prim {
             Prim::Bool => Ty::Bool,
         }
     }
+
+    /// How the conversion is spelled, which is also its target type's name.
+    ///
+    /// [`Ty::name`] needs a [`TypeTable`] because a `Ty` may be an enum or a
+    /// class, whose names are the program's. None of these four is, so this one
+    /// needs nothing handed in.
+    pub fn name(self) -> &'static str {
+        match self {
+            Prim::Int => "int",
+            Prim::Char => "char",
+            Prim::Str => "string",
+            Prim::Bool => "bool",
+        }
+    }
 }
 
 /// A function the compiler provides rather than the program declaring.
@@ -1154,7 +1168,7 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
             dump_expr(out, array, depth + 1);
         }
         ExprKind::Convert { to, value, .. } => {
-            out.push_str(&format!("{pad}convert to {}\n", to.ty().name(&TypeTable::default())));
+            out.push_str(&format!("{pad}convert to {}\n", to.name()));
             dump_expr(out, value, depth + 1);
         }
         ExprKind::New { class, fields, .. } => {
@@ -1225,4 +1239,486 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
 /// surrogates in the middle of it names no character either.
 pub fn is_scalar_value(value: i64) -> bool {
     u32::try_from(value).is_ok_and(|v| char::from_u32(v).is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tree a source produces, as [`dump`] renders it.
+    ///
+    /// Going through the parser rather than building nodes by hand is what
+    /// makes these tests about the language: a shape nothing can be written to
+    /// produce is not one worth pinning.
+    fn dumped(src: &str) -> String {
+        let tokens = crate::lexer::lex(src).expect("the source should lex");
+        let program = crate::parser::parse(&tokens).expect("the source should parse");
+        dump(&program)
+    }
+
+    fn dumped_main(body: &str) -> String {
+        let whole = dumped(&format!("fn main() {{\n{body}\n}}\n"));
+        whole.strip_prefix("fn main()\n").expect("main's own header").to_string()
+    }
+
+    /// A table with one hierarchy, `Circle : Shape`, and one enum.
+    ///
+    /// Built by hand because these are questions about the *table*, not about
+    /// any syntax: `sema` is what fills one in from a program, and going
+    /// through it would test that instead.
+    fn table() -> (TypeTable, ClassId, ClassId, EnumId) {
+        let mut table = TypeTable::default();
+        table.enums.push(EnumInfo {
+            name: "Colour".to_string(),
+            variants: vec!["Red".to_string(), "Green".to_string()],
+        });
+        table.classes.push(ClassInfo {
+            name: "Shape".to_string(),
+            base: None,
+            fields: Vec::new(),
+            methods: Vec::new(),
+            size: 8,
+            storage: 24,
+        });
+        table.classes.push(ClassInfo {
+            name: "Circle".to_string(),
+            base: Some(ClassId(0)),
+            fields: vec![FieldInfo { name: "r".to_string(), ty: Ty::Int, offset: 8 }],
+            methods: Vec::new(),
+            size: 16,
+            // Every class of a hierarchy reserves the hierarchy's maximum.
+            storage: 24,
+        });
+        (table, ClassId(0), ClassId(1), EnumId(0))
+    }
+
+    // -- what a type answers -----------------------------------------------
+
+    #[test]
+    fn a_type_names_itself_through_the_table_that_holds_its_name() {
+        let (mut table, shape, _, colour) = table();
+        table.arrays.push(ArrayInfo { elem: Ty::Int, len: 3 });
+        table.lists.push(Ty::Str);
+
+        assert_eq!(Ty::Int.name(&table), "int");
+        assert_eq!(Ty::Str.name(&table), "string");
+        assert_eq!(Ty::Char.name(&table), "char");
+        assert_eq!(Ty::Bool.name(&table), "bool");
+        assert_eq!(Ty::Enum(colour).name(&table), "Colour");
+        assert_eq!(Ty::Class(shape).name(&table), "Shape");
+        assert_eq!(Ty::Array(ArrayId(0)).name(&table), "int[3]");
+        // The missing length *is* the name: as many as the program needs.
+        assert_eq!(Ty::List(ListId(0)).name(&table), "string[]");
+    }
+
+    #[test]
+    fn the_article_follows_the_spelling_rather_than_the_type() {
+        let (mut table, shape, _, colour) = table();
+        table.arrays.push(ArrayInfo { elem: Ty::Int, len: 3 });
+
+        assert_eq!(Ty::Int.with_article(&table), "an `int`");
+        assert_eq!(Ty::Array(ArrayId(0)).with_article(&table), "an `int[3]`");
+        assert_eq!(Ty::Str.with_article(&table), "a `string`");
+        assert_eq!(Ty::Class(shape).with_article(&table), "a `Shape`");
+        // An enum's name is the program's, so only its spelling can decide.
+        assert_eq!(Ty::Enum(colour).with_article(&table), "a `Colour`");
+    }
+
+    #[test]
+    fn only_numbers_and_characters_are_ordered() {
+        // An enum's variants have an order in the declaration, but not one the
+        // program said anything about; two strings are not ordered either,
+        // because where an accented letter sorts is a question about a language.
+        assert!(Ty::Int.is_ordered());
+        assert!(Ty::Char.is_ordered());
+        for ty in [Ty::Str, Ty::Bool, Ty::Enum(EnumId(0)), Ty::Array(ArrayId(0))] {
+            assert!(!ty.is_ordered(), "{ty:?} should not be ordered");
+        }
+    }
+
+    #[test]
+    fn the_aggregates_are_the_types_that_answer_no_equality() {
+        for ty in [Ty::Int, Ty::Str, Ty::Char, Ty::Bool, Ty::Enum(EnumId(0))] {
+            assert!(ty.has_equality(), "{ty:?} should compare");
+        }
+        // Element by element is a loop nobody asked for, and comparing the
+        // addresses would answer a different question.
+        for ty in [Ty::Array(ArrayId(0)), Ty::List(ListId(0)), Ty::Class(ClassId(0))] {
+            assert!(!ty.has_equality(), "{ty:?} should not compare");
+        }
+    }
+
+    #[test]
+    fn a_list_fits_in_a_register_and_still_cannot_be_printed() {
+        // The two questions come apart on exactly this type: printing one would
+        // show the address of its elements rather than the elements.
+        assert!(Ty::List(ListId(0)).fits_in_a_register());
+        assert!(!Ty::List(ListId(0)).is_printable());
+
+        for ty in [Ty::Int, Ty::Str, Ty::Char, Ty::Bool, Ty::Enum(EnumId(0))] {
+            assert!(ty.is_printable(), "{ty:?} should print");
+            assert!(ty.fits_in_a_register(), "{ty:?} should fit in a register");
+        }
+        // These two live in the frame; what a register holds is their address.
+        for ty in [Ty::Array(ArrayId(0)), Ty::Class(ClassId(0))] {
+            assert!(!ty.fits_in_a_register(), "{ty:?} should not fit in a register");
+            assert!(!ty.is_printable(), "{ty:?} should not print");
+        }
+    }
+
+    // -- the type table ----------------------------------------------------
+
+    #[test]
+    fn a_class_descends_from_itself_and_from_its_ancestors() {
+        let (table, shape, circle, _) = table();
+        assert!(table.descends_from(circle, shape));
+        assert!(table.descends_from(circle, circle));
+        assert!(table.descends_from(shape, shape));
+        // ... and not the other way, which is what makes a downcast a mistake.
+        assert!(!table.descends_from(shape, circle));
+    }
+
+    #[test]
+    fn only_a_subclass_coerces_and_only_upwards() {
+        let (table, shape, circle, _) = table();
+        assert!(table.coerces(Ty::Class(circle), Ty::Class(shape)));
+        assert!(!table.coerces(Ty::Class(shape), Ty::Class(circle)));
+        // The only widening in the language: everything else is equality.
+        assert!(table.coerces(Ty::Int, Ty::Int));
+        assert!(!table.coerces(Ty::Int, Ty::Char));
+    }
+
+    #[test]
+    fn every_class_of_a_hierarchy_reserves_the_same_room() {
+        let (mut table, shape, circle, _) = table();
+        // Not `size`: a `Circle` written into a `Shape` has to keep its vtable
+        // pointer and its fields, so storage is the hierarchy's maximum.
+        assert_eq!(table.size_of(Ty::Class(shape)), 24);
+        assert_eq!(table.size_of(Ty::Class(circle)), 24);
+        assert_eq!(table.class(circle).size, 16);
+
+        // Everything that fits in a register is eight, which is what makes a
+        // field's offset its position.
+        for ty in [Ty::Int, Ty::Str, Ty::Char, Ty::Bool, Ty::Enum(EnumId(0))] {
+            assert_eq!(table.size_of(ty), 8, "{ty:?}");
+        }
+
+        table.arrays.push(ArrayInfo { elem: Ty::Class(circle), len: 3 });
+        assert_eq!(
+            table.size_of(Ty::Array(ArrayId(0))),
+            72,
+            "three slots of the hierarchy's room"
+        );
+    }
+
+    #[test]
+    fn the_root_of_a_hierarchy_is_what_settles_its_room() {
+        let (table, shape, circle, _) = table();
+        assert_eq!(table.root_of(circle), shape);
+        assert_eq!(table.root_of(shape), shape);
+    }
+
+    #[test]
+    fn a_class_is_sealed_when_nothing_extends_it() {
+        let (table, shape, circle, _) = table();
+        // Only whole-program compilation can answer this, and it is what makes
+        // a call on a `Circle` a direct one.
+        assert!(table.is_sealed(circle));
+        assert!(!table.is_sealed(shape));
+    }
+
+    #[test]
+    fn a_field_and_a_method_are_found_by_name_or_not_at_all() {
+        let (table, _, circle, _) = table();
+        assert_eq!(table.class(circle).field("r").map(|f| f.offset), Some(8));
+        assert!(table.class(circle).field("nope").is_none());
+        assert!(table.class(circle).method("area").is_none());
+    }
+
+    #[test]
+    fn a_variants_tag_is_where_it_was_written() {
+        let (table, _, _, colour) = table();
+        assert_eq!(table.enum_info(colour).tag("Red"), Some(0));
+        assert_eq!(table.enum_info(colour).tag("Green"), Some(1));
+        assert_eq!(table.enum_info(colour).tag("Blue"), None);
+    }
+
+    // -- operators ---------------------------------------------------------
+
+    #[test]
+    fn arithmetic_answers_nothing_where_the_machine_would_not() {
+        assert_eq!(BinOp::Add.apply(2, 3), Some(5));
+        assert_eq!(BinOp::Sub.apply(2, 3), Some(-1));
+        assert_eq!(BinOp::Mul.apply(6, 7), Some(42));
+        assert_eq!(BinOp::Div.apply(7, 2), Some(3), "towards zero");
+        assert_eq!(BinOp::Div.apply(-7, 2), Some(-3), "towards zero from below too");
+        assert_eq!(BinOp::Rem.apply(-7, 2), Some(-1), "the sign is the dividend's");
+
+        assert_eq!(BinOp::Add.apply(i64::MAX, 1), None);
+        assert_eq!(BinOp::Sub.apply(i64::MIN, 1), None);
+        assert_eq!(BinOp::Mul.apply(i64::MAX, 2), None);
+        assert_eq!(BinOp::Div.apply(1, 0), None);
+        assert_eq!(BinOp::Rem.apply(1, 0), None);
+        assert_eq!(BinOp::Div.apply(i64::MIN, -1), None);
+        // `MIN % -1` is 0 on paper, and the machine reaches that 0 through the
+        // `idiv` whose *quotient* does not fit — so it is refused too.
+        assert_eq!(BinOp::Rem.apply(i64::MIN, -1), None);
+    }
+
+    #[test]
+    fn the_exact_answer_is_what_names_the_value_that_did_not_fit() {
+        // Only a diagnostic wants this, and it is why an overflow message can
+        // say which number an `int` could not hold.
+        assert_eq!(BinOp::Add.apply_exact(i64::MAX, 1), Some(i128::from(i64::MAX) + 1));
+        assert_eq!(BinOp::Sub.apply_exact(i64::MIN, 1), Some(i128::from(i64::MIN) - 1));
+        assert_eq!(
+            BinOp::Mul.apply_exact(i64::MIN, i64::MIN),
+            Some(i128::from(i64::MIN) * i128::from(i64::MIN))
+        );
+        // `MIN / -1` overflows an `i64` and does not overflow an `i128`, which
+        // is exactly the point of asking at the wider width.
+        assert_eq!(BinOp::Div.apply_exact(i64::MIN, -1), Some(-i128::from(i64::MIN)));
+        // A division by zero has no answer at any width.
+        assert_eq!(BinOp::Div.apply_exact(1, 0), None);
+        assert_eq!(BinOp::Rem.apply_exact(1, 0), None);
+    }
+
+    #[test]
+    fn only_addition_and_multiplication_may_have_their_operands_exchanged() {
+        assert!(BinOp::Add.commutes());
+        assert!(BinOp::Mul.commutes());
+        for op in [BinOp::Sub, BinOp::Div, BinOp::Rem] {
+            assert!(!op.commutes(), "{} does not commute", op.symbol());
+        }
+    }
+
+    #[test]
+    fn the_two_operators_with_a_zero_divisor_to_worry_about() {
+        assert!(BinOp::Div.divides());
+        assert!(BinOp::Rem.divides());
+        for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
+            assert!(!op.divides(), "{} does not divide", op.symbol());
+        }
+    }
+
+    #[test]
+    fn every_arithmetic_operator_has_a_symbol_and_a_noun_of_its_own() {
+        let ops = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Rem];
+        let symbols: Vec<&str> = ops.iter().map(|op| op.symbol()).collect();
+        assert_eq!(symbols, vec!["+", "-", "*", "/", "%"]);
+        // The noun is what a diagnostic talks about, so none may be empty or
+        // shared with another operator.
+        let nouns: Vec<&str> = ops.iter().map(|op| op.noun()).collect();
+        for (at, noun) in nouns.iter().enumerate() {
+            assert!(!noun.is_empty());
+            assert!(!nouns[at + 1..].contains(noun), "two operators share `{noun}`");
+        }
+    }
+
+    #[test]
+    fn negating_a_comparison_twice_gives_it_back() {
+        // Every comparison has an opposite, which is what lets `!(a < b)` be
+        // lowered as `a >= b` rather than as a negated result.
+        for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+            assert_ne!(op.negate(), op, "{} is its own opposite", op.symbol());
+            assert_eq!(op.negate().negate(), op, "{}", op.symbol());
+        }
+        assert_eq!(CmpOp::Lt.negate(), CmpOp::Ge);
+        assert_eq!(CmpOp::Le.negate(), CmpOp::Gt);
+    }
+
+    #[test]
+    fn only_the_four_orderings_need_operands_that_can_be_ordered() {
+        assert!(!CmpOp::Eq.is_ordering());
+        assert!(!CmpOp::Ne.is_ordering());
+        for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+            assert!(op.is_ordering(), "{}", op.symbol());
+        }
+    }
+
+    #[test]
+    fn a_short_circuits_answer_is_also_its_condition_for_stopping() {
+        // They coincide: `false && x` is false, and `true || x` is true.
+        assert_eq!(LogicOp::And.short_circuit(), 0);
+        assert_eq!(LogicOp::Or.short_circuit(), 1);
+        assert_eq!(LogicOp::And.symbol(), "&&");
+        assert_eq!(LogicOp::Or.symbol(), "||");
+    }
+
+    // -- conversions and builtins ------------------------------------------
+
+    #[test]
+    fn a_conversion_is_spelled_as_the_type_it_produces() {
+        for (prim, ty) in [
+            (Prim::Int, Ty::Int),
+            (Prim::Char, Ty::Char),
+            (Prim::Str, Ty::Str),
+            (Prim::Bool, Ty::Bool),
+        ] {
+            assert_eq!(prim.ty(), ty);
+            assert_eq!(prim.name(), ty.name(&TypeTable::default()));
+        }
+    }
+
+    #[test]
+    fn a_builtin_is_found_by_the_name_it_answers_to_and_by_no_other() {
+        for builtin in Builtin::ALL {
+            assert_eq!(Builtin::from_name(builtin.name()), Some(builtin));
+            assert!(builtin.params().is_empty(), "neither takes anything yet");
+        }
+        assert_eq!(Builtin::ReadLine.ret(), Some(Ty::Str));
+        assert_eq!(Builtin::Eof.ret(), Some(Ty::Bool));
+        assert_eq!(Builtin::from_name("print"), None);
+        assert_eq!(Builtin::from_name(""), None);
+    }
+
+    #[test]
+    fn only_some_numbers_name_a_character() {
+        assert!(is_scalar_value(0));
+        assert!(is_scalar_value(0xD7FF), "the last one below the surrogates");
+        assert!(is_scalar_value(0xE000), "the first one above them");
+        assert!(is_scalar_value(0x10FFFF), "the last one there is");
+
+        assert!(!is_scalar_value(-1));
+        assert!(!is_scalar_value(0xD800), "the surrogate block names nothing");
+        assert!(!is_scalar_value(0xDFFF));
+        assert!(!is_scalar_value(0x110000), "one past the end");
+        assert!(!is_scalar_value(i64::MAX));
+    }
+
+    // -- places ------------------------------------------------------------
+
+    #[test]
+    fn every_place_is_rooted_at_a_variable() {
+        // The only thing in TinyC that names storage, which is what keeps an
+        // address from ever having to travel outward.
+        let at = Span::new(0, 1);
+        let var = Place::Var { name: "xs".to_string(), name_span: at };
+        assert_eq!(var.root().0, "xs");
+
+        let element = Place::Element {
+            base: Box::new(var.clone()),
+            index: Expr { id: NodeId(0), span: at, kind: ExprKind::Int(0) },
+            span: Span::new(0, 5),
+        };
+        assert_eq!(element.root().0, "xs");
+        assert_eq!(element.span(), Span::new(0, 5), "an element underlines the whole of it");
+
+        let field = Place::Field {
+            base: Box::new(element),
+            name: "r".to_string(),
+            name_span: Span::new(6, 1),
+        };
+        assert_eq!(field.root().0, "xs");
+        assert_eq!(field.span(), Span::new(0, 7), "a field reaches back to what it is on");
+    }
+
+    // -- the dump ----------------------------------------------------------
+
+    #[test]
+    fn the_dump_shows_precedence_as_the_shape_of_the_tree() {
+        // The whole point of the dump: the tree, not the source it came from.
+        assert_eq!(
+            dumped_main("print(1 + 2 * 3);"),
+            "  print\n    +\n      int 1\n      *\n        int 2\n        int 3\n"
+        );
+        assert_eq!(
+            dumped_main("print((1 + 2) * 3);"),
+            "  print\n    *\n      +\n        int 1\n        int 2\n      int 3\n"
+        );
+    }
+
+    #[test]
+    fn the_dump_names_every_kind_of_literal() {
+        assert_eq!(dumped_main("print(1);"), "  print\n    int 1\n");
+        assert_eq!(dumped_main("print(\"a\\nb\");"), "  print\n    string \"a\\nb\"\n");
+        assert_eq!(dumped_main("print('x');"), "  print\n    char 'x'\n");
+        assert_eq!(dumped_main("print(true);"), "  print\n    bool true\n");
+    }
+
+    #[test]
+    fn a_declared_type_is_dumped_as_it_was_written() {
+        // The dump has no table to resolve names against and needs none: what
+        // it shows is the syntax, brackets included.
+        assert!(dumped_main("int[3] xs = [1, 2, 3];").starts_with("  decl int[3] xs\n"));
+        assert!(dumped_main("int[] ys = [];").starts_with("  decl int[] ys\n"));
+        assert!(dumped_main("string s = \"a\";").starts_with("  decl string s\n"));
+    }
+
+    #[test]
+    fn an_assignment_shows_the_shape_of_its_place_and_the_indices_underneath() {
+        // The place is a shape, and an index inside it is an expression of its
+        // own — so `xs[i] = 1` shows `xs[]` with `i` and `1` under it.
+        let dumped = dumped_main("int[2] xs = [0, 0];\nint i = 0;\nxs[i] = 1;");
+        assert!(dumped.ends_with("  assign xs[]\n    var i\n    int 1\n"), "{dumped}");
+    }
+
+    #[test]
+    fn a_method_body_is_printed_under_its_class_and_not_again_in_the_flat_list() {
+        let dumped = dumped(
+            "class Shape {\n  int t;\n  fn area(self) -> int { return self.t; }\n}\n\
+             fn main() {\n}\n",
+        );
+        assert_eq!(dumped.matches("fn area(self) -> int").count(), 1, "{dumped}");
+        // Indented, because it belongs to the class above it.
+        assert!(dumped.contains("\n  fn area(self) -> int\n"), "{dumped}");
+        assert!(dumped.contains("class Shape\n  field int t\n"), "{dumped}");
+    }
+
+    #[test]
+    fn a_base_class_and_an_enums_variants_are_named_on_their_own_line() {
+        assert!(dumped("enum C { R, G }\nfn main() {\n}\n").starts_with("enum C { R, G }\n"));
+        let hierarchy = dumped("class A {\n}\nclass B : A {\n}\nfn main() {\n}\n");
+        assert!(hierarchy.contains("class A\n"), "{hierarchy}");
+        assert!(hierarchy.contains("class B : A\n"), "{hierarchy}");
+    }
+
+    #[test]
+    fn every_statement_reaches_the_dump() {
+        // A shape the dump forgot would print nothing at all, and `--emit ast`
+        // would quietly lie about the program.
+        let body = "int a = 1;\n\
+                    a = 2;\n\
+                    print(a);\n\
+                    int[] ys = [];\n\
+                    push(ys, a);\n\
+                    if (a == 2) {\n  a = 3;\n} else {\n  a = 4;\n}\n\
+                    while (a < 5) {\n  a = a + 1;\n  break;\n}\n\
+                    for (int i = 0; i < 2; i = i + 1) {\n  continue;\n}\n\
+                    nothing();\n\
+                    return;";
+        let dumped = dumped(&format!("fn nothing() {{\n}}\nfn main() {{\n{body}\n}}\n"));
+        for expected in [
+            "decl int a", "assign a", "print", "push ys", "if", "then", "else", "while", "for",
+            "break", "continue", "call nothing", "return",
+        ] {
+            assert!(dumped.contains(expected), "no `{expected}` in the dump:\n{dumped}");
+        }
+    }
+
+    #[test]
+    fn every_expression_reaches_the_dump() {
+        let body = "int a = -1;\n\
+                    bool b = !(a < 0) && a >= 0 || a == 0;\n\
+                    Colour k = Colour::Red;\n\
+                    int[2] xs = [1, 2];\n\
+                    print(len(xs) + xs[0]);\n\
+                    print(int('z'));\n\
+                    Circle c = Circle { r: 1 };\n\
+                    print(c.r);\n\
+                    print(c.get());\n\
+                    print(match (k) { Colour::Red => 1, Colour::Green => 2, });";
+        let dumped = dumped(&format!(
+            "enum Colour {{ Red, Green }}\n\
+             class Circle {{\n  int r;\n  fn get(self) -> int {{ return self.r; }}\n}}\n\
+             fn main() {{\n{body}\n}}\n"
+        ));
+        for expected in [
+            "neg", "not", "&&", "||", "==", ">=", "<", "variant Colour::Red", "array", "len",
+            "index", "convert to int", "new Circle", "field r", "method get", "match",
+            "  Colour::Red", "int 1",
+        ] {
+            assert!(dumped.contains(expected), "no `{expected}` in the dump:\n{dumped}");
+        }
+    }
 }

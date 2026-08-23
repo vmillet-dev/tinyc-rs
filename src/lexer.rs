@@ -921,6 +921,80 @@ mod tests {
         assert_eq!(tokens[2].span, Span::new(10, 1)); // =
     }
 
+
+    // -- running out mid-token ---------------------------------------------
+
+    #[test]
+    fn a_character_literal_that_runs_out_at_the_end_of_the_file() {
+        // The newline case is covered above; this is the other way a literal
+        // can stop, and it reaches a different arm — there is no character
+        // after the one that was allowed, not even a wrong one.
+        for src in ["'a", "'ab", "'"] {
+            let error = error(src);
+            assert!(
+                error.message.contains("unterminated character literal"),
+                "`{src}`: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_backslash_at_the_end_of_the_file_leaves_the_literal_unterminated() {
+        // `escape` answers `None` when the file ends inside it, and what is
+        // unterminated is the *literal* rather than the escape — so this is the
+        // message either kind of literal reports.
+        assert!(error(r#""abc\"#).message.contains("unterminated string literal"));
+        assert!(error(r"'\").message.contains("unterminated character literal"));
+    }
+
+    #[test]
+    fn a_string_may_hold_a_quote_of_the_other_kind_escaped_or_not() {
+        // `\'` is accepted in a string even though nothing there needs it, so
+        // that the two literals take the same escapes.
+        assert_eq!(kinds(r#""it\'s""#), vec![TokenKind::Str(chars("it's")), TokenKind::Eof]);
+        assert_eq!(kinds(r#""it's""#), vec![TokenKind::Str(chars("it's")), TokenKind::Eof]);
+        // ... and a character literal takes `\"` for the same reason.
+        assert_eq!(kinds(r#"'\"'"#), vec![TokenKind::Char('"'), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn the_nul_character_can_be_written_in_both_literals() {
+        assert_eq!(kinds(r"'\0'"), vec![TokenKind::Char('\0'), TokenKind::Eof]);
+        assert_eq!(kinds(r#""a\0b""#), vec![TokenKind::Str(chars("a\0b")), TokenKind::Eof]);
+    }
+
+    #[test]
+    fn a_string_literal_may_not_run_past_the_end_of_its_line() {
+        // A real newline ends it; `\n` is how one is put *in* it.
+        assert!(error("\"a\nb\"").message.contains("unterminated string literal"));
+        assert_eq!(kinds(r#""a\nb""#), vec![TokenKind::Str(chars("a\nb")), TokenKind::Eof]);
+    }
+
+    // -- trivia the lexer does not have ------------------------------------
+
+    #[test]
+    fn there_are_no_block_comments() {
+        // `/*` is a division followed by a multiplication, and saying so here
+        // is what keeps a program that expects otherwise from being read wrong.
+        assert_eq!(
+            kinds("1 /* 2"),
+            vec![TokenKind::Int(1), TokenKind::Slash, TokenKind::Star, TokenKind::Int(2),
+                 TokenKind::Eof]
+        );
+    }
+
+    #[test]
+    fn a_carriage_return_is_whitespace_like_any_other() {
+        // A file with Windows line endings has one before every newline, so a
+        // lexer that did not skip it would fail on half the world's files.
+        assert_eq!(
+            kinds("int\r\nx\r\n"),
+            vec![TokenKind::KwInt, TokenKind::Ident("x".into()), TokenKind::Eof]
+        );
+        // Including at the end of a comment, which stops at the newline.
+        assert_eq!(kinds("// hi\r\n1"), vec![TokenKind::Int(1), TokenKind::Eof]);
+    }
     // -- malformed input ---------------------------------------------------
 
     #[test]

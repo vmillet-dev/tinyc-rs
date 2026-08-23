@@ -5,7 +5,7 @@
 //! characters, not bytes, so a non-ASCII string literal earlier on the line does
 //! not shift the reported column.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// How many columns a tab character occupies when a source line is echoed.
 const TAB_WIDTH: usize = 4;
@@ -91,10 +91,6 @@ impl SourceFile {
         &self.text
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     /// 1-based line and column (in characters) for a byte offset.
     pub fn line_col(&self, offset: u32) -> (usize, usize) {
         let offset = (offset as usize).min(self.text.len());
@@ -105,7 +101,7 @@ impl SourceFile {
     }
 
     /// The text of a 1-based line, without its terminator.
-    pub fn line_text(&self, line: usize) -> &str {
+    fn line_text(&self, line: usize) -> &str {
         let start = self.line_starts[line - 1];
         let end = self
             .line_starts

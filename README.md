@@ -353,6 +353,10 @@ at most three parameters, and says so when it takes four.
   addresses would quietly answer a different question.
 * **A field may not be an array or another object**, which keeps every offset a
   multiple of eight.
+* **A class may not take an enum's name, or another class's.** A type name is
+  resolved to one type and there is nowhere for a second to go, so the loser
+  would be a declaration no program could ever name. The compiler says so
+  instead, pointing at whichever of the two was written second.
 * **Arrays stay invariant.** A `Circle[2]` is not a `Shape[2]`, because writing
   a `Rect` through the second would put one in the first. What *is* allowed is
   building a `Shape[2]` directly: an array literal takes the nearest common
@@ -1052,6 +1056,16 @@ together:
 Anything running the pipeline should go through `tinyc::with_compiler_stack`,
 which is what the CLI does.
 
+What is counted is the depth of the **tree**, not the depth the parser happens
+to recurse to, and the two part company wherever a loop builds a left-leaning
+chain. `1 + 1 + 1` reads as flat and is a tree three deep; so is a chain of
+`else if`, each of which nests inside the previous `else`. Both were a stack
+overflow rather than a diagnostic while only the parser's own recursion was
+counted, because every later pass still walks the tree the loop built.
+
+Width is not depth and is not limited: an array literal's elements are siblings,
+so a thousand of them cost one level, not a thousand.
+
 ## Register allocation
 
 The allocator is a linear scan over the IR's virtual registers, and it is
@@ -1269,12 +1283,16 @@ out of the allocator's hands, so the allocator only ever reasons about
 cargo test
 ```
 
-Unit tests live beside each stage, and two integration suites sit on top:
+Unit tests live beside each stage, and three integration suites sit on top:
 
 * `tests/error_positions.rs` asserts the exact line and column reported for
   every program in `examples/errors/`, and checks the *shape* of the emitted
   assembly — that every path out of a function undoes its prologue, and that no
   generated symbol is one a TinyC function could also claim.
+* `tests/pipeline.rs` covers what belongs to the pipeline as a whole rather than
+  to any one stage: that every shape of nesting is refused *in words* past the
+  limit and survives every stage below it, and that `--emit` really stops the
+  run where it says it does.
 * `tests/execution.rs` **runs the compiled programs.** Every other test in the
   repository inspects text, and text cannot tell a `setl` from a `setg` or
   notice a register clobbered between two instructions that each look right on

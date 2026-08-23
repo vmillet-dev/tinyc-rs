@@ -69,7 +69,9 @@
 
 use crate::ast::{BinOp, ClassId, CmpOp, EnumId, Ty};
 use crate::codegen::{Allocation, Backend, Location, PhysReg, RegisterFile};
-use crate::ir::{Block, Function, Instr, Program, Runtime, Terminator, VReg, Value};
+use crate::ir::{
+    Block, CHAR_BYTES, Function, Instr, Program, Runtime, STR_HEADER, Terminator, VReg, Value,
+};
 
 /// Register numbers follow the usual x86-64 encoding order.
 const NAMES: [&str; 16] = [
@@ -593,6 +595,56 @@ impl Asm {
     }
 }
 
+/// One runtime routine's stack frame: the registers it saves and the bytes it
+/// reserves under them.
+///
+/// The prologue and the epilogue are one value so that they cannot come apart.
+/// A `push` whose `pop` was forgotten, or a `sub rsp` whose `add` was, leaves
+/// `rsp` wrong for whoever runs next — a crash a long way from its cause, and
+/// the kind of mistake that only shows up in the routine nobody exercised.
+///
+/// The alignment rule is checked here too, once, instead of being re-derived at
+/// every routine: a routine is reached by `call`, so `rsp % 16 == 8` on
+/// arrival, each push takes eight more, and what is reserved has to bring the
+/// total back to a multiple of sixteen before this routine calls anything of
+/// its own.
+struct StubFrame {
+    saved: &'static [&'static str],
+    reserved: u32,
+}
+
+impl StubFrame {
+    /// Push `saved` in order and reserve `reserved` bytes under them. `note`
+    /// says what the reserved bytes are for, beside the `sub`.
+    fn enter(
+        asm: &mut Asm,
+        saved: &'static [&'static str],
+        reserved: u32,
+        note: &str,
+    ) -> StubFrame {
+        assert_eq!(
+            (8 + 8 * saved.len() as u32 + reserved) % 16,
+            0,
+            "a runtime routine's frame has to leave rsp aligned for the calls it makes"
+        );
+        for register in saved {
+            asm.asm(&format!("push {register}"));
+        }
+        asm.asm(&format!("sub  rsp, {reserved}    ; {note}"));
+        StubFrame { saved, reserved }
+    }
+
+    /// Give the frame back and return — the exact reverse of [`Self::enter`],
+    /// which is why the two are never written out by hand.
+    fn ret(&self, asm: &mut Asm) {
+        asm.asm(&format!("add  rsp, {}", self.reserved));
+        for register in self.saved.iter().rev() {
+            asm.asm(&format!("pop  {register}"));
+        }
+        asm.asm("ret");
+    }
+}
+
 // -- sections --------------------------------------------------------------
 
 fn header(asm: &mut Asm, target: &str, used: &Used) {
@@ -791,9 +843,7 @@ fn arena(asm: &mut Asm) {
     asm.comment("the arena: a bump pointer through chunks, and nothing is ever freed");
     asm.line(&format!("{ALLOC}:"));
     asm.comment("rcx = bytes wanted -> rax = their address");
-    asm.asm("push rbx");
-    asm.asm("push rsi");
-    asm.asm("sub  rsp, 40    ; shadow space + alignment");
+    let frame = StubFrame::enter(asm, &["rbx", "rsi"], 40, "shadow space + alignment");
     asm.comment("round up, so every block starts 16-aligned like malloc's own");
     asm.asm("lea  rbx, [rcx+15]");
     asm.asm("and  rbx, -16");
@@ -802,10 +852,7 @@ fn arena(asm: &mut Asm) {
     asm.asm(&format!("cmp  {RDX}, [{ARENA_END}]"));
     asm.asm("ja   .refill");
     asm.asm(&format!("mov  [{ARENA_NEXT}], {RDX}"));
-    asm.asm("add  rsp, 40");
-    asm.asm("pop  rsi");
-    asm.asm("pop  rbx");
-    asm.asm("ret");
+    frame.ret(asm);
 
     asm.line(".refill:");
     asm.comment("what is left of the old chunk is abandoned: nothing here frees");
@@ -823,10 +870,7 @@ fn arena(asm: &mut Asm) {
     asm.asm(&format!("mov  [{ARENA_END}], {RDX}"));
     asm.asm(&format!("lea  {RDX}, [{RAX}+rbx]"));
     asm.asm(&format!("mov  [{ARENA_NEXT}], {RDX}"));
-    asm.asm("add  rsp, 40");
-    asm.asm("pop  rsi");
-    asm.asm("pop  rbx");
-    asm.asm("ret");
+    frame.ret(asm);
 }
 
 /// The routines a string's operators become.
@@ -841,17 +885,17 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("a + b: a new string in the arena, holding a's characters then b's");
         asm.line(&format!("{}:", runtime_symbol(Runtime::Concat)));
         asm.comment("rcx = a, rdx = b -> rax = the joined string");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("push rdi");
-        asm.asm("push r12");
-        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        let frame =
+
+            StubFrame::enter(asm, &["rbx", "rsi", "rdi", "r12"], 40, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}"));
         asm.asm(&format!("mov  rdi, {RDX}"));
         asm.asm("mov  rbx, [rsi-8]    ; how many characters a has");
         asm.asm("mov  r12, [rdi-8]");
         asm.asm(&format!("lea  {RCX}, [rbx+r12]"));
-        asm.asm(&format!("lea  {RCX}, [{RCX}*4+8]    ; the header, then four bytes each"));
+        asm.asm(&format!(
+            "lea  {RCX}, [{RCX}*{CHAR_BYTES}+{STR_HEADER}]    ; the header, then four bytes each"
+        ));
         asm.asm(&format!("call {ALLOC}"));
         asm.asm(&format!("lea  {RDX}, [rbx+r12]"));
         asm.asm(&format!("mov  [{RAX}], {RDX}    ; the count goes in front"));
@@ -879,12 +923,7 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
         asm.asm(&format!("dec  {RCX}"));
         asm.asm("jmp  .right");
         asm.line(".done:");
-        asm.asm("add  rsp, 40");
-        asm.asm("pop  r12");
-        asm.asm("pop  rdi");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 
     if used.str_eq {
@@ -937,17 +976,17 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("string(c): a string of exactly one character");
         asm.line(&format!("{}:", runtime_symbol(Runtime::CharToStr)));
         asm.comment("rcx = the character -> rax = the string");
-        asm.asm("push rbx");
-        asm.asm("sub  rsp, 32    ; shadow space");
+        let frame = StubFrame::enter(asm, &["rbx"], 32, "shadow space");
         asm.asm(&format!("mov  rbx, {RCX}"));
-        asm.asm(&format!("mov  {RCX}, 12    ; the count, then the one character"));
+        asm.asm(&format!(
+            "mov  {RCX}, {}    ; the count, then the one character",
+            STR_HEADER + CHAR_BYTES
+        ));
         asm.asm(&format!("call {ALLOC}"));
         asm.asm(&format!("mov  qword [{RAX}], 1"));
         asm.asm(&format!("add  {RAX}, 8"));
         asm.asm(&format!("mov  [{RAX}], ebx"));
-        asm.asm("add  rsp, 32");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 
     if used.int_str {
@@ -955,11 +994,8 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("string(n): the number written out in decimal");
         asm.line(&format!("{}:", runtime_symbol(Runtime::IntToStr)));
         asm.comment("rcx = n -> rax = its text");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("push rdi");
-        asm.asm("push r12");
-        asm.asm("sub  rsp, 72    ; shadow space + room for the digits");
+        let saved: &[&str] = &["rbx", "rsi", "rdi", "r12"];
+        let frame = StubFrame::enter(asm, saved, 72, "shadow space + room for the digits");
         asm.asm("xor  r12, r12    ; how many digits so far");
         asm.asm("lea  rdi, [rsp+32]");
         asm.asm(&format!("mov  rbx, {RCX}    ; keep n, to read its sign back"));
@@ -985,7 +1021,7 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
         asm.asm("mov  byte [rdi+r12], 45    ; '-'");
         asm.asm("inc  r12");
         asm.line(".unsigned:");
-        asm.asm(&format!("lea  {RCX}, [r12*4+8]"));
+        asm.asm(&format!("lea  {RCX}, [r12*{CHAR_BYTES}+{STR_HEADER}]"));
         asm.asm(&format!("call {ALLOC}"));
         asm.asm(&format!("mov  [{RAX}], r12"));
         asm.asm(&format!("add  {RAX}, 8"));
@@ -999,12 +1035,7 @@ fn string_stubs(asm: &mut Asm, used: &Used) {
         asm.asm(&format!("add  {RDX}, 4"));
         asm.asm(&format!("test {RCX}, {RCX}"));
         asm.asm("jnz  .copy");
-        asm.asm("add  rsp, 72");
-        asm.asm("pop  r12");
-        asm.asm("pop  rdi");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 }
 
@@ -1025,9 +1056,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("room for n elements, with the length already set");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListNew)));
         asm.comment("rcx = how many elements -> rax = the list");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        let frame = StubFrame::enter(asm, &["rbx", "rsi"], 40, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}    ; the length"));
         asm.asm(&format!("mov  rbx, {RCX}"));
         asm.comment("never less than four, so the first few pushes need no move");
@@ -1040,10 +1069,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.asm(&format!("mov  [{RAX}], rbx    ; capacity"));
         asm.asm(&format!("mov  [{RAX}+8], rsi    ; length"));
         asm.asm(&format!("add  {RAX}, 16    ; and the value is where the elements start"));
-        asm.asm("add  rsp, 40");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 
     if used.list_push {
@@ -1051,11 +1077,9 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("one more element, answering where the list ended up");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListPush)));
         asm.comment("rcx = the list, rdx = the value -> rax = the list, possibly moved");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("push rdi");
-        asm.asm("push r12");
-        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        let frame =
+
+            StubFrame::enter(asm, &["rbx", "rsi", "rdi", "r12"], 40, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}"));
         asm.asm(&format!("mov  r12, {RDX}"));
         asm.asm("mov  rbx, [rsi-8]    ; length");
@@ -1083,12 +1107,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.asm("inc  rbx");
         asm.asm("mov  [rsi-8], rbx    ; the length lives with the elements");
         asm.asm(&format!("mov  {RAX}, rsi"));
-        asm.asm("add  rsp, 40");
-        asm.asm("pop  r12");
-        asm.asm("pop  rdi");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 
     if used.str_int {
@@ -1096,18 +1115,16 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("int(s): the number a string spells, and nothing else will do");
         asm.line(&format!("{}:", runtime_symbol(Runtime::StrToInt)));
         asm.comment("rcx = the text -> rax = the number");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("push rdi");
-        asm.asm("push r12");
-        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        let frame =
+
+            StubFrame::enter(asm, &["rbx", "rsi", "rdi", "r12"], 40, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}"));
         asm.asm("mov  rbx, [rsi-8]    ; how many characters");
         asm.asm("xor  rdi, rdi        ; where we are");
         asm.asm("xor  r12, r12        ; was there a minus?");
         asm.asm("test rbx, rbx");
         asm.asm(&format!("jz   {ABORT_NOT_A_NUMBER}    ; the empty string spells nothing"));
-        asm.asm(&format!("mov  eax, [rsi]"));
+        asm.asm("mov  eax, [rsi]");
         asm.asm("cmp  eax, 45    ; '-'");
         asm.asm("jne  .digits");
         asm.asm("mov  r12, 1");
@@ -1120,8 +1137,8 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.line(".next:");
         asm.asm("cmp  rdi, rbx");
         asm.asm("jae  .complete");
-        asm.asm(&format!("mov  ecx, [rsi+rdi*4]"));
-        asm.asm(&format!("sub  ecx, 48    ; '0'"));
+        asm.asm("mov  ecx, [rsi+rdi*4]");
+        asm.asm("sub  ecx, 48    ; '0'");
         asm.asm("cmp  ecx, 9");
         asm.asm(&format!("ja   {ABORT_NOT_A_NUMBER}    ; unsigned, so it catches both ends"));
         asm.asm(&format!("imul {RAX}, {RAX}, 10"));
@@ -1137,12 +1154,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.asm(&format!("neg  {RAX}"));
         asm.asm(&format!("jo   {ABORT_NOT_A_NUMBER}    ; only the one with no positive twin"));
         asm.line(".signed:");
-        asm.asm("add  rsp, 40");
-        asm.asm("pop  r12");
-        asm.asm("pop  rdi");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 
     if used.chars_str {
@@ -1150,9 +1162,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("string(cs): a list of characters sealed into a string");
         asm.line(&format!("{}:", runtime_symbol(Runtime::CharsToStr)));
         asm.comment("rcx = a char[] -> rax = a string of the same characters");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        let frame = StubFrame::enter(asm, &["rbx", "rsi"], 40, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}"));
         asm.asm("mov  rbx, [rsi-8]");
         asm.asm(&format!("lea  {RCX}, [rbx*4+8]"));
@@ -1169,10 +1179,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.asm(&format!("inc  {RCX}"));
         asm.asm("jmp  .copy");
         asm.line(".copied:");
-        asm.asm("add  rsp, 40");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 
     if used.list_clone {
@@ -1180,9 +1187,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("a second list holding the same elements — what assigning one costs");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListClone)));
         asm.comment("rcx = the list -> rax = a list of its own");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("sub  rsp, 40    ; shadow space + alignment");
+        let frame = StubFrame::enter(asm, &["rbx", "rsi"], 40, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}"));
         asm.asm("mov  rbx, [rsi-8]");
         asm.asm(&format!("mov  {RCX}, rbx"));
@@ -1196,10 +1201,7 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.asm(&format!("inc  {RCX}"));
         asm.asm("jmp  .copy");
         asm.line(".copied:");
-        asm.asm("add  rsp, 40");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 }
 
@@ -1248,10 +1250,7 @@ fn text_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("print a string: encode the whole of it, then hand printf one C string");
         asm.line(&format!("{PRINT_STR}:"));
         asm.comment("rcx = the string");
-        asm.asm("push rbx");
-        asm.asm("push rsi");
-        asm.asm("push rdi");
-        asm.asm("sub  rsp, 32    ; shadow space");
+        let frame = StubFrame::enter(asm, &["rbx", "rsi", "rdi"], 32, "shadow space");
         asm.asm(&format!("mov  rsi, {RCX}"));
         asm.asm(&format!("mov  rbx, [{RCX}-8]"));
         asm.comment("four bytes per character is the most UTF-8 can need, plus the NUL");
@@ -1268,7 +1267,7 @@ fn text_stubs(asm: &mut Asm, used: &Used) {
         asm.line(".next:");
         asm.asm("test rbx, rbx");
         asm.asm("jz   .done");
-        asm.asm(&format!("mov  ecx, [rsi]"));
+        asm.asm("mov  ecx, [rsi]");
         asm.asm(&format!("mov  {RDX}, rdi"));
         asm.asm(&format!("call {UTF8}"));
         asm.asm(&format!("add  rdi, {RAX}"));
@@ -1280,11 +1279,7 @@ fn text_stubs(asm: &mut Asm, used: &Used) {
         asm.asm(&format!("lea  {RCX}, [{FMT_STR}]"));
         asm.asm(&format!("mov  {RDX}, [{SCRATCH}]"));
         asm.asm("call printf");
-        asm.asm("add  rsp, 32");
-        asm.asm("pop  rdi");
-        asm.asm("pop  rsi");
-        asm.asm("pop  rbx");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 
     if used.print_char {
@@ -1292,15 +1287,15 @@ fn text_stubs(asm: &mut Asm, used: &Used) {
         asm.comment("print one character: at most four bytes, so the frame is buffer enough");
         asm.line(&format!("{PRINT_CHAR}:"));
         asm.comment("rcx = the character");
-        asm.asm("sub  rsp, 56    ; shadow space + a five-byte buffer + alignment");
+        let frame =
+            StubFrame::enter(asm, &[], 56, "shadow space + a five-byte buffer + alignment");
         asm.asm(&format!("lea  {RDX}, [rsp+32]"));
         asm.asm(&format!("call {UTF8}"));
         asm.asm(&format!("mov  byte [rsp+{RAX}+32], 0"));
         asm.asm(&format!("lea  {RCX}, [{FMT_STR}]"));
         asm.asm(&format!("lea  {RDX}, [rsp+32]"));
         asm.asm("call printf");
-        asm.asm("add  rsp, 56");
-        asm.asm("ret");
+        frame.ret(asm);
     }
 }
 
@@ -1319,7 +1314,7 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.asm(&format!("cmp  {RAX}, [{INPUT_LEN}]"));
     asm.asm("jb   .waiting");
     asm.asm("sub  rsp, 40    ; shadow space + alignment");
-    asm.asm(&format!("mov  ecx, 0    ; the input"));
+    asm.asm("mov  ecx, 0    ; the input");
     asm.asm(&format!("lea  {RDX}, [{INPUT}]"));
     asm.asm(&format!("mov  r8d, {INPUT_BYTES}"));
     asm.asm("call _read");
@@ -1379,11 +1374,8 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.comment("one character's worth of UTF-8, taken from the input");
     asm.line(&format!("{UTF8_DECODE}:"));
     asm.comment("rcx = the first byte -> rax = the character it starts");
-    asm.asm("push rbx");
-    asm.asm("push rsi");
-    asm.asm("push rdi");
-    asm.asm("sub  rsp, 32    ; shadow space");
-    asm.asm(&format!("cmp  ecx, 0x80"));
+    let frame = StubFrame::enter(asm, &["rbx", "rsi", "rdi"], 32, "shadow space");
+    asm.asm("cmp  ecx, 0x80");
     asm.asm("jb   .plain");
     asm.asm(&format!("mov  rbx, {RCX}"));
     // Which of the three multi-byte forms this is, read off the lead byte.
@@ -1421,9 +1413,9 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.asm(&format!("call {NEXT_BYTE}"));
     asm.asm(&format!("cmp  {RAX}, 0"));
     asm.asm(&format!("jl   {ABORT_BAD_UTF8}    ; the input stopped mid-character"));
-    asm.asm(&format!("mov  edx, eax"));
-    asm.asm(&format!("and  edx, 0xC0"));
-    asm.asm(&format!("cmp  edx, 0x80"));
+    asm.asm("mov  edx, eax");
+    asm.asm("and  edx, 0xC0");
+    asm.asm("cmp  edx, 0x80");
     asm.asm(&format!("jne  {ABORT_BAD_UTF8}"));
     asm.asm("and  eax, 0x3F");
     asm.asm("shl  rbx, 6");
@@ -1435,7 +1427,7 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.comment("an overlong encoding spells a character in more bytes than it needs");
     asm.asm("cmp  rbx, rsi");
     asm.asm(&format!("jb   {ABORT_BAD_UTF8}"));
-    asm.asm(&format!("cmp  rbx, 0x10FFFF"));
+    asm.asm("cmp  rbx, 0x10FFFF");
     asm.asm(&format!("ja   {ABORT_BAD_UTF8}"));
     asm.asm(&format!("mov  {RAX}, rbx"));
     asm.asm(&format!("sub  {RAX}, 0xD800"));
@@ -1443,21 +1435,15 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.asm(&format!("jbe  {ABORT_BAD_UTF8}    ; a surrogate names no character"));
     asm.asm(&format!("mov  {RAX}, rbx"));
     asm.line(".decoded:");
-    asm.asm("add  rsp, 32");
-    asm.asm("pop  rdi");
-    asm.asm("pop  rsi");
-    asm.asm("pop  rbx");
-    asm.asm("ret");
+    frame.ret(asm);
 
     asm.blank();
     asm.comment("read_line(): characters accumulate in a list, then become a string");
     asm.line(&format!("{}:", runtime_symbol(Runtime::ReadLine)));
     asm.comment("-> rax = the line, without its ending");
-    asm.asm("push rbx");
-    asm.asm("push rsi");
-    asm.asm("push rdi");
-    asm.asm("push r12");
-    asm.asm("sub  rsp, 40    ; shadow space + alignment");
+    let frame =
+
+        StubFrame::enter(asm, &["rbx", "rsi", "rdi", "r12"], 40, "shadow space + alignment");
     asm.comment("the first byte decides whether there is a line at all");
     asm.asm(&format!("call {NEXT_BYTE}"));
     asm.asm(&format!("cmp  {RAX}, 0"));
@@ -1478,7 +1464,7 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.asm(&format!("mov  rbx, {RAX}"));
     asm.asm(&format!("call {NEXT_BYTE}"));
     asm.asm(&format!("mov  rsi, {RAX}"));
-    asm.asm(&format!("cmp  rsi, 0"));
+    asm.asm("cmp  rsi, 0");
     asm.asm("jge  .next    ; the input running out ends the line too");
 
     asm.line(".ended:");
@@ -1487,7 +1473,7 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.asm(&format!("test {RCX}, {RCX}"));
     asm.asm("jz   .seal");
     asm.asm(&format!("mov  edx, [rbx+{RCX}*8-8]"));
-    asm.asm(&format!("cmp  edx, 13"));
+    asm.asm("cmp  edx, 13");
     asm.asm("jne  .seal");
     asm.asm(&format!("dec  {RCX}"));
     asm.asm(&format!("mov  [rbx-8], {RCX}"));
@@ -1495,12 +1481,7 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.line(".seal:");
     asm.asm(&format!("mov  {RCX}, rbx"));
     asm.asm(&format!("call {}", runtime_symbol(Runtime::CharsToStr)));
-    asm.asm("add  rsp, 40");
-    asm.asm("pop  r12");
-    asm.asm("pop  rdi");
-    asm.asm("pop  rsi");
-    asm.asm("pop  rbx");
-    asm.asm("ret");
+    frame.ret(asm);
 }
 
 /// One byte of a UTF-8 sequence: some bits of the character, under the tag that
@@ -1778,35 +1759,27 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
 
     fn instr(&mut self, instr: &Instr) {
         match instr {
-            Instr::Const { dst, val } => {
-                let work = self.work_reg(*dst, false);
+            Instr::Const { dst, val } => self.produce(*dst, |e, work| {
                 if *val == 0 {
                     // Clearing the 32-bit half zeroes the whole register, and
                     // costs three bytes fewer than an immediate zero.
-                    self.asm.asm(&format!("xor  {0}, {0}", half(&work)));
+                    e.asm.asm(&format!("xor  {0}, {0}", half(work)));
                 } else {
-                    self.asm.asm(&format!("mov  {work}, {val}"));
+                    e.asm.asm(&format!("mov  {work}, {val}"));
                 }
-                self.store_back(*dst, &work);
-            }
+            }),
             Instr::StrAddr { dst, id } => {
-                let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("lea  {work}, [str{}]", id.0));
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| e.asm.asm(&format!("lea  {work}, [str{}]", id.0)));
             }
             Instr::Copy { dst, src } => {
                 let src = self.value(src);
-                let work = self.work_reg(*dst, false);
-                self.asm.mov(&work, &src);
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| e.asm.mov(work, &src));
             }
             // The argument is already sitting in its ABI register; this just
             // moves it to wherever the allocator decided it should live.
             Instr::Param { dst, index } => {
                 let src = ARG_REGS[*index as usize];
-                let work = self.work_reg(*dst, false);
-                self.asm.mov(&work, src);
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| e.asm.mov(work, src));
             }
             // `cmp` sets the flags; `setcc` turns the one that matters into a
             // 0 or 1 byte, and `movzx` widens it to the 64-bit value a bool is.
@@ -1815,10 +1788,9 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             Instr::Cmp { op, dst, lhs, rhs } => {
                 self.compare(lhs, rhs);
                 self.asm.asm(&format!("{} {SCRATCH1_8}", setcc(*op)));
-
-                let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("movzx {work}, {SCRATCH1_8}"));
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| {
+                    e.asm.asm(&format!("movzx {work}, {SCRATCH1_8}"));
+                });
             }
             // One `idiv`, read from `rax` for the quotient or `rdx` for the
             // remainder.
@@ -1839,43 +1811,41 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 let clobbers_rhs =
                     self.shares_register(*dst, rhs) && !self.shares_register(*dst, lhs);
 
-                let work = self.work_reg(*dst, clobbers_rhs);
-                let lhs = self.value(lhs);
-                self.asm.mov(&work, &lhs);
+                self.produce_into(*dst, clobbers_rhs, |e, work| {
+                    let lhs = e.value(lhs);
+                    e.asm.mov(work, &lhs);
 
-                let (rhs, immediate) = self.operand_for_alu(rhs);
-                match op {
-                    BinOp::Add => self.asm.asm(&format!("add  {work}, {rhs}")),
-                    BinOp::Sub => self.asm.asm(&format!("sub  {work}, {rhs}")),
-                    // `imul` has no two-operand immediate form.
-                    BinOp::Mul if immediate => {
-                        self.asm.asm(&format!("imul {work}, {work}, {rhs}"))
+                    let (rhs, immediate) = e.operand_for_alu(rhs);
+                    match op {
+                        BinOp::Add => e.asm.asm(&format!("add  {work}, {rhs}")),
+                        BinOp::Sub => e.asm.asm(&format!("sub  {work}, {rhs}")),
+                        // `imul` has no two-operand immediate form.
+                        BinOp::Mul if immediate => {
+                            e.asm.asm(&format!("imul {work}, {work}, {rhs}"))
+                        }
+                        BinOp::Mul => e.asm.asm(&format!("imul {work}, {rhs}")),
+                        BinOp::Div | BinOp::Rem => unreachable!("handled above"),
                     }
-                    BinOp::Mul => self.asm.asm(&format!("imul {work}, {rhs}")),
-                    BinOp::Div | BinOp::Rem => unreachable!("handled above"),
-                }
-                // `add`, `sub` and `imul` all set the overflow flag on a result
-                // that does not fit, and set it on nothing else. One
-                // never-taken branch is what keeps a wrong answer from being
-                // handed on as if it were right.
-                self.asm.asm(&format!("jo   {ABORT_OVERFLOW}"));
-                self.store_back(*dst, &work);
+                    // `add`, `sub` and `imul` all set the overflow flag on a
+                    // result that does not fit, and set it on nothing else. One
+                    // never-taken branch is what keeps a wrong answer from being
+                    // handed on as if it were right.
+                    e.asm.asm(&format!("jo   {ABORT_OVERFLOW}"));
+                });
             }
             // The address of this function's own room, which the prologue has
             // already reserved. One `lea`, and never a call.
             Instr::Frame { dst, offset } => {
-                let work = self.work_reg(*dst, false);
                 let at = self.frame.array_offset(*offset);
-                self.asm.asm(&format!("lea  {work}, [rsp+{at}]"));
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| e.asm.asm(&format!("lea  {work}, [rsp+{at}]")));
             }
             // A field's place was settled at compile time, so this is a `lea`
             // and nothing else — no check, because there is no question.
             Instr::Field { dst, base, offset } => {
                 let base = self.in_register(base, SCRATCH0);
-                let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("lea  {work}, [{base}+{offset}]"));
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| {
+                    e.asm.asm(&format!("lea  {work}, [{base}+{offset}]"));
+                });
             }
             // `base + index * 8` is an addressing mode, so an element's address
             // is one instruction and not arithmetic — which is also why it
@@ -1888,9 +1858,9 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                     // array can reach here: a string's length is not known
                     // until the program runs, so an index into one is checked
                     // however plainly it is written.
-                    let work = self.work_reg(*dst, false);
-                    self.asm.asm(&format!("lea  {work}, [{base}+{}]", at * i64::from(*scale)));
-                    self.store_back(*dst, &work);
+                    self.produce(*dst, |e, work| {
+                        e.asm.asm(&format!("lea  {work}, [{base}+{}]", at * i64::from(*scale)));
+                    });
                     return;
                 }
 
@@ -1904,21 +1874,22 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
 
                 // `lea` reads its operands before it writes, so the result may
                 // land on the base's own register.
-                let work = self.work_reg(*dst, false);
-                if matches!(scale, 1 | 2 | 4 | 8) {
-                    self.asm.asm(&format!("lea  {work}, [{base}+{index}*{scale}]"));
-                } else {
-                    // An array of objects scales by the hierarchy's room, which
-                    // is the one width x86's addressing modes cannot express.
-                    //
-                    // The product goes to a scratch register and never to the
-                    // index's own: that one may be a variable's home, and a
-                    // loop counter multiplied by the element size is no longer
-                    // a loop counter.
-                    self.asm.asm(&format!("imul {SCRATCH1}, {index}, {scale}"));
-                    self.asm.asm(&format!("lea  {work}, [{base}+{SCRATCH1}]"));
-                }
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| {
+                    if matches!(scale, 1 | 2 | 4 | 8) {
+                        e.asm.asm(&format!("lea  {work}, [{base}+{index}*{scale}]"));
+                    } else {
+                        // An array of objects scales by the hierarchy's room,
+                        // which is the one width x86's addressing modes cannot
+                        // express.
+                        //
+                        // The product goes to a scratch register and never to
+                        // the index's own: that one may be a variable's home,
+                        // and a loop counter multiplied by the element size is
+                        // no longer a loop counter.
+                        e.asm.asm(&format!("imul {SCRATCH1}, {index}, {scale}"));
+                        e.asm.asm(&format!("lea  {work}, [{base}+{SCRATCH1}]"));
+                    }
+                });
             }
             // Eight bytes at a time, unrolled: the count is a multiple of eight
             // and known here, and an object is small.
@@ -1932,9 +1903,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             }
             Instr::Load { dst, addr } => {
                 let addr = self.in_register(addr, SCRATCH0);
-                let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("mov  {work}, [{addr}]"));
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| e.asm.asm(&format!("mov  {work}, [{addr}]")));
             }
             // A character is four bytes inside a string and eight everywhere
             // else, so reading one widens it. Writing the 32-bit half of a
@@ -1942,17 +1911,17 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             // is never negative, so there is nothing to sign extend.
             Instr::LoadChar { dst, addr } => {
                 let addr = self.in_register(addr, SCRATCH0);
-                let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("mov  {}, [{addr}]", narrow(&work)));
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| {
+                    e.asm.asm(&format!("mov  {}, [{addr}]", narrow(work)));
+                });
             }
             // The count a string carries in the eight bytes before its
             // characters. One load, which is why `len` is not a routine.
             Instr::Count { dst, of } => {
                 let of = self.in_register(of, SCRATCH0);
-                let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("mov  {work}, [{of}-8]"));
-                self.store_back(*dst, &work);
+                self.produce(*dst, |e, work| {
+                    e.asm.asm(&format!("mov  {work}, [{of}-{STR_HEADER}]"));
+                });
             }
             Instr::Store { addr, value } => {
                 let addr = self.in_register(addr, SCRATCH0);
@@ -1967,11 +1936,9 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             }
             // The address of a class's method table, which an object carries at
             // offset 0 and a virtual call reads back.
-            Instr::VTable { dst, class } => {
-                let work = self.work_reg(*dst, false);
-                self.asm.asm(&format!("lea  {work}, [{}]", vtable_label(*class)));
-                self.store_back(*dst, &work);
-            }
+            Instr::VTable { dst, class } => self.produce(*dst, |e, work| {
+                e.asm.asm(&format!("lea  {work}, [{}]", vtable_label(*class)));
+            }),
             // No source of these moves can be an argument register, because the
             // allocator is never given one — see the module docs.
             Instr::Call { dst, callee, args } => {
@@ -2114,9 +2081,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
 
         // The divisor has already been read, so the answer can go straight into
         // the destination even if the two share a register.
-        let work = self.work_reg(dst, false);
-        self.asm.mov(&work, result);
-        self.store_back(dst, &work);
+        self.produce(dst, |e, work| e.asm.mov(work, result));
     }
 
     // -- operands ----------------------------------------------------------
@@ -2153,10 +2118,38 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
     /// Move a call's answer out of `rax`, when the caller wanted one.
     fn take_result(&mut self, dst: Option<VReg>) {
         if let Some(dst) = dst {
-            let work = self.work_reg(dst, false);
-            self.asm.mov(&work, RAX);
-            self.store_back(dst, &work);
+            self.produce(dst, |emitter, work| emitter.asm.mov(work, RAX));
         }
+    }
+
+    /// Compute `dst`'s value with `emit`, then put it where the allocator
+    /// decided `dst` lives.
+    ///
+    /// Every instruction that produces a value ends this way, and the two
+    /// halves have to stay together: a [`Self::work_reg`] without its
+    /// [`Self::store_back`] leaves a spilled result in a scratch register and
+    /// drops it, which is a wrong number rather than a crash. Going through one
+    /// place is what makes leaving the second half out impossible.
+    ///
+    /// Whatever `emit` needs to read is worked out *before* the call, because
+    /// the working register may be an operand's own — see the arms that take an
+    /// operand into a scratch register first.
+    fn produce(&mut self, dst: VReg, emit: impl FnOnce(&mut Self, &str)) {
+        self.produce_into(dst, false, emit);
+    }
+
+    /// [`Self::produce`] for the one instruction that may need its result kept
+    /// *off* its destination's own register: see the `Bin` arm, where writing
+    /// the result would destroy an operand still to be read.
+    fn produce_into(
+        &mut self,
+        dst: VReg,
+        force_scratch: bool,
+        emit: impl FnOnce(&mut Self, &str),
+    ) {
+        let work = self.work_reg(dst, force_scratch);
+        emit(self, &work);
+        self.store_back(dst, &work);
     }
 
     /// The value as something an addressing mode can use, which is to say a

@@ -353,6 +353,14 @@ fn a_duplicate_function_points_at_the_second_definition() {
     assert_error_at("duplicate_function.tc", "5:4");
 }
 
+/// Enums and classes share one namespace, and the caret goes on whichever was
+/// written second — even though the two are collected by different passes, in a
+/// fixed order that has nothing to do with the order they were written in.
+#[test]
+fn an_enum_and_a_class_of_the_same_name_point_at_the_second_one() {
+    assert_error_at("enum_and_class_collide.tc", "8:7");
+}
+
 #[test]
 fn a_bare_return_in_a_returning_function_points_at_the_keyword() {
     assert_error_at("return_without_value.tc", "2:3");

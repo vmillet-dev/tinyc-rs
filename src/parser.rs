@@ -79,6 +79,19 @@ struct Parser<'a> {
     depth: u32,
 }
 
+/// A binary operator, whichever of the three kinds of node it builds.
+///
+/// The three are separate in the tree — `&&` does not evaluate both operands,
+/// and a comparison produces a `bool` whatever it took — but they are written
+/// the same way and parse the same way, which is what lets one loop read all
+/// five precedence levels. See [`Parser::chain`].
+#[derive(Clone, Copy)]
+enum Operator {
+    Arith(BinOp),
+    Compare(CmpOp),
+    Logic(LogicOp),
+}
+
 impl<'a> Parser<'a> {
     fn run(mut self) -> PResult<Program> {
         let (mut enums, mut classes, mut functions) = (Vec::new(), Vec::new(), Vec::new());
@@ -115,12 +128,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     return Ok(ClassDecl { name, name_span, base, fields, methods });
                 }
-                TokenKind::Eof => {
-                    let found = self.peek();
-                    return Err(Diagnostic::new("unclosed class", found.span)
-                        .with_label("expected `}` before the end of the file")
-                        .with_note("to close this `{`", Some(open)));
-                }
+                TokenKind::Eof => return Err(self.unclosed("class", open)),
                 TokenKind::KwFn => {
                     methods.push(functions.len());
                     functions.push(self.fn_decl()?);
@@ -185,10 +193,28 @@ impl<'a> Parser<'a> {
 
     /// Run `parse` one level deeper, refusing to go past [`MAX_NESTING`].
     ///
-    /// Every recursive path through the grammar passes through [`Self::unary`]
-    /// or [`Self::block`], so counting those two is enough to bound the depth of
-    /// the whole tree — and therefore the stack every later pass will use.
+    /// What is counted is the depth of the *tree*, not the depth this parser
+    /// happens to recurse to: the two part company wherever a loop builds a
+    /// left-leaning chain, and it is the tree that every later pass — and the
+    /// drop that frees it — walks recursively. See [`Self::deepen`].
     fn nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> PResult<T>) -> PResult<T> {
+        self.deepen()?;
+        let parsed = parse(self);
+        self.release(1);
+        parsed
+    }
+
+    /// Charge one level of nesting for a node about to be built.
+    ///
+    /// [`Self::nested`] is the recursive form, which releases its level when
+    /// the call returns. A loop that builds a left-leaning chain has no such
+    /// call to hang one on — `a + b + c` is exactly as deep a tree as
+    /// `a + (b + c)`, and would otherwise be counted as flat — so it charges a
+    /// level per node here and releases them together at the end.
+    ///
+    /// Nothing releases on the error path, and nothing needs to: the parser
+    /// stops at its first mistake, so no later depth is ever asked about.
+    fn deepen(&mut self) -> PResult<()> {
         self.depth += 1;
         if self.depth > MAX_NESTING {
             self.depth -= 1;
@@ -200,9 +226,11 @@ impl<'a> Parser<'a> {
                     None,
                 ));
         }
-        let parsed = parse(self);
-        self.depth -= 1;
-        parsed
+        Ok(())
+    }
+
+    fn release(&mut self, levels: u32) {
+        self.depth -= levels;
     }
 
     /// Consume a type. `what` names the thing that needed it, so one helper can
@@ -305,15 +333,7 @@ impl<'a> Parser<'a> {
             }
         }
 
-        if !self.eat(&TokenKind::RBrace) {
-            let found = self.peek();
-            return Err(Diagnostic::new(
-                format!("expected `}}`, found {}", found.kind.describe()),
-                found.span,
-            )
-            .with_label("a variant list ends here")
-            .with_note("to close this `{`", Some(open)));
-        }
+        self.expect_closing(TokenKind::RBrace, open, "a variant list ends here")?;
         Ok(EnumDecl { name, name_span, variants })
     }
 
@@ -503,12 +523,7 @@ impl<'a> Parser<'a> {
                         },
                     });
                 }
-                TokenKind::Eof => {
-                    let found = self.peek();
-                    return Err(Diagnostic::new("unclosed match", found.span)
-                        .with_label("expected `}` before the end of the file")
-                        .with_note("to close this `{`", Some(open)));
-                }
+                TokenKind::Eof => return Err(self.unclosed("match", open)),
                 _ => arms.push(self.match_arm()?),
             }
         }
@@ -554,12 +569,7 @@ impl<'a> Parser<'a> {
                         let close = p.bump().span;
                         return Ok(Block { stmts, span: open.to(close) });
                     }
-                    TokenKind::Eof => {
-                        let found = p.peek();
-                        return Err(Diagnostic::new("unclosed block", found.span)
-                            .with_label("expected `}` before the end of the file")
-                            .with_note("to close this `{`", Some(open)));
-                    }
+                    TokenKind::Eof => return Err(p.unclosed("block", open)),
                     _ => stmts.push(p.stmt()?),
                 }
             }
@@ -581,9 +591,12 @@ impl<'a> Parser<'a> {
 
         let else_block = if self.eat(&TokenKind::KwElse) {
             // `else if` chains by nesting the next `if` in a synthetic block,
-            // so the AST needs no separate "else if" shape.
+            // so the AST needs no separate "else if" shape. That synthetic
+            // block is real nesting, and is counted: a chain of a thousand
+            // `else if`s is a tree a thousand deep, whatever it looks like on
+            // the page.
             if matches!(self.peek().kind, TokenKind::KwIf) {
-                let nested = self.if_stmt()?;
+                let nested = self.nested(Self::if_stmt)?;
                 Some(Block { stmts: vec![nested], span: self.tokens[self.pos - 1].span })
             } else {
                 Some(self.block()?)
@@ -741,91 +754,89 @@ impl<'a> Parser<'a> {
     /// `||` binds loosest of all, so `a < 1 || b < 2` is one disjunction of two
     /// comparisons rather than a comparison against a disjunction.
     fn expr(&mut self) -> PResult<Expr> {
-        let mut lhs = self.and()?;
-        while self.eat(&TokenKind::PipePipe) {
-            let rhs = self.and()?;
-            lhs = self.logic(LogicOp::Or, lhs, rhs);
-        }
-        Ok(lhs)
+        self.chain(Self::and, &[(TokenKind::PipePipe, Operator::Logic(LogicOp::Or))])
     }
 
     /// `&&` binds tighter than `||`, so `a || b && c` is `a || (b && c)`.
     fn and(&mut self) -> PResult<Expr> {
-        let mut lhs = self.comparison()?;
-        while self.eat(&TokenKind::AmpAmp) {
-            let rhs = self.comparison()?;
-            lhs = self.logic(LogicOp::And, lhs, rhs);
-        }
-        Ok(lhs)
+        self.chain(Self::comparison, &[(TokenKind::AmpAmp, Operator::Logic(LogicOp::And))])
     }
 
     /// Comparisons bind looser than arithmetic, so `a + 1 < b * 2` compares the
     /// two sums.
     fn comparison(&mut self) -> PResult<Expr> {
-        let mut lhs = self.sum()?;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::EqEq => CmpOp::Eq,
-                TokenKind::BangEq => CmpOp::Ne,
-                TokenKind::Lt => CmpOp::Lt,
-                TokenKind::Le => CmpOp::Le,
-                TokenKind::Gt => CmpOp::Gt,
-                TokenKind::Ge => CmpOp::Ge,
-                _ => return Ok(lhs),
-            };
-            self.bump();
-            let rhs = self.sum()?;
-            lhs = Expr {
-                id: self.node_id(),
-                span: lhs.span.to(rhs.span),
-                kind: ExprKind::Cmp { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
-            };
-        }
-    }
-
-    fn logic(&mut self, op: LogicOp, lhs: Expr, rhs: Expr) -> Expr {
-        Expr {
-            id: self.node_id(),
-            span: lhs.span.to(rhs.span),
-            kind: ExprKind::Logic { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
-        }
+        self.chain(
+            Self::sum,
+            &[
+                (TokenKind::EqEq, Operator::Compare(CmpOp::Eq)),
+                (TokenKind::BangEq, Operator::Compare(CmpOp::Ne)),
+                (TokenKind::Lt, Operator::Compare(CmpOp::Lt)),
+                (TokenKind::Le, Operator::Compare(CmpOp::Le)),
+                (TokenKind::Gt, Operator::Compare(CmpOp::Gt)),
+                (TokenKind::Ge, Operator::Compare(CmpOp::Ge)),
+            ],
+        )
     }
 
     fn sum(&mut self) -> PResult<Expr> {
-        let mut lhs = self.term()?;
-        loop {
-            let op = match self.peek().kind {
-                TokenKind::Plus => BinOp::Add,
-                TokenKind::Minus => BinOp::Sub,
-                _ => return Ok(lhs),
-            };
-            self.bump();
-            let rhs = self.term()?;
-            lhs = self.binary(op, lhs, rhs);
-        }
+        self.chain(
+            Self::term,
+            &[
+                (TokenKind::Plus, Operator::Arith(BinOp::Add)),
+                (TokenKind::Minus, Operator::Arith(BinOp::Sub)),
+            ],
+        )
     }
 
     fn term(&mut self) -> PResult<Expr> {
-        let mut lhs = self.unary()?;
+        self.chain(
+            Self::unary,
+            &[
+                (TokenKind::Star, Operator::Arith(BinOp::Mul)),
+                (TokenKind::Slash, Operator::Arith(BinOp::Div)),
+                (TokenKind::Percent, Operator::Arith(BinOp::Rem)),
+            ],
+        )
+    }
+
+    /// `operand (op operand)*` — one precedence level, associating to the left.
+    ///
+    /// All five levels have this shape and differ only in what they take for an
+    /// operand and which operators they accept, so they are one loop written
+    /// once. The nesting is charged here rather than by [`Self::nested`],
+    /// because the chain leans left: every operator puts one more node *on top*
+    /// of everything parsed so far, exactly as a recursive call would.
+    fn chain(
+        &mut self,
+        operand: fn(&mut Self) -> PResult<Expr>,
+        operators: &[(TokenKind, Operator)],
+    ) -> PResult<Expr> {
+        let mut lhs = operand(self)?;
+        let mut levels = 0;
         loop {
-            let op = match self.peek().kind {
-                TokenKind::Star => BinOp::Mul,
-                TokenKind::Slash => BinOp::Div,
-                TokenKind::Percent => BinOp::Rem,
-                _ => return Ok(lhs),
+            let found = operators.iter().find(|(token, _)| *token == self.peek().kind);
+            let Some(&(_, op)) = found else {
+                self.release(levels);
+                return Ok(lhs);
             };
             self.bump();
-            let rhs = self.unary()?;
+            self.deepen()?;
+            levels += 1;
+            let rhs = operand(self)?;
             lhs = self.binary(op, lhs, rhs);
         }
     }
 
-    fn binary(&mut self, op: BinOp, lhs: Expr, rhs: Expr) -> Expr {
-        Expr {
-            id: self.node_id(),
-            span: lhs.span.to(rhs.span),
-            kind: ExprKind::Bin { op, lhs: Box::new(lhs), rhs: Box::new(rhs) },
-        }
+    /// One node of a chain, whichever of the three shapes its operator builds.
+    fn binary(&mut self, op: Operator, lhs: Expr, rhs: Expr) -> Expr {
+        let span = lhs.span.to(rhs.span);
+        let (lhs, rhs) = (Box::new(lhs), Box::new(rhs));
+        let kind = match op {
+            Operator::Arith(op) => ExprKind::Bin { op, lhs, rhs },
+            Operator::Compare(op) => ExprKind::Cmp { op, lhs, rhs },
+            Operator::Logic(op) => ExprKind::Logic { op, lhs, rhs },
+        };
+        Expr { id: self.node_id(), span, kind }
     }
 
     /// Every recursive path through the expression grammar comes through here,
@@ -855,9 +866,19 @@ impl<'a> Parser<'a> {
     ///
     /// One loop rather than a case per shape, which is what lets `a.b[i].c`
     /// parse without the grammar knowing that combination exists.
+    ///
+    /// The chain leans left exactly as an operator chain does, so its nesting
+    /// is charged the same way — see [`Self::chain`].
     fn primary(&mut self) -> PResult<Expr> {
         let mut expr = self.atom()?;
+        let mut levels = 0;
         loop {
+            if !matches!(self.peek().kind, TokenKind::Dot | TokenKind::LBracket) {
+                self.release(levels);
+                return Ok(expr);
+            }
+            self.deepen()?;
+            levels += 1;
             if self.eat(&TokenKind::Dot) {
                 let (name, name_span) = self.expect_ident("a field or method name")?;
                 // A `(` is what tells a method call from a field.
@@ -882,7 +903,8 @@ impl<'a> Parser<'a> {
                         kind: ExprKind::Field { object: Box::new(expr), name, name_span },
                     };
                 }
-            } else if self.eat(&TokenKind::LBracket) {
+            } else {
+                self.bump(); // `[`
                 let index = self.expr()?;
                 let close = self.expect(TokenKind::RBracket)?.span;
                 expr = Expr {
@@ -893,8 +915,6 @@ impl<'a> Parser<'a> {
                         index: Box::new(index),
                     },
                 };
-            } else {
-                return Ok(expr);
             }
         }
     }
@@ -1028,16 +1048,8 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if !self.eat(&TokenKind::RBrace) {
-            let found = self.peek();
-            return Err(Diagnostic::new(
-                format!("expected `}}`, found {}", found.kind.describe()),
-                found.span,
-            )
-            .with_label("an object literal ends here")
-            .with_note("to close this `{`", Some(open)));
-        }
-        let span = class_span.to(self.tokens[self.pos - 1].span);
+        let close = self.expect_closing(TokenKind::RBrace, open, "an object literal ends here")?;
+        let span = class_span.to(close);
         Ok(Expr { id: self.node_id(), span, kind: ExprKind::New { class, class_span, fields, span } })
     }
 
@@ -1058,29 +1070,52 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if !self.eat(&TokenKind::RBracket) {
-            let found = self.peek();
-            return Err(Diagnostic::new(
-                format!("expected `]`, found {}", found.kind.describe()),
-                found.span,
-            )
-            .with_label("an array literal ends here")
-            .with_note("to close this `[`", Some(open)));
-        }
-        let span = open.to(self.tokens[self.pos - 1].span);
+        let close = self.expect_closing(TokenKind::RBracket, open, "an array literal ends here")?;
+        let span = open.to(close);
         Ok(Expr { id: self.node_id(), span, kind: ExprKind::Array { elements, span } })
     }
 
     fn expect_closing_paren(&mut self, open: Span) -> PResult<Span> {
-        if self.eat(&TokenKind::RParen) {
+        self.expect_closing(TokenKind::RParen, open, "expected `)` here")
+    }
+
+    /// Consume the bracket that ends a construct, or say what it was meant to
+    /// close.
+    ///
+    /// Four constructs end in a bracket and all four report the same way, so
+    /// the shape is written once: what differs is which bracket and how the
+    /// construct is named, and `label` is the only part a reader of the message
+    /// would notice.
+    fn expect_closing(&mut self, kind: TokenKind, open: Span, label: &str) -> PResult<Span> {
+        if self.eat(&kind) {
             return Ok(self.tokens[self.pos - 1].span);
         }
         let found = self.peek();
-        Err(
-            Diagnostic::new(format!("expected `)`, found {}", found.kind.describe()), found.span)
-                .with_label("expected `)` here")
-                .with_note("to close this `(`", Some(open)),
+        Err(Diagnostic::new(
+            format!("expected `{}`, found {}", kind.text(), found.kind.describe()),
+            found.span,
         )
+        .with_label(label)
+        .with_note(format!("to close this `{}`", opening_of(&kind)), Some(open)))
+    }
+
+    /// The end of the file arrived before the `}` that should have ended
+    /// `what` — the other way a braced construct can run on, and the one where
+    /// naming a token found instead would say nothing.
+    fn unclosed(&self, what: &str, open: Span) -> Diagnostic {
+        Diagnostic::new(format!("unclosed {what}"), self.peek().span)
+            .with_label("expected `}` before the end of the file")
+            .with_note("to close this `{`", Some(open))
+    }
+}
+
+/// The bracket a closing one matches, for "to close this `{`".
+fn opening_of(closing: &TokenKind) -> &'static str {
+    match closing {
+        TokenKind::RParen => "(",
+        TokenKind::RBrace => "{",
+        TokenKind::RBracket => "[",
+        other => unreachable!("`{}` closes nothing", other.text()),
     }
 }
 
@@ -1158,6 +1193,58 @@ mod tests {
         );
         let errors = parse_deep(&source).unwrap_err();
         assert!(errors[0].message.contains("nests too deeply"), "{:?}", errors[0]);
+    }
+
+    /// A left-leaning chain looks flat and is not: `1 + 1 + 1` is a tree three
+    /// deep, and every later pass walks it recursively. Counting only the
+    /// parser's own recursion missed these entirely, and a long enough one was
+    /// a stack overflow rather than a diagnostic.
+    #[test]
+    fn the_limit_counts_a_chain_of_operators() {
+        let levels = MAX_NESTING as usize + 8;
+        for chain in ["1", "x", "x == x", "x && x"].map(|term| format!(" + {term}")) {
+            let source =
+                format!("fn main() {{ int x = 1; print(1{}); }}", chain.repeat(levels));
+            let errors = parse_deep(&source).unwrap_err();
+            assert!(
+                errors[0].message.contains("nests too deeply"),
+                "{chain}: {:?}",
+                errors[0]
+            );
+        }
+    }
+
+    #[test]
+    fn the_limit_counts_a_chain_of_field_accesses() {
+        // `.a.a.a…` leans left exactly as `+` does, through the postfix loop.
+        let source =
+            format!("fn main() {{ print(x{}); }}", ".a".repeat(MAX_NESTING as usize + 8));
+        let errors = parse_deep(&source).unwrap_err();
+        assert!(errors[0].message.contains("nests too deeply"), "{:?}", errors[0]);
+    }
+
+    /// An `else if` chain reads as flat and nests as deeply as it is long: each
+    /// one goes in a synthetic block inside the previous `else`.
+    #[test]
+    fn the_limit_counts_an_else_if_chain() {
+        let levels = MAX_NESTING as usize + 8;
+        let source = format!(
+            "fn main() {{ if (true) {{ }} {} }}",
+            "else if (true) { } ".repeat(levels)
+        );
+        let errors = parse_deep(&source).unwrap_err();
+        assert!(errors[0].message.contains("nests too deeply"), "{:?}", errors[0]);
+    }
+
+    #[test]
+    fn a_chain_that_stays_under_the_limit_still_parses() {
+        // The limit is on depth, not on length: an array literal is as wide as
+        // it likes, because its elements are siblings rather than a chain.
+        let terms = vec!["1"; MAX_NESTING as usize - 8].join(" + ");
+        assert!(parse_deep(&format!("fn main() {{ print({terms}); }}")).is_ok());
+
+        let elements = vec!["1"; 1000].join(", ");
+        assert!(parse_deep(&format!("fn main() {{ int[1000] xs = [{elements}]; }}")).is_ok());
     }
 
     #[test]
