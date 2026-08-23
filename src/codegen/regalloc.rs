@@ -804,4 +804,286 @@ mod tests {
         );
         assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(main, &rf));
     }
+
+    // -- the verifier itself ------------------------------------------------
+    //
+    // Every test above ends in `assert!(verify(..).is_ok())`, which is worth
+    // exactly as much as `verify`'s ability to say `Err`. A verifier that
+    // always agreed would make all of them pass and mean nothing, so these
+    // hand it allocations that are wrong on purpose.
+
+    /// Build an allocation by hand, so it can be made wrong in ways the
+    /// allocator would never produce.
+    fn allocation_of(intervals: Vec<Interval>, placed: &[(VReg, Location)]) -> Allocation {
+        Allocation {
+            locations: placed.iter().copied().collect(),
+            used_callee_saved: Vec::new(),
+            spill_slots: 0,
+            intervals,
+        }
+    }
+
+    fn interval(vreg: u32, start: u32, end: u32, crosses_call: bool) -> Interval {
+        Interval { vreg: VReg(vreg), start, end, crosses_call }
+    }
+
+    #[test]
+    fn the_verifier_catches_two_overlapping_intervals_in_one_register() {
+        let rf = tiny_file();
+        let overlapping = allocation_of(
+            vec![interval(0, 0, 5, false), interval(1, 2, 7, false)],
+            &[(VReg(0), Location::Reg(PhysReg(2))), (VReg(1), Location::Reg(PhysReg(2)))],
+        );
+        let Err(problem) = verify(&overlapping, &rf) else {
+            panic!("two values in one register at the same time was accepted")
+        };
+        assert!(problem.contains("overlapping"), "{problem}");
+    }
+
+    #[test]
+    fn the_verifier_catches_two_overlapping_intervals_in_one_spill_slot() {
+        // A slot handed out twice corrupts memory rather than a register, which
+        // is if anything harder to find — so it is checked the same way.
+        let rf = tiny_file();
+        let overlapping = allocation_of(
+            vec![interval(0, 0, 5, false), interval(1, 2, 7, false)],
+            &[(VReg(0), Location::Spill(0)), (VReg(1), Location::Spill(0))],
+        );
+        assert!(verify(&overlapping, &rf).is_err(), "one slot, two live values");
+    }
+
+    #[test]
+    fn the_verifier_catches_a_value_left_in_a_register_a_call_destroys() {
+        let rf = tiny_file();
+        let clobbered = allocation_of(
+            vec![interval(0, 0, 5, true)],
+            &[(VReg(0), Location::Reg(rf.caller_saved[0]))],
+        );
+        let Err(problem) = verify(&clobbered, &rf) else {
+            panic!("a value live across a call was left in a caller-saved register")
+        };
+        assert!(problem.contains("caller-saved"), "{problem}");
+    }
+
+    /// Two intervals that merely *touch* share a register legitimately.
+    ///
+    /// This is the rule the whole allocator rests on — see the module docs — so
+    /// a verifier that rejected it would be rejecting correct allocations, and
+    /// the one it would reject first is the commonest shape there is:
+    /// `x = x + 1`.
+    #[test]
+    fn the_verifier_allows_two_intervals_that_only_touch() {
+        let rf = tiny_file();
+        let touching = allocation_of(
+            vec![interval(0, 0, 3, false), interval(1, 3, 6, false)],
+            &[(VReg(0), Location::Reg(PhysReg(2))), (VReg(1), Location::Reg(PhysReg(2)))],
+        );
+        assert!(verify(&touching, &rf).is_ok(), "{:?}", verify(&touching, &rf));
+    }
+
+    #[test]
+    fn a_value_that_crosses_a_call_may_be_spilled_instead() {
+        // Callee-saved is not the only right answer: a stack slot survives a
+        // call too, and is what the allocator falls back on when it runs out.
+        let rf = tiny_file();
+        let spilled = allocation_of(vec![interval(0, 0, 5, true)], &[(VReg(0), Location::Spill(0))]);
+        assert!(verify(&spilled, &rf).is_ok());
+    }
+
+    // -- register files the allocator has to cope with ----------------------
+
+    #[test]
+    fn a_register_file_of_one_spills_everything_else_and_stays_valid() {
+        // The narrowest file that can allocate anything at all. Nothing about
+        // the allocator may assume there is a second register to fall back on.
+        let rf = RegisterFile {
+            names: vec!["only"],
+            caller_saved: Vec::new(),
+            callee_saved: vec![PhysReg(0)],
+            max_args: 4,
+        };
+        let ir = ir_of_main(
+            "int a = 1;\nint b = 2;\nint c = 3;\nint d = 4;\nprint(a + b + c + d);",
+        );
+        let main = &ir.functions[0];
+        let allocation = allocate(main, &rf);
+
+        assert!(allocation.spill_slots > 0, "with one register, something has to spill");
+        assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(main, &rf));
+    }
+
+    #[test]
+    fn a_file_with_no_callee_saved_registers_spills_what_crosses_a_call() {
+        // A value cannot stay in a register a call destroys, so with no
+        // callee-saved register at all the only place left is the stack. The
+        // allocator has to reach that conclusion rather than hand one out.
+        let rf = RegisterFile {
+            names: vec!["v0", "v1"],
+            caller_saved: vec![PhysReg(0), PhysReg(1)],
+            callee_saved: Vec::new(),
+            max_args: 4,
+        };
+        let ir = ir_of_main("string s = \"hi\";\nprint(1 + 2);\nprint(s);");
+        let main = &ir.functions[0];
+        let allocation = allocate(main, &rf);
+
+        assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(main, &rf));
+        assert!(allocation.used_callee_saved.is_empty(), "there were none to use");
+        let s = main.blocks[0].instrs.iter().find_map(|i| i.def()).unwrap();
+        assert!(
+            matches!(allocation.location(s), Location::Spill(_)),
+            "a value across a call had nowhere to go but the stack: {}",
+            allocation.dump(main, &rf)
+        );
+    }
+
+    #[test]
+    fn every_value_is_given_exactly_one_place() {
+        // The backend looks every virtual register up by name and would panic
+        // on one that was never placed, which is a crash rather than a
+        // diagnostic — so it is worth stating plainly.
+        let rf = tiny_file();
+        let ir = ir_of(
+            "fn f(int a, int b) -> int {\n  int c = a * b;\n  return c - a;\n}\n\
+             fn main() {\n  int x = 1;\n  while (x < 10) {\n    x = x + f(x, 2);\n  }\n  \
+             print(x);\n}",
+        );
+        for function in &ir.functions {
+            let allocation = allocate(function, &rf);
+            assert_eq!(
+                allocation.intervals.len(),
+                allocation.locations.len(),
+                "one place per interval in `{}`",
+                function.name
+            );
+            for interval in &allocation.intervals {
+                // `location` panics on a missing one, which is the check.
+                let _ = allocation.location(interval.vreg);
+            }
+        }
+    }
+
+    // -- the frame the allocation asks for ----------------------------------
+
+    #[test]
+    fn a_callee_saved_register_is_listed_once_however_often_it_is_used() {
+        // The prologue pushes this list and the epilogue pops it. A duplicate
+        // would push twice and pop twice for one register — balanced, and still
+        // wrong, because the second push would save a value already saved while
+        // the frame grew by eight bytes nobody accounted for.
+        let rf = tiny_file();
+        let ir = ir_of_main(
+            "string a = \"a\";\nstring b = \"b\";\nprint(1);\nprint(a);\nprint(b);\n\
+             print(2);\nprint(a);",
+        );
+        let main = &ir.functions[0];
+        let allocation = allocate(main, &rf);
+
+        let mut listed = allocation.used_callee_saved.clone();
+        let count = listed.len();
+        listed.sort_unstable();
+        listed.dedup();
+        assert_eq!(listed.len(), count, "a register is listed twice: {:?}", allocation.used_callee_saved);
+
+        // ... and every register listed is one the file actually has.
+        for reg in &allocation.used_callee_saved {
+            assert!(rf.callee_saved.contains(reg), "{reg:?} is not callee-saved here");
+        }
+    }
+
+    #[test]
+    fn a_spill_slot_is_reused_once_the_value_in_it_has_died() {
+        // Slots are recycled on expiry exactly as registers are. Without that,
+        // a long function would reserve a slot per temporary and the frame
+        // would grow with the length of the code rather than with how much is
+        // live at once — which is the whole point of measuring intervals.
+        let rf = tiny_file();
+        let short_lived = (0..40)
+            .map(|n| format!("int v{n} = {n} + 1;\nprint(v{n});\n"))
+            .collect::<String>();
+
+        let ir = ir_of_main(&short_lived);
+        let main = &ir.functions[0];
+        let allocation = allocate(main, &rf);
+
+        assert!(
+            allocation.spill_slots <= 4,
+            "the frame grew with the code: {} slots for 40 values",
+            allocation.spill_slots
+        );
+        assert!(verify(&allocation, &rf).is_ok(), "{}", allocation.dump(main, &rf));
+    }
+
+    #[test]
+    fn a_function_with_nothing_to_allocate_asks_for_nothing() {
+        let rf = tiny_file();
+        let ir = ir_of("fn nothing() {\n}\nfn main() {\n  nothing();\n}");
+        let allocation = allocate(&ir.functions[0], &rf);
+
+        assert_eq!(allocation.spill_slots, 0);
+        assert!(allocation.used_callee_saved.is_empty());
+        assert!(verify(&allocation, &rf).is_ok());
+    }
+
+    // -- what `--dump-regalloc` prints --------------------------------------
+
+    #[test]
+    fn the_dump_names_every_value_and_where_it_went() {
+        // The dump is the only window into this stage, so it has to account for
+        // every interval — one that was allocated but not printed would be
+        // invisible exactly when someone is looking for it.
+        let rf = tiny_file();
+        // Enough live at once that the tiny file has to spill, so both kinds of
+        // location are printed.
+        let ir = ir_of_main(
+            "int a = 1;\nint b = 2;\nint c = 3;\nint d = 4;\nint e = 5;\n\
+             print(a + b + c + d + e);",
+        );
+        let main = &ir.functions[0];
+        let allocation = allocate(main, &rf);
+        let dump = allocation.dump(main, &rf);
+
+        let values: Vec<&str> = dump.lines().filter(|line| line.starts_with('%')).collect();
+        assert_eq!(values.len(), allocation.intervals.len(), "one line per value:\n{dump}");
+        for name in ["%a", "%b", "%e"] {
+            assert!(dump.contains(name), "`{name}` is missing from:\n{dump}");
+        }
+        // Every value line names a place: a register from this file, or a slot.
+        for line in &values {
+            let placed =
+                rf.names.iter().any(|name| line.contains(name)) || line.contains("spill slot");
+            assert!(placed, "no location on `{line}`:\n{dump}");
+        }
+        // And the summary says what the frame will cost.
+        assert!(dump.contains(&format!("{} spill slot(s)", allocation.spill_slots)), "{dump}");
+        assert!(allocation.spill_slots > 0, "this was meant to spill:\n{dump}");
+    }
+
+    #[test]
+    fn the_dump_uses_the_names_the_register_file_gave() {
+        // The allocator answers `PhysReg(2)`; only the backend knows that is
+        // `rbx`. The dump has to ask rather than invent, or `--dump-regalloc`
+        // would print one target's register names for another's allocation.
+        let rf = tiny_file();
+        let ir = ir_of_main("int x = 1;\nprint(x);");
+        let main = &ir.functions[0];
+        let dump = allocate(main, &rf).dump(main, &rf);
+
+        assert!(
+            rf.names.iter().any(|name| dump.contains(name)),
+            "none of {:?} appear in:\n{dump}",
+            rf.names
+        );
+        assert!(!dump.contains("rbx"), "a real machine's names leaked in:\n{dump}");
+    }
+
+    #[test]
+    fn the_register_file_names_what_it_hands_out() {
+        let rf = tiny_file();
+        assert_eq!(rf.name(PhysReg(0)), "v0");
+        assert_eq!(rf.name(PhysReg(3)), "s1");
+        for reg in rf.caller_saved.iter().chain(&rf.callee_saved) {
+            assert!(!rf.name(*reg).is_empty(), "{reg:?} has no name");
+        }
+    }
 }

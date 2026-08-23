@@ -1,31 +1,24 @@
 //! Every file in `examples/errors/` must fail, and must fail *at the right
 //! place*: these assertions are what keep the line/column reporting honest.
+//!
+//! Only about *where* the caret lands. That a program is refused at all is
+//! checked for every target at once in `tests/targets.rs`, and what the emitted
+//! assembly looks like belongs to the backend that emits it — neither is here.
 
 use std::path::Path;
 
 use tinyc::codegen::Target;
-use tinyc::codegen::x64_win::is_runtime_symbol;
 use tinyc::diag::SourceFile;
 
-/// The examples these tests compile.
+/// The target these tests compile for.
 ///
-/// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
-/// things out by hand, so it is allowed to be broken at any time. Anything that
-/// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 12] = [
-    "arith.tc",
-    "spill.tc",
-    "reassign.tc",
-    "bool.tc",
-    "control_flow.tc",
-    "functions.tc",
-    "enums.tc",
-    "arrays.tc",
-    "classes.tc",
-    "strings.tc",
-    "lists.tc",
-    "interactive.tc",
-];
+/// A diagnostic's position is a fact about the source text, so nearly all of
+/// these hold whatever the target is — and `tests/targets.rs` checks that every
+/// target refuses every one of these files. The exceptions are the two about
+/// parameter counts, which are the target's own answer: `too_many_params`
+/// points at the *fifth* parameter only on a target that passes four. So one is
+/// pinned here deliberately rather than assumed.
+const TARGET: Target = Target::X86_64Windows;
 
 /// Compile an example and return the `line:col` of each diagnostic it produces.
 fn error_positions(file: &str) -> Vec<String> {
@@ -33,7 +26,7 @@ fn error_positions(file: &str) -> Vec<String> {
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let source = SourceFile::new(file, text);
 
-    match tinyc::compile(source.text(), Target::X86_64Windows) {
+    match tinyc::compile(source.text(), TARGET) {
         Ok(_) => panic!("{file} was expected to fail, but compiled"),
         Err(errors) => errors
             .iter()
@@ -156,7 +149,7 @@ fn redeclaration_points_at_both_declarations() {
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/errors/redeclaration.tc");
     let source = SourceFile::new("redeclaration.tc", std::fs::read_to_string(path).unwrap());
-    let Err(errors) = tinyc::compile(source.text(), Target::X86_64Windows) else {
+    let Err(errors) = tinyc::compile(source.text(), TARGET) else {
         panic!("redeclaration.tc was expected to fail");
     };
     let (_, note_span) = errors[0].note.clone().expect("a note pointing at the first declaration");
@@ -188,7 +181,7 @@ fn arms_that_disagree_point_at_the_second_one_and_note_the_first() {
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/errors/match_arms_disagree.tc");
     let source = SourceFile::new("match_arms_disagree.tc", std::fs::read_to_string(path).unwrap());
-    let Err(errors) = tinyc::compile(source.text(), Target::X86_64Windows) else {
+    let Err(errors) = tinyc::compile(source.text(), TARGET) else {
         panic!("match_arms_disagree.tc was expected to fail");
     };
     let (_, note_span) = errors[0].note.clone().expect("a note pointing at the arm that set the type");
@@ -366,111 +359,3 @@ fn a_bare_return_in_a_returning_function_points_at_the_keyword() {
     assert_error_at("return_without_value.tc", "2:3");
 }
 
-/// The good examples must keep compiling, and keep producing the same answers
-/// the comments in them promise.
-#[test]
-fn the_working_examples_compile() {
-    for file in EXAMPLES {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let compiled = tinyc::compile(&text, Target::X86_64Windows)
-            .unwrap_or_else(|errors| panic!("{file} failed to compile: {errors:?}"));
-
-        assert!(compiled.asm.contains("global main"));
-        assert!(compiled.asm.contains("section .text"));
-
-        // Every path out of a function must undo its prologue exactly once. A
-        // function with two `return`s has two epilogues, so the counts balance
-        // per exit, not per file.
-        let functions = functions_in(&compiled.asm);
-        assert!(!functions.is_empty(), "{file}: no function was recognised in the assembly");
-        for (name, body) in functions {
-            // The runtime helpers are jumped to and never come back, so they
-            // have neither a prologue nor an epilogue to balance.
-            if is_runtime_symbol(name) {
-                continue;
-            }
-            let pushes = body.matches("push ").count();
-            let exits = body.matches("\n    ret\n").count();
-            assert!(exits > 0, "{file}: {name} never returns");
-            assert_eq!(
-                body.matches("pop  ").count(),
-                pushes * exits,
-                "unbalanced prologue in {file}: {name}"
-            );
-            // A leaf that spills nothing reserves no frame, and so has nothing
-            // to release — but a `sub` without a matching `add` on some path
-            // would leave the stack wrong.
-            let reserved = body.matches("sub  rsp,").count();
-            assert_eq!(
-                body.matches("add  rsp,").count(),
-                reserved * exits,
-                "{file}: {name} does not release its frame on every path"
-            );
-        }
-    }
-}
-
-/// Every symbol the assembly defines, other than the entry point, must be one
-/// no runtime or literal can also claim.
-#[test]
-fn generated_symbols_cannot_collide_with_a_tinyc_function() {
-    for file in EXAMPLES {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let compiled = tinyc::compile(&text, Target::X86_64Windows).unwrap();
-
-        for (name, _) in functions_in(&compiled.asm) {
-            assert!(
-                name == "main" || name.contains('$'),
-                "{file}: `{name}` is a bare symbol a TinyC function could also define"
-            );
-        }
-    }
-}
-
-/// Split emitted assembly into `(name, body)` per function.
-///
-/// A function starts at a label in the first column; the block labels inside it
-/// all begin with a `.`, which is exactly how NASM scopes them too.
-fn functions_in(asm: &str) -> Vec<(&str, &str)> {
-    let starts: Vec<(usize, &str)> = asm
-        .match_indices('\n')
-        .filter_map(|(offset, _)| {
-            let line = asm[offset + 1..].lines().next()?;
-            let name = line.strip_suffix(':')?;
-            let plain = !name.is_empty()
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
-                && !name.starts_with(|c: char| c.is_ascii_digit());
-            plain.then_some((offset + 1, name))
-        })
-        .collect();
-
-    starts
-        .iter()
-        .enumerate()
-        .map(|(index, &(offset, name))| {
-            let end = starts.get(index + 1).map_or(asm.len(), |&(next, _)| next);
-            (name, &asm[offset..end])
-        })
-        .collect()
-}
-
-/// The allocation the backend is handed must be internally consistent.
-#[test]
-fn allocations_are_valid() {
-    use tinyc::codegen::{backend_for, regalloc};
-
-    for file in EXAMPLES {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
-        let text = std::fs::read_to_string(&path).unwrap();
-        let compiled = tinyc::compile(&text, Target::X86_64Windows).unwrap();
-        let backend = backend_for(Target::X86_64Windows);
-
-        for allocation in &compiled.allocations {
-            if let Err(problem) = regalloc::verify(allocation, backend.register_file()) {
-                panic!("{file}: {problem}");
-            }
-        }
-    }
-}

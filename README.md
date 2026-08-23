@@ -1277,18 +1277,36 @@ The x64 Windows backend keeps the ABI-critical registers (`rcx`, `rdx`, `r8`,
 out of the allocator's hands, so the allocator only ever reasons about
 "caller-saved" and "callee-saved" pools — never about x86.
 
+**Nothing in the test suite needs to change either.** `tests/targets.rs` walks
+`Target::names()`, so step 2 alone puts the new backend under every contract
+every other target already keeps; `tests/cli.rs` will ask for it by name; and
+`tests/execution.rs` will assemble, link and *run* its output as soon as
+`tests/harness/elf.rs` reports a target that resolves. Adding a target is one
+job, not two — see [The execution harness](#the-execution-harness).
+
 ## Tests
 
 ```bash
 cargo test
 ```
 
-Unit tests live beside each stage, and three integration suites sit on top:
+Unit tests live beside each stage — including the ones about the *text* a
+backend emits, which belong to that backend and no other: a prologue, a symbol
+prefix and a mnemonic are facts about `x64_win`, so they are checked in
+`x64_win`. Five integration suites sit on top:
 
 * `tests/error_positions.rs` asserts the exact line and column reported for
-  every program in `examples/errors/`, and checks the *shape* of the emitted
-  assembly — that every path out of a function undoes its prologue, and that no
-  generated symbol is one a TinyC function could also claim.
+  every program in `examples/errors/`. Only about where the caret lands.
+* `tests/targets.rs` holds every backend to the same contract, walking
+  `Target::names()` rather than naming one: every example compiles, every
+  allocation verifies, every register file holds together, the parameter limit
+  is the target's own, the front end builds the same tree for all of them, and
+  every error example is refused by all of them. Nothing in it names a target,
+  so a new backend arrives already covered.
+* `tests/cli.rs` drives the built binary: where the assembly is written, what
+  `--emit` prints and does not write, what an unknown target says, and that a
+  program refused at any stage exits non-zero with a rendered diagnostic on
+  stderr. It needs no assembler.
 * `tests/pipeline.rs` covers what belongs to the pipeline as a whole rather than
   to any one stage: that every shape of nesting is refused *in words* past the
   limit and survives every stage below it, and that `--emit` really stops the
@@ -1304,8 +1322,27 @@ Unit tests live beside each stage, and three integration suites sit on top:
   *number* wherever it can, so that a mangled character shows up as a wrong
   count rather than as output that merely looks odd.
 
-The execution suite needs `nasm` and the Microsoft linker. When it cannot find
-them it says so and passes, so `cargo test` still works without a toolchain:
+### The execution harness
+
+`tests/execution.rs` names no platform. It is a set of tables — a small TinyC
+program and what it must print — and everything that differs per machine lives
+behind one trait in `tests/harness/`:
+
+```text
+tests/harness/mod.rs   the tables' runners, and `host_toolchain()`
+tests/harness/msvc.rs  nasm -f win64, then link.exe   (#[cfg(windows)])
+tests/harness/elf.rs   nasm -f elf64, then cc         (#[cfg(unix)])
+```
+
+`Toolchain` is one method — assembly text in, an executable out — plus the
+`Target` to ask the compiler for. `host_toolchain()` picks one, and is the only
+`cfg` in the whole harness. So adding the Linux backend means giving `elf.rs`
+a target that resolves; every case table comes along unchanged.
+
+Both failure modes are ordinary answers rather than panics: a machine may have
+no assembler, and the compiler may have no backend for a machine that does. In
+either case the suite says what was missing and passes, so `cargo test` still
+works without a toolchain:
 
 ```bash
 cargo test --test execution -- --nocapture

@@ -67,6 +67,14 @@ pub fn compile(program: &Program, backend: &dyn Backend) -> (Vec<Allocation>, St
 
 #[cfg(test)]
 mod tests {
+    //! The unit-level door into this stage, checked against the one target
+    //! that exists here.
+    //!
+    //! The same contracts are checked against *every* target in
+    //! `tests/targets.rs`, which walks [`Target::names`] instead of naming one.
+    //! These stay because they run without building anything and fail closer to
+    //! the code that broke; that file is what a new backend has to satisfy.
+
     use super::*;
 
     /// Lower a whole program to IR, which is what this stage takes.

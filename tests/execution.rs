@@ -6,49 +6,33 @@
 //! their own. Running the program is the only check that can, so this is where a
 //! miscompilation gets caught.
 //!
-//! It needs `nasm` and the Microsoft linker. When either is missing the tests
-//! report what they could not find and pass, so `cargo test` still works on a
-//! machine without a toolchain — run them deliberately with:
+//! Nothing in this file names a platform. Every test is a table of small TinyC
+//! programs and what each must print, run through the [`harness`], which owns
+//! the one part that differs per machine — see `tests/harness/mod.rs`. A new
+//! backend inherits all of it unchanged.
+//!
+//! It needs an assembler and a linker. When either is missing the tests report
+//! what they could not find and pass, so `cargo test` still works on a machine
+//! without a toolchain — run them deliberately with:
 //!
 //! ```text
 //! cargo test --test execution -- --nocapture
 //! ```
 //!
 //! and read the "skipped" lines.
-//!
-//! The only target is x86_64-windows, so the whole file is Windows-only.
-#![cfg(windows)]
 
-use std::os::windows::process::CommandExt;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+mod harness;
 
-use tinyc::codegen::Target;
+use harness::{EXAMPLES, Harness, examples, normalise};
 
-/// Programs that must keep printing exactly what `examples/expected/<name>.txt`
-/// says, and the source of truth for what a working TinyC program looks like.
-const EXAMPLES: [&str; 13] = [
-    "hello.tc",
-    "arith.tc",
-    "spill.tc",
-    "reassign.tc",
-    "bool.tc",
-    "control_flow.tc",
-    "functions.tc",
-    "enums.tc",
-    "arrays.tc",
-    "classes.tc",
-    "strings.tc",
-    "lists.tc",
-    "interactive.tc",
-];
 
 #[test]
 fn every_example_prints_what_it_promises() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     for file in EXAMPLES {
-        let source = examples().join(file);
+        let source = std::fs::read_to_string(examples().join(file))
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
         let expected = examples().join("expected").join(file.replace(".tc", ".txt"));
         let expected = std::fs::read_to_string(&expected)
             .unwrap_or_else(|e| panic!("{}: {e}", expected.display()));
@@ -59,7 +43,7 @@ fn every_example_prints_what_it_promises() {
         let input = examples().join("expected").join(file.replace(".tc", ".in"));
         let input = std::fs::read(&input).unwrap_or_default();
 
-        let run = tools.build_and_run_on(&source, file, &input);
+        let run = harness.build_and_run(file, &source, &input);
         assert!(run.status.success(), "{file} exited with {}\n{}", run.status, run.stderr);
         assert_eq!(normalise(&run.stdout), normalise(&expected), "{file} printed the wrong thing");
     }
@@ -69,7 +53,7 @@ fn every_example_prints_what_it_promises() {
 /// that a wrong answer is a wrong *number* rather than a crash.
 #[test]
 fn the_awkward_corners_of_code_generation_still_compute() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let cases: [(&str, &str); 15] = [
         // The destination shares a register with the right operand of an
@@ -115,7 +99,7 @@ fn the_awkward_corners_of_code_generation_still_compute() {
         ("int a = 17;\nint b = 5;\na = a % b;\nprint(a);", "2"),
     ];
 
-    run_each(tools, "corner", &cases);
+    harness.each_prints("corner", &cases);
 }
 
 /// What a string does, checked by running it rather than by reading assembly.
@@ -125,7 +109,7 @@ fn the_awkward_corners_of_code_generation_still_compute() {
 /// that merely looks odd.
 #[test]
 fn strings_hold_characters_rather_than_bytes() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let cases: [(&str, &str); 17] = [
         // A length is a count of characters, whatever they cost to write.
@@ -173,7 +157,7 @@ fn strings_hold_characters_rather_than_bytes() {
             print(len(s));"#, "32768"),
     ];
 
-    run_each(tools, "string", &cases);
+    harness.each_prints("string", &cases);
 }
 
 /// What a list does, checked by running it.
@@ -183,7 +167,7 @@ fn strings_hold_characters_rather_than_bytes() {
 /// copy, so several of these deliberately push past it.
 #[test]
 fn lists_grow_and_stay_their_owners() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let cases: [(&str, &str); 12] = [
         (r#"int[] xs = [];
@@ -249,14 +233,14 @@ fn lists_grow_and_stay_their_owners() {
                    \x20 for (int i = 1; i <= n; i = i + 1) { push(out, i * i); }\n\
                    \x20 return out;\n\
                    }\n";
-    run_each_after(tools, "list", prelude, &cases);
+    harness.each_prints_after("list", prelude, &cases);
 }
 
 /// Reading input, which is the one thing that cannot be checked by looking at
 /// the program alone: what it does depends on what it is given.
 #[test]
 fn reading_the_input_sees_characters_and_knows_when_to_stop() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     // `(input, body, expected)`. The inputs are written as raw bytes on
     // purpose: what arrives is UTF-8, and turning it into characters is the
@@ -302,20 +286,20 @@ fn reading_the_input_sees_characters_and_knows_when_to_stop() {
         ),
     ];
 
-    run_each_on(tools, "input", &cases);
+    harness.each_prints_given("input", &cases);
 }
 
 /// Asking for a line that is not there stops the program, rather than answering
 /// with something that could be mistaken for an empty line.
 #[test]
 fn reading_past_the_end_reports_and_exits() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
-    let source = tools.scratch.join("past_the_end.tc");
-    std::fs::write(&source, "fn main() {\n  print(read_line());\n  print(read_line());\n}\n")
-        .unwrap();
-
-    let run = tools.build_and_run_on(&source, "past_the_end", b"only\n");
+    let run = harness.build_and_run(
+        "past_the_end",
+        "fn main() {\n  print(read_line());\n  print(read_line());\n}\n",
+        b"only\n",
+    );
     assert!(!run.status.success(), "it should not have finished");
     assert!(run.stdout.contains("only"), "the line it did have: {}", run.stdout);
     assert!(run.stderr.contains("no more input"), "{}", run.stderr);
@@ -325,83 +309,19 @@ fn reading_past_the_end_reports_and_exits() {
 /// some replacement nobody asked for.
 #[test]
 fn input_that_is_not_utf8_reports_and_exits() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
-    let source = tools.scratch.join("bad_utf8.tc");
-    std::fs::write(&source, "fn main() {\n  print(read_line());\n}\n").unwrap();
-
-    let run = tools.build_and_run_on(&source, "bad_utf8", b"\xff\xfe\n");
+    let run =
+        harness.build_and_run("bad_utf8", "fn main() {\n  print(read_line());\n}\n", b"\xff\xfe\n");
     assert!(!run.status.success(), "it should not have finished");
     assert!(run.stderr.contains("not valid UTF-8"), "{}", run.stderr);
-}
-
-// -- running a table of cases ----------------------------------------------
-//
-// Every test in this file is a table of small programs, and there are only
-// three things one can be asked: print this, print this given that input, or
-// stop and say why. One runner each, so that a test is its table and nothing
-// else — and so that a case added to any of them cannot forget to check
-// whether the program actually succeeded.
-
-/// Compile each body as the whole of `main`, run it, and check what it printed.
-fn run_each(tools: &Tools, stem: &str, cases: &[(&str, &str)]) {
-    run_each_after(tools, stem, "", cases);
-}
-
-/// The same, with `prelude` — the functions and classes the bodies need —
-/// written above `main`.
-fn run_each_after(tools: &Tools, stem: &str, prelude: &str, cases: &[(&str, &str)]) {
-    for (index, (body, expected)) in cases.iter().enumerate() {
-        let name = format!("{stem}{index}");
-        let source = tools.scratch.join(format!("{name}.tc"));
-        std::fs::write(&source, format!("{prelude}fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run(&source, &name);
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(run.stdout.trim(), *expected, "case {index}:\n{body}");
-    }
-}
-
-/// Run each body on the input written beside it.
-///
-/// The one thing that cannot be checked by looking at a program alone: what it
-/// does depends on what it is given.
-fn run_each_on(tools: &Tools, stem: &str, cases: &[(&[u8], &str, &str)]) {
-    for (index, (input, body, expected)) in cases.iter().enumerate() {
-        let name = format!("{stem}{index}");
-        let source = tools.scratch.join(format!("{name}.tc"));
-        std::fs::write(&source, format!("fn main() {{\n{body}\n}}\n")).unwrap();
-
-        let run = tools.build_and_run_on(&source, &name, input);
-        assert!(run.status.success(), "case {index} exited with {}\n{}", run.status, run.stderr);
-        assert_eq!(normalise(&run.stdout), normalise(expected), "case {index}:\n{body}");
-    }
-}
-
-/// Each whole program here must *stop*, and say so: these are the operations
-/// with no right answer to hand back, and the check is that none of them hands
-/// one back anyway.
-fn each_stops_with(tools: &Tools, stem: &str, cases: &[(&str, &str)]) {
-    for (index, (program, expected)) in cases.iter().enumerate() {
-        let name = format!("{stem}{index}");
-        let source = tools.scratch.join(format!("{name}.tc"));
-        std::fs::write(&source, program).unwrap();
-
-        let run = tools.build_and_run(&source, &name);
-        assert!(!run.status.success(), "case {index} was expected to fail: {}", run.stdout);
-        assert!(
-            run.stderr.contains(expected),
-            "case {index} should have mentioned `{expected}`, said: {}",
-            run.stderr
-        );
-    }
 }
 
 /// A division the hardware cannot perform must say so and stop, rather than
 /// dying on a hardware exception with nothing printed.
 #[test]
 fn a_division_that_cannot_be_performed_reports_and_exits() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let cases = [
         ("fn zero() -> int {\n  return 0;\n}\nfn main() {\n  print(1 / zero());\n}", "by zero"),
@@ -451,7 +371,7 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
         ),
     ];
 
-    each_stops_with(tools, "abort", &cases);
+    harness.each_stops_with("abort", &cases);
 }
 
 /// Short circuiting and loop jumps are the two features whose whole point is
@@ -463,7 +383,7 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
 /// loop prints the wrong number.
 #[test]
 fn short_circuits_and_loop_jumps_do_what_they_promise() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let cases: [(&str, &str); 15] = [
         // The right operand must not run: `10 / z` would abort the process.
@@ -520,7 +440,7 @@ fn short_circuits_and_loop_jumps_do_what_they_promise() {
         ("bool ok = 1 > 0;\nprint(!!ok);", "true"),
     ];
 
-    run_each(tools, "logic", &cases);
+    harness.each_prints("logic", &cases);
 }
 
 /// Objects: the layout, the dispatch, and the upcast that makes them useful.
@@ -529,7 +449,7 @@ fn short_circuits_and_loop_jumps_do_what_they_promise() {
 /// rather than a crash, so running the thing is the only check that catches it.
 #[test]
 fn objects_dispatch_on_what_they_are() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let prelude = "class Shape {\n  fn area(self) -> int { return 0; }\n  \
                    fn name(self) -> string { return \"shape\"; }\n}\n\
@@ -564,7 +484,7 @@ fn objects_dispatch_on_what_they_are() {
         ("Rect r = Rect { w: 3, h: 3 };\nprint(r.area());", "9"),
     ];
 
-    run_each_after(tools, "object", prelude, &cases);
+    harness.each_prints_after("object", prelude, &cases);
 }
 
 /// The three things a polymorphic value could not be until aggregates gained
@@ -576,7 +496,7 @@ fn objects_dispatch_on_what_they_are() {
 /// is a plausible number rather than a crash.
 #[test]
 fn a_polymorphic_value_keeps_what_it_is_when_it_is_copied() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let prelude = "class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
                    class Circle : Shape {\n  int r;\n  \
@@ -617,7 +537,7 @@ fn a_polymorphic_value_keeps_what_it_is_when_it_is_copied() {
         ),
     ];
 
-    run_each_after(tools, "poly", prelude, &cases);
+    harness.each_prints_after("poly", prelude, &cases);
 }
 
 /// Arrays really read and write the memory they claim to.
@@ -627,7 +547,7 @@ fn a_polymorphic_value_keeps_what_it_is_when_it_is_copied() {
 /// number rather than as anything the assembly looks guilty about.
 #[test]
 fn arrays_address_the_elements_they_promise() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let prelude = "fn fill(int[4] xs) {\n  for (int i = 0; i < len(xs); i = i + 1) {\n    \
                    xs[i] = i * 10;\n  }\n}\n";
@@ -665,7 +585,7 @@ fn arrays_address_the_elements_they_promise() {
         ("string[2] w = [\"no\", \"yes\"];\nprint(w[1]);", "yes"),
     ];
 
-    run_each_after(tools, "array", prelude, &cases);
+    harness.each_prints_after("array", prelude, &cases);
 }
 
 /// An index the compiler could not check must be checked where it lands.
@@ -676,7 +596,7 @@ fn arrays_address_the_elements_they_promise() {
 /// runs, which makes this the only check they have at all.
 #[test]
 fn an_index_out_of_bounds_reports_and_exits() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let bounds = "index out of bounds";
     let at = |n: &str| format!("fn at() -> int {{\n  return {n};\n}}\n");
@@ -736,7 +656,7 @@ fn an_index_out_of_bounds_reports_and_exits() {
     ];
 
     let cases: Vec<(&str, &str)> = cases.iter().map(|(p, e)| (p.as_str(), *e)).collect();
-    each_stops_with(tools, "bounds", &cases);
+    harness.each_stops_with("bounds", &cases);
 }
 
 /// The two conversions that can refuse: neither invents an answer for input
@@ -746,7 +666,7 @@ fn an_index_out_of_bounds_reports_and_exits() {
 /// program knows — a constant is settled by `sema` long before this.
 #[test]
 fn a_conversion_that_has_no_answer_reports_and_exits() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let number = |n: &str| format!("fn n() -> int {{\n  return {n};\n}}\n");
     let text = |s: &str| format!("fn t() -> string {{\n  return \"{s}\";\n}}\n");
@@ -779,14 +699,14 @@ fn a_conversion_that_has_no_answer_reports_and_exits() {
     ];
 
     let cases: Vec<(&str, &str)> = cases.iter().map(|(p, e)| (p.as_str(), *e)).collect();
-    each_stops_with(tools, "convert", &cases);
+    harness.each_stops_with("convert", &cases);
 }
 
 /// The boundary values these two conversions *do* answer, next door to the ones
 /// above — a guard one out either way would show up here rather than there.
 #[test]
 fn a_conversion_answers_everything_right_up_to_the_boundary() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     let cases: [(&str, &str); 8] = [
         // The first and last characters there are, and the two either side of
@@ -808,14 +728,14 @@ fn a_conversion_answers_everything_right_up_to_the_boundary() {
     // settle: what is under test is the check in the emitted code.
     let prelude = "fn n(int v) -> int {\n  return v;\n}\n\
                    fn t(string v) -> string {\n  return v;\n}\n";
-    run_each_after(tools, "boundary", prelude, &cases);
+    harness.each_prints_after("boundary", prelude, &cases);
 }
 
 /// A `match` used as a value, where getting the control flow wrong shows up as
 /// a wrong answer rather than a crash.
 #[test]
 fn a_match_expression_yields_the_arm_that_ran() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
     // A helper whose arms mix the two shapes, so the diverging one is exercised
     // where it belongs: leaving the function rather than reaching the join.
@@ -847,226 +767,241 @@ fn a_match_expression_yields_the_arm_that_ran() {
         ),
     ];
 
-    run_each_after(tools, "matchval", prelude, &cases);
+    harness.each_prints_after("matchval", prelude, &cases);
 }
 
 /// A TinyC function may be called anything, including the name of the runtime
 /// routine `print` itself compiles into.
 #[test]
 fn a_program_may_name_a_function_after_the_runtime() {
-    let Some(tools) = Tools::find() else { return };
+    let Some(harness) = Harness::find() else { return };
 
-    let source = tools.scratch.join("shadow_runtime.tc");
-    std::fs::write(
-        &source,
+    let run = harness.build_and_run(
+        "shadow_runtime",
         "fn printf() -> int {\n  return 41;\n}\n\
          fn str0() -> int {\n  return 1;\n}\n\
          fn main() {\n  print(\"hi\");\n  print(printf() + str0());\n}\n",
-    )
-    .unwrap();
-
-    let run = tools.build_and_run(&source, "shadow_runtime");
+        b"",
+    );
     assert!(run.status.success(), "exited with {}\n{}", run.status, run.stderr);
     assert_eq!(normalise(&run.stdout), "hi\n42\n");
 }
 
-// -- the toolchain ---------------------------------------------------------
 
-fn examples() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")
-}
-
-/// Trailing whitespace and line endings are the shell's business, not the
-/// compiler's.
-fn normalise(text: &str) -> String {
-    text.replace("\r\n", "\n").trim_end().to_string() + "\n"
-}
-
-struct Run {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-/// The external programs `tinyc` stops short of, and a directory to work in.
-struct Tools {
-    nasm: PathBuf,
-    link: PathBuf,
-    /// The library search path `vcvars64.bat` sets up. Captured once, because
-    /// running that batch file per link is slower than everything else here put
-    /// together.
-    lib: String,
-    scratch: PathBuf,
-}
-
-impl Tools {
-    /// Answers `None` — after saying why — when the machine cannot link.
-    ///
-    /// Looking the toolchain up costs a second or two, and every test in this
-    /// file wants the same answer, so it is found once for the whole run.
-    fn find() -> Option<&'static Tools> {
-        static TOOLS: std::sync::OnceLock<Option<Tools>> = std::sync::OnceLock::new();
-        TOOLS.get_or_init(Tools::look_for).as_ref()
-    }
-
-    fn look_for() -> Option<Tools> {
-        let Some(nasm) = find_nasm() else {
-            println!("skipped: nasm not found (winget install nasm)");
-            return None;
-        };
-        let Some((link, lib)) = find_linker() else {
-            println!("skipped: no Visual Studio C++ toolchain found");
-            return None;
-        };
-
-        let scratch = std::env::temp_dir().join("tinyc-execution-tests");
-        std::fs::create_dir_all(&scratch).expect("a directory to build in");
-        Some(Tools { nasm, link, lib, scratch })
-    }
-
-    /// tinyc -> nasm -> link -> run, answering what the program printed.
-    fn build_and_run(&self, source: &Path, name: &str) -> Run {
-        self.build_and_run_on(source, name, b"")
-    }
-
-    /// Build and run, with `input` on the program's standard input.
-    ///
-    /// A program that reads is given exactly these bytes and then the end of
-    /// the input, which is what makes `eof()` testable at all: run with a
-    /// terminal attached it would wait for someone to type.
-    fn build_and_run_on(&self, source: &Path, name: &str, input: &[u8]) -> Run {
-        let asm = self.scratch.join(format!("{name}.asm"));
-        let obj = self.scratch.join(format!("{name}.obj"));
-        let exe = self.scratch.join(format!("{name}.exe"));
-
-        let text = std::fs::read_to_string(source)
-            .unwrap_or_else(|e| panic!("{}: {e}", source.display()));
-        let compiled = tinyc::with_compiler_stack(|| tinyc::compile(&text, Target::X86_64Windows))
-            .unwrap_or_else(|errors| panic!("{name} failed to compile: {errors:?}"));
-        std::fs::write(&asm, &compiled.asm).unwrap();
-
-        let assembled = Command::new(&self.nasm)
-            .args(["-f", "win64", "-o"])
-            .arg(&obj)
-            .arg(&asm)
-            .output()
-            .expect("nasm should run");
-        assert!(
-            assembled.status.success(),
-            "{name} did not assemble:\n{}",
-            String::from_utf8_lossy(&assembled.stderr)
-        );
-
-        // `link` finds the C runtime through `LIB`, which is the one thing a
-        // developer command prompt would have set up for it.
-        //
-        //  - msvcrt.lib                   : the C runtime, where printf lives
-        //  - kernel32.lib                 : SetConsoleOutputCP, so a console reads
-        //                                   what is printed to it as UTF-8
-        //  - legacy_stdio_definitions.lib : printf as a real symbol rather than
-        //                                   the inline function the UCRT headers
-        //                                   normally provide
-        let linked = Command::new(&self.link)
-            .env("LIB", &self.lib)
-            .args(["/nologo", "/subsystem:console", "/entry:mainCRTStartup"])
-            .arg(format!("/out:{}", exe.display()))
-            .arg(&obj)
-            .args(["msvcrt.lib", "kernel32.lib", "legacy_stdio_definitions.lib"])
-            .output()
-            .expect("link should run");
-        assert!(
-            linked.status.success(),
-            "{name} did not link:\n{}{}",
-            String::from_utf8_lossy(&linked.stdout),
-            String::from_utf8_lossy(&linked.stderr)
-        );
-
-        let mut child = Command::new(&exe)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("the compiled program should run");
-        {
-            use std::io::Write;
-            let stdin = child.stdin.as_mut().expect("stdin was piped");
-            stdin.write_all(input).expect("the program should take its input");
-        }
-        let run = child.wait_with_output().expect("the program should finish");
-        Run {
-            status: run.status,
-            stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&run.stderr).into_owned(),
-        }
-    }
-}
-
-/// `winget install nasm` does not put it on `PATH`, so look where it lands.
-fn find_nasm() -> Option<PathBuf> {
-    let mut candidates = vec![PathBuf::from("nasm.exe")];
-    for variable in ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"] {
-        if let Ok(root) = std::env::var(variable) {
-            candidates.push(Path::new(&root).join("bin").join("NASM").join("nasm.exe"));
-            candidates.push(Path::new(&root).join("NASM").join("nasm.exe"));
-        }
-    }
-    candidates.into_iter().find(|path| {
-        path.exists()
-            || Command::new(path).arg("-v").output().is_ok_and(|out| out.status.success())
-    })
-}
-
-/// `link.exe` and the `LIB` path it needs, the way a developer command prompt
-/// would provide them.
+/// Every type `print` accepts renders as itself.
 ///
-/// `vcvars64.bat` is the only thing that knows where the C runtime's import
-/// libraries are, and it only ever announces it by setting environment
-/// variables — so it is run once, in a shell that then prints its environment
-/// back. See the same dance in `scripts/build.ps1`.
-fn find_linker() -> Option<(PathBuf, String)> {
-    let program_files = std::env::var("ProgramFiles(x86)").ok()?;
-    let vswhere = Path::new(&program_files)
-        .join("Microsoft Visual Studio")
-        .join("Installer")
-        .join("vswhere.exe");
-    if !vswhere.exists() {
-        return None;
-    }
+/// `print` is the only way a TinyC program says anything, so a type it renders
+/// wrongly makes every other test in this file report about the wrong thing.
+/// One case per printable type, and one for each of the two `bool` texts.
+#[test]
+fn every_type_prints_as_itself() {
+    let Some(harness) = Harness::find() else { return };
 
-    let found = Command::new(&vswhere)
-        .args(["-latest", "-products", "*", "-property", "installationPath"])
-        .output()
-        .ok()?;
-    let root = String::from_utf8_lossy(&found.stdout).trim().to_string();
-    if root.is_empty() {
-        return None;
-    }
+    let prelude = "enum Colour { Red, Green, Blue }\n";
+    let cases: [(&str, &str); 12] = [
+        ("print(0);", "0"),
+        ("print(7);", "7"),
+        // The widest numbers there are, which is where a renderer that worked
+        // digit by digit would run out.
+        ("print(9223372036854775807);", "9223372036854775807"),
+        ("print(0 - 9223372036854775807 - 1);", "-9223372036854775808"),
+        ("print(true);", "true"),
+        ("print(false);", "false"),
+        ("print(\"text\");", "text"),
+        // A character is printed as itself, not as its number.
+        ("print('a');", "a"),
+        ("print('\u{e9}');", "\u{e9}"),
+        // A variant prints its own name, and the last one is the one a table
+        // read one entry short would miss.
+        ("print(Colour::Red);", "Red"),
+        ("print(Colour::Blue);", "Blue"),
+        // A value computed rather than written, so nothing was folded away.
+        ("int n = 20;\nprint(n * 5 + 1);", "101"),
+    ];
 
-    let vcvars = Path::new(&root).join("VC").join("Auxiliary").join("Build").join("vcvars64.bat");
-    if !vcvars.exists() {
-        return None;
-    }
+    harness.each_prints_after("print", prelude, &cases);
+}
 
-    // `raw_arg`: `cmd.exe` does not parse its command line the way Rust quotes
-    // arguments for it, and the quotes around the path have to reach it as
-    // written.
-    let environment = Command::new("cmd")
-        .raw_arg(format!("/c call \"{}\" >nul 2>&1 && set", vcvars.display()))
-        .output()
-        .ok()?;
-    let environment = String::from_utf8_lossy(&environment.stdout);
+/// Arithmetic that lands exactly on the edge of the range, and must *not* be
+/// refused.
+///
+/// TinyC stops a program rather than answering wrongly, which makes the guard
+/// itself worth testing from both sides: `tests/execution.rs` already has the
+/// operations that overflow, and these are their neighbours that do not. A
+/// guard one out either way would show up here rather than there.
+#[test]
+fn arithmetic_at_the_edge_of_the_range_still_answers() {
+    let Some(harness) = Harness::find() else { return };
 
-    let value = |wanted: &str| {
-        environment.lines().find_map(|line| {
-            let (name, value) = line.split_once('=')?;
-            name.eq_ignore_ascii_case(wanted).then(|| value.to_string())
-        })
-    };
+    // The values come back from calls so nothing is a constant `sema` could
+    // settle: what is under test is the check in the emitted code.
+    let prelude = "fn v(int n) -> int {\n  return n;\n}\n\
+                   fn max() -> int {\n  return 9223372036854775807;\n}\n\
+                   fn min() -> int {\n  return 0 - 9223372036854775807 - 1;\n}\n";
+    let cases: [(&str, &str); 14] = [
+        // Reaching each end exactly.
+        ("print(max() - 1 + 1);", "9223372036854775807"),
+        ("print(min() + 1 - 1);", "-9223372036854775808"),
+        ("print(max() + min());", "-1"),
+        ("print(max() - max());", "0"),
+        // Multiplication that just fits, and its negative twin.
+        ("print(v(4611686018427387903) * 2 + 1);", "9223372036854775807"),
+        ("print(v(0 - 4611686018427387904) * 2);", "-9223372036854775808"),
+        // Division at the ends. `min() / -1` is the one that overflows and is
+        // checked elsewhere; these are the ones next to it.
+        ("print(min() / v(1));", "-9223372036854775808"),
+        ("print(max() / v(0 - 1));", "-9223372036854775807"),
+        ("print(min() / v(2));", "-4611686018427387904"),
+        // A remainder that is zero, including for the value with no positive
+        // twin — where the division it is paired with would overflow.
+        ("print(min() % v(1));", "0"),
+        ("print(max() % max());", "0"),
+        // Negating the largest positive number is fine; negating the most
+        // negative one is not, and is checked elsewhere.
+        ("print(-max());", "-9223372036854775807"),
+        // Zero absorbs, and must not be mistaken for an overflow.
+        ("print(min() * v(0));", "0"),
+        // Both ends in one expression, reaching zero through -1 rather than
+        // through `0 - min()`, which has no answer at all.
+        ("print(min() + max() + 1);", "0"),
+    ];
 
-    let lib = value("LIB")?;
-    let link = value("PATH")?
-        .split(';')
-        .map(|directory| Path::new(directory).join("link.exe"))
-        .find(|candidate| candidate.exists())?;
-    Some((link, lib))
+    harness.each_prints_after("edge", prelude, &cases);
+}
+
+/// Every comparison, checked on both sides of the boundary it turns on.
+///
+/// Each pair of operators differs at exactly one input — `<` and `<=` only at
+/// equality — so an off-by-one in the condition codes is invisible anywhere
+/// else. All four combinations of sign are here too, because a comparison done
+/// unsigned would get the positive cases right and the negative ones wrong.
+#[test]
+fn every_comparison_turns_at_the_right_place() {
+    let Some(harness) = Harness::find() else { return };
+
+    let prelude = "fn v(int n) -> int {\n  return n;\n}\n";
+    let cases: [(&str, &str); 18] = [
+        ("print(v(5) < v(5));", "false"),
+        ("print(v(4) < v(5));", "true"),
+        ("print(v(5) <= v(5));", "true"),
+        ("print(v(6) <= v(5));", "false"),
+        ("print(v(5) > v(5));", "false"),
+        ("print(v(6) > v(5));", "true"),
+        ("print(v(5) >= v(5));", "true"),
+        ("print(v(4) >= v(5));", "false"),
+        ("print(v(5) == v(5));", "true"),
+        ("print(v(5) != v(5));", "false"),
+        // A negative against a positive: unsigned, this answers the opposite.
+        ("print(v(0 - 1) < v(1));", "true"),
+        ("print(v(0 - 1) > v(1));", "false"),
+        // Two negatives, where the larger magnitude is the smaller number.
+        ("print(v(0 - 5) < v(0 - 4));", "true"),
+        ("print(v(0 - 5) >= v(0 - 4));", "false"),
+        // The two ends of the range against each other.
+        ("print(v(0 - 9223372036854775807 - 1) < v(9223372036854775807));", "true"),
+        ("print(v(9223372036854775807) <= v(0 - 9223372036854775807 - 1));", "false"),
+        // Characters and enums answer equality, and only equality.
+        ("print('a' == 'a');\nprint('a' != 'b');", "true\ntrue"),
+        ("print(\"ab\" == \"ab\");\nprint(\"ab\" != \"ba\");", "true\ntrue"),
+    ];
+
+    harness.each_prints_after("compare", prelude, &cases);
+}
+
+/// Calls at the limits of what the calling convention can carry.
+///
+/// Arguments travel in registers, and there are only so many — so the shapes
+/// worth running are the ones that use all of them, use them again before the
+/// first call has finished, or spend one of them on something invisible.
+#[test]
+fn calls_pass_their_arguments_even_at_the_limits() {
+    let Some(harness) = Harness::find() else { return };
+
+    let prelude = "class Point {\n  int x;\n  int y;\n}\n\
+                   fn four(int a, int b, int c, int d) -> int {\n  \
+                     return a * 1000 + b * 100 + c * 10 + d;\n}\n\
+                   fn one(int a) -> int {\n  return a + 1;\n}\n\
+                   fn build(int a, int b, int c) -> Point {\n  \
+                     return Point { x: a * 100 + b, y: c };\n}\n\
+                   fn depth(int n) -> int {\n  if (n == 0) {\n    return 0;\n  }\n  \
+                     return 1 + depth(n - 1);\n}\n\
+                   fn total(int n) -> int {\n  if (n == 0) {\n    return 0;\n  }\n  \
+                     return n + total(n - 1);\n}\n";
+    let cases: [(&str, &str); 9] = [
+        // Every argument register at once, in order — a pair swapped would
+        // still answer a number, just the wrong one.
+        ("print(four(1, 2, 3, 4));", "1234"),
+        // Each argument the result of a call, so every one of them is live
+        // across a later call and none may sit where a call destroys it.
+        ("print(four(one(0), one(1), one(2), one(3)));", "1234"),
+        // A call inside a call's own argument list, at the last position.
+        ("print(four(1, 2, 3, one(3)));", "1234"),
+        // Returning an aggregate spends an argument register on the hidden
+        // address of the caller's room, leaving three — so this is the full
+        // house for a function that returns one.
+        ("Point p = build(1, 2, 3);\nprint(p.x * 10 + p.y);", "1023"),
+        // The returned object outlives the call that built it, and a second
+        // call must not land on top of the first one's room.
+        (
+            "Point a = build(1, 2, 3);\nPoint b = build(4, 5, 6);\n\
+             print(a.x * 10000 + b.x);",
+            "1020405",
+        ),
+        // Recursion deep enough that the frames have to be right hundreds of
+        // times over, not just once.
+        ("print(depth(500));", "500"),
+        ("print(total(1000));", "500500"),
+        // A call in a loop condition, evaluated afresh each time round.
+        (
+            "int n = 0;\nwhile (one(n) < 10) {\n  n = n + 1;\n}\nprint(n);",
+            "9",
+        ),
+        // Values that must survive a call made between their definition and
+        // their use — more of them than there are registers to hold.
+        (
+            "int a = 1; int b = 2; int c = 3; int d = 4; int e = 5;\n\
+             int f = 6; int g = 7; int h = 8;\n\
+             print(one(0) + a + b + c + d + e + f + g + h);",
+            "37",
+        ),
+    ];
+
+    harness.each_prints_after("call", prelude, &cases);
+}
+
+/// Code that never runs still has to be code.
+///
+/// A loop whose condition starts false, an `if` with nothing on the other side,
+/// a function with an empty body: each emits a block that is jumped over. If
+/// the jump goes to the wrong place, or a frame is set up and not released, the
+/// failure is not a wrong answer — it is a crash, or a program that never ends.
+#[test]
+fn a_body_that_never_runs_leaves_everything_as_it_was() {
+    let Some(harness) = Harness::find() else { return };
+
+    let prelude = "fn nothing() {\n}\n\
+                   fn nothing_twice() {\n  if (true) {\n  }\n  while (false) {\n  }\n}\n";
+    let cases: [(&str, &str); 10] = [
+        ("nothing();\nprint(1);", "1"),
+        ("nothing_twice();\nprint(2);", "2"),
+        // A `while` whose condition is false from the start.
+        ("int n = 0;\nwhile (n > 0) {\n  n = n + 1;\n}\nprint(n);", "0"),
+        // A `for` whose range is empty, including one that never could run.
+        ("int n = 0;\nfor (int i = 0; i < 0; i = i + 1) {\n  n = n + 1;\n}\nprint(n);", "0"),
+        ("int n = 0;\nfor (int i = 5; i < 3; i = i + 1) {\n  n = n + 1;\n}\nprint(n);", "0"),
+        // An `if` with no `else`, taken and not taken.
+        ("int n = 1;\nif (n > 5) {\n  n = 99;\n}\nprint(n);", "1"),
+        ("int n = 1;\nif (n < 5) {\n  n = 99;\n}\nprint(n);", "99"),
+        // An empty block in the middle of a function, which must not disturb
+        // what is around it.
+        ("int n = 1;\nif (true) {\n}\nn = n + 1;\nprint(n);", "2"),
+        // A loop that runs exactly once, which is the boundary either side of
+        // the two above.
+        ("int n = 0;\nfor (int i = 0; i < 1; i = i + 1) {\n  n = n + 1;\n}\nprint(n);", "1"),
+        // A `break` on the first pass, so the body runs once and the loop ends
+        // without the condition ever being false.
+        ("int n = 0;\nwhile (true) {\n  n = n + 1;\n  break;\n}\nprint(n);", "1"),
+    ];
+
+    harness.each_prints_after("empty", prelude, &cases);
 }

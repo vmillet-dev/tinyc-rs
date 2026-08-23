@@ -3056,4 +3056,119 @@ mod tests {
         );
         assert_eq!(asm.matches("call fib").count(), 3, "{asm}"); // twice inside, once from main
     }
+
+    // -- the shape of a whole file ----------------------------------------
+    //
+    // Everything above compiles a fragment and looks for one instruction.
+    // These four are about the file as a whole, over the checked-in examples:
+    // the assertions that used to live in `tests/error_positions.rs` and did
+    // not belong there, because `push`, `ret` and a `$` in a symbol are facts
+    // about *this* backend and no other.
+
+    /// The examples these tests compile.
+    ///
+    /// `examples/hello.tc` is deliberately absent: it is a scratch file for
+    /// trying things out by hand, so it is allowed to be broken at any time.
+    const EXAMPLES: [&str; 12] = [
+        "arith.tc",
+        "spill.tc",
+        "reassign.tc",
+        "bool.tc",
+        "control_flow.tc",
+        "functions.tc",
+        "enums.tc",
+        "arrays.tc",
+        "classes.tc",
+        "strings.tc",
+        "lists.tc",
+        "interactive.tc",
+    ];
+
+    fn compile_example(file: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples").join(file);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        compile_src(&text)
+    }
+
+    #[test]
+    fn the_file_declares_the_entry_point_the_c_runtime_calls() {
+        for file in EXAMPLES {
+            let asm = compile_example(file);
+            assert!(asm.contains("global main"), "{file}: nothing for the linker to start from");
+            assert!(asm.contains("section .text"), "{file}: no code section");
+            assert!(!functions_in(&asm).is_empty(), "{file}: no function was recognised");
+        }
+    }
+
+    /// Every path out of a function undoes its prologue exactly once.
+    ///
+    /// A function with two `return`s has two epilogues, so the counts balance
+    /// per exit, not per file. Getting this wrong does not produce wrong
+    /// arithmetic — it corrupts the caller's stack, which is the kind of
+    /// mistake that shows up somewhere else entirely.
+    #[test]
+    fn every_function_undoes_its_prologue_on_every_path() {
+        for file in EXAMPLES {
+            let asm = compile_example(file);
+            for (name, body) in functions_in(&asm) {
+                // The runtime helpers are jumped to and never come back, so
+                // they have neither a prologue nor an epilogue to balance.
+                if is_runtime_symbol(name) {
+                    continue;
+                }
+                let pushes = body.matches("push ").count();
+                let exits = body.matches("\n    ret\n").count();
+                assert!(exits > 0, "{file}: {name} never returns");
+                assert_eq!(
+                    body.matches("pop  ").count(),
+                    pushes * exits,
+                    "unbalanced prologue in {file}: {name}"
+                );
+                // A leaf that spills nothing reserves no frame, and so has
+                // nothing to release — but a `sub` without a matching `add` on
+                // some path would leave the stack wrong.
+                let reserved = body.matches("sub  rsp,").count();
+                assert_eq!(
+                    body.matches("add  rsp,").count(),
+                    reserved * exits,
+                    "{file}: {name} does not release its frame on every path"
+                );
+            }
+        }
+    }
+
+    /// Every symbol the assembly defines, other than the entry point, must be
+    /// one no TinyC function and no string literal can also claim.
+    ///
+    /// See the module docs: a program with `fn printf()` would otherwise define
+    /// the very label `print` compiles a call to — something that assembles,
+    /// links, runs, and silently does the wrong thing.
+    #[test]
+    fn generated_symbols_cannot_collide_with_a_tinyc_function() {
+        for file in EXAMPLES {
+            let asm = compile_example(file);
+            for (name, _) in functions_in(&asm) {
+                assert!(
+                    name == "main" || name.contains('$'),
+                    "{file}: `{name}` is a bare symbol a TinyC function could also define"
+                );
+            }
+        }
+    }
+
+    /// A `$` is what separates the two namespaces, and only the entry point is
+    /// allowed to sit outside them.
+    #[test]
+    fn the_prefixes_keep_the_two_namespaces_apart() {
+        // A TinyC function called `rt` must not become a runtime symbol, which
+        // is the collision `tc$rt$` is shaped to make impossible.
+        let asm = compile_src(
+            "fn rt() -> int {\n  return 1;\n}\nfn main() {\n  print(rt());\n}\n",
+        );
+        let names: Vec<&str> = functions_in(&asm).into_iter().map(|(name, _)| name).collect();
+        assert!(names.contains(&"tc$rt"), "{names:?}");
+        assert!(!names.iter().any(|n| is_runtime_symbol(n) && *n == "tc$rt"), "{names:?}");
+        assert!(!is_runtime_symbol("tc$rt"), "a function called `rt` is not a runtime helper");
+        assert!(is_runtime_symbol("tc$rt$concat"), "a real helper is one");
+    }
 }
