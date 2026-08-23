@@ -2214,7 +2214,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             (Ty::Char | Ty::Int, Ty::Str) => {}
             // And a whole list of characters at once, which is how a string is
             // built a character at a time without paying for a new string on
-            // every one — see the note on `+` in the README.
+            // every one — see the note on `+` in `docs/architecture.md`.
             (Ty::List(id), Ty::Str)
                 if self.shared.declared.table.element(id) == Ty::Char => {}
             (Ty::Int, Ty::Char) => {
