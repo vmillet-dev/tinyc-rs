@@ -207,6 +207,12 @@ pub enum Runtime {
     ListPush,
     /// `(s) -> int`: the number a string spells, refusing anything else.
     StrToInt,
+    /// `(s) -> bool`: whether [`Runtime::StrToInt`] would answer rather than
+    /// stop the program.
+    ///
+    /// The two are one routine asked two ways — see the backend — so they
+    /// cannot come to disagree about what a number is.
+    IsInt,
     /// `() -> string`: one line of input, without its line ending.
     ReadLine,
     /// `() -> bool`: whether the input has run out, asked without consuming
@@ -236,6 +242,7 @@ impl Runtime {
             Runtime::ListClone => "list_clone",
             Runtime::CharsToStr => "chars_str",
             Runtime::StrToInt => "str_int",
+            Runtime::IsInt => "is_int",
             Runtime::ReadLine => "read_line",
             Runtime::Eof => "eof",
         }
@@ -247,6 +254,7 @@ impl Runtime {
         match builtin {
             Builtin::ReadLine => Runtime::ReadLine,
             Builtin::Eof => Runtime::Eof,
+            Builtin::IsInt => Runtime::IsInt,
         }
     }
 }
@@ -1695,11 +1703,20 @@ impl Lowering<'_> {
     }
 
     /// What a place *holds*, which for anything but a variable means reading it.
+    ///
+    /// An aggregate is the exception, and it is the same exception an element
+    /// and a field make when they are read as expressions: what a place of that
+    /// type holds does not fit in a register, so its *address* is the value.
+    /// Reading eight bytes out of it would produce an object's vtable pointer
+    /// rather than the object, which is the address of nothing at all.
     fn place_value(&mut self, place: &Place) -> Value {
         match place {
             Place::Var { name, .. } => Value::Reg(self.lookup(name)),
             other => {
                 let addr = self.place_address(other);
+                if !self.place_type(other).fits_in_a_register() {
+                    return Value::Reg(addr);
+                }
                 let dst = self.fresh_temp();
                 self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
                 Value::Reg(dst)
@@ -1773,8 +1790,15 @@ impl Lowering<'_> {
                     unreachable!("sema rejects a field on anything but an object");
                 };
                 let object = self.expr(object);
-                let addr = self.field_address(object, id, name);
-                self.emit(Instr::Load { dst, addr: Value::Reg(addr) });
+                let addr = Value::Reg(self.field_address(object, id, name));
+                // A field that is itself an aggregate *is* its address, exactly
+                // as an element of one is: it lives inside the object, so there
+                // is nothing to read out and nothing to copy until somebody
+                // says where to.
+                match self.types.of(expr.id).fits_in_a_register() {
+                    true => self.emit(Instr::Load { dst, addr }),
+                    false => self.emit(Instr::Copy { dst, src: addr }),
+                }
             }
             ExprKind::MethodCall { .. } => self.method_call(Some(dst), expr),
             // A list literal reserves nothing in the frame: its elements live
@@ -2322,6 +2346,48 @@ mod tests {
             ir.table.class(ClassId(1)).fields.iter().map(|f| f.offset).collect();
         // The vtable pointer takes offset 0.
         assert_eq!(offsets, vec![8, 16]);
+    }
+
+    #[test]
+    fn an_aggregate_field_is_its_address_rather_than_something_to_read() {
+        // The rule an element already followed: a value too big for a register
+        // *is* where it lives. Reading eight bytes out of `s.b` would produce
+        // the inner object's vtable pointer, and writing through that would
+        // land in the vtable rather than in the object.
+        let ir = lower_src(
+            "class Point {\n  int x;\n}\n\
+             class Segment {\n  Point a;\n  Point b;\n}\n\
+             fn main() {\n  \
+             Segment s = Segment { a: Point { x: 1 }, b: Point { x: 2 } };\n  \
+             s.b.x = 3;\n  \
+             print(s.b.x);\n}",
+        );
+        // `b` starts past the whole of `a`, rather than one register after it.
+        let offsets: Vec<u32> =
+            ir.table.class(ClassId(1)).fields.iter().map(|f| f.offset).collect();
+        assert_eq!(offsets, vec![8, 24]);
+
+        let main = ir.functions.iter().find(|f| f.name == "main").expect("main survives");
+        let loads =
+            main.blocks[0].instrs.iter().filter(|i| matches!(i, Instr::Load { .. })).count();
+        // One, and it is the `print`. Reaching `s.b` to write through it reads
+        // nothing at all.
+        assert_eq!(loads, 1, "{}", ir.dump());
+    }
+
+    #[test]
+    fn writing_through_an_element_that_is_an_object_reaches_the_element() {
+        let ir = lower_src(
+            "class Point {\n  int x;\n}\n\
+             fn main() {\n  \
+             Point[2] ps = [Point { x: 1 }, Point { x: 2 }];\n  \
+             ps[1].x = 7;\n  \
+             print(ps[1].x);\n}",
+        );
+        let main = ir.functions.iter().find(|f| f.name == "main").expect("main survives");
+        let loads =
+            main.blocks[0].instrs.iter().filter(|i| matches!(i, Instr::Load { .. })).count();
+        assert_eq!(loads, 1, "{}", ir.dump());
     }
 
     #[test]
@@ -3326,6 +3392,12 @@ mod tests {
             .filter(|i| matches!(i, Instr::RtCall { callee: Runtime::ReadLine, dst: None, .. }))
             .collect();
         assert_eq!(calls.len(), 1, "{}", ir.dump());
+
+        // A built-in that takes something is no different: the argument is
+        // lowered where it stands and travels as an operand.
+        let ir = lower_main("print(is_int(\"42\"));");
+        assert!(routines(&ir).contains(&Runtime::IsInt), "{}", ir.dump());
+        assert!(!instrs(&ir).iter().any(|i| matches!(i, Instr::Call { .. })), "{}", ir.dump());
     }
 
     #[test]

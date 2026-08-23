@@ -159,8 +159,8 @@ joins two strings, `&&`, `||` and `!` are `bool`-only, `//` starts a comment, an
 a variable keeps the type it was declared with — assigning a `string` to an
 `int` is an error.
 
-Two functions come with the language rather than being declared —
-`read_line() -> string` and `eof() -> bool`, see
+Three functions come with the language rather than being declared —
+`read_line() -> string`, `eof() -> bool` and `is_int(string) -> bool`, see
 [Reading input](#reading-input) — and a program cannot take their names.
 
 There is no implicit truth test either, so `!n` on an `int` is a type error
@@ -270,10 +270,11 @@ A subclass's fields are its base's plus more, at the same offsets — so a
 costs not one instruction. The other direction is a type error: no `Shape` is
 known to be a `Circle`.
 
-Every value in TinyC is eight bytes, so a field's offset is its position and a
-field access is one `lea` with nothing to check. That is the same arithmetic an
-array index does, minus the bounds check — a field's place was settled at
-compile time and cannot be out of range.
+A field access is one `lea` with nothing to check: the same arithmetic an array
+index does, minus the bounds check — a field's place was settled at compile time
+and cannot be out of range. The offset stopped being the field's *position* the
+moment a field could be an array or another object; it is the sum of the sizes
+in front of it. See [Composition](#composition).
 
 #### Dispatch decided by the object, and by the compiler when it can
 
@@ -344,6 +345,81 @@ travels outward, so none can dangle. The cost is one of the four argument
 registers, which `sema` accounts for — a function returning an aggregate takes
 at most three parameters, and says so when it takes four.
 
+#### Composition
+
+A field may be an array or another object, and what a class holds it holds
+**inside itself** ([`examples/composition.tc`](examples/composition.tc)):
+
+```c
+class Point {
+  int x;
+  int y;
+}
+
+class Segment {
+  Point a;        // a whole `Point`, not the address of one
+  Point b;
+}
+```
+
+```
+Segment:  [ vtable ][ a: [ vtable ][ x ][ y ] ][ b: [ vtable ][ x ][ y ] ]
+            0         8                          32
+```
+
+Everything else follows from that one change:
+
+* **A copy carries the whole tree.** `Segment t = s;` copies the bytes of both
+  points, so writing through `s.a` afterwards is invisible through `t`. Nothing
+  new had to be said for that — an object was always copied outright, and now
+  there is simply more of it.
+* **`s.a` is an address, not something read out of the object.** A `Point` does
+  not fit in a register, so reaching into one is arithmetic on the outer
+  object's address and nothing is loaded until a scalar is. It is the rule
+  `xs[i]` already followed when the elements were objects.
+* **A field may be any class in a hierarchy**, and it reserves the room the
+  biggest of them needs — the same `storage` a local of that class would. So a
+  `Holder { Shape held; }` may hold a `Circle`, and the vtable pointer travels
+  with the copy.
+
+**What an object contains is a tree, never a graph.** There is no reference type
+to close a ring with, so a class that would contain itself — directly, through
+another class, or through an array — is refused rather than represented:
+
+```
+error: `Node` cannot contain a `Node`
+  |
+6 |   Node next;
+  |   ^^^^ a field lives inside the object, so its room is part of this one's
+  = note: TinyC has no reference type, so what an object holds it holds outright
+```
+
+A linked list is simply not a shape this language describes; `int[]` is what
+holds a quantity that grows.
+
+**The order the classes are laid out in** is what makes any of this answerable,
+and two rules decide it. A class's fields follow its base's, so a base is
+measured first. And a field holding an object reserves that object's room, so
+whatever it names is measured first too — which means the compiler walks the
+containments before it measures anything, in hierarchies rather than in classes,
+because every class in a hierarchy reserves the same amount. That last point is
+why `class A { B b; }` with `class B : A {}` is the same error as
+`class A { A a; }`.
+
+**Containment multiplies, and the frame does not.** An object lives in the
+frame, so a class holding a thousand rows of a thousand `int`s would be eight
+megabytes of stack. It is a diagnostic rather than a crash in a program that
+compiled:
+
+```
+error: `Grid` is too big
+  |
+8 | class Grid {
+  |       ^^^^ 8396808 bytes, and at most 65536 are supported
+  = note: an object lives in the frame, and containment multiplies; `int[]` is
+    what holds a quantity the frame cannot
+```
+
 #### What objects still may not do
 
 * **An object is complete or it does not exist.** Every field is named in the
@@ -351,8 +427,10 @@ at most three parameters, and says so when it takes four.
   which is what removes the question `null` would have answered.
 * **No printing and no comparing.** `print` takes one value, and comparing
   addresses would quietly answer a different question.
-* **A field may not be an array or another object**, which keeps every offset a
-  multiple of eight.
+* **A field may not be a list.** Everything else nests — see
+  [Composition](#composition) — because it lives inside the object and is
+  copied along with it. A list's elements live in the arena, so a field would
+  hold only their address and a copy would share them rather than copy them.
 * **A class may not take an enum's name, or another class's.** A type name is
   resolved to one type and there is nowhere for a second to go, so the loser
   would be a declaration no program could ever name. The compiler says so
@@ -479,7 +557,7 @@ is written out, and these four conversions are the whole list:
 | Written | Gives | Fails when |
 |---|---|---|
 | `int(c)` | a character's code point | never |
-| `int(s)` | the number a string spells | the text is not a number an `int` can hold |
+| `int(s)` | the number a string spells | the text is not a number an `int` can hold — ask `is_int(s)` first |
 | `char(n)` | the character with that code point | `n` names none — checked at compile time when it is a constant, at run time otherwise |
 | `string(c)` | a string of that one character | never |
 | `string(n)` | a number written out in decimal | never |
@@ -634,7 +712,11 @@ aliases" true without exception.
 A list holds what fits in a register: `int`, `string`, `char`, `bool`, and any
 enum. Not an object, which would have to be copied rather than moved on every
 growth — and not another list, which would put the aliasing back by the side
-door. A field of a class cannot be a list yet for that second reason.
+door. A field of a class cannot be a list for that second reason read the other
+way round: an object is copied outright, so the copy would share the elements
+rather than copy them. Everything that is not a list does nest in an object —
+see [Composition](#composition) — precisely because it lives *inside* the
+object rather than in the arena.
 
 ### What lists changed underneath
 
@@ -676,7 +758,7 @@ makes the arena safe to grow things in.
 
 ### Reading input
 
-Two functions the compiler provides, and the first programs that do not know
+Three functions the compiler provides, and the first programs that do not know
 what they will be given ([`examples/interactive.tc`](examples/interactive.tc)):
 
 ```c
@@ -709,16 +791,45 @@ units, and no settling for zero when the text is not a number at all. A number
 too large for an `int` is refused for the same reason arithmetic that overflows
 is.
 
+**`is_int(s)` is how you ask first**, and it is there for exactly the reason
+`eof()` is. Stopping the program is the right answer to a mistake *in the
+program* — an index out of range, an overflow. Text that spells no number is
+not that: it is the data, and a program that reads what it was given has to be
+able to handle it.
+
+```c
+string line = read_line();
+if (is_int(line)) {
+  print(int(line) * 2);
+} else {
+  print("that is not a number");
+}
+```
+
+Nothing a program could write itself would do. A loop over the characters gets
+most of the way, and then cannot answer the last question: whether nineteen
+digits still *fit* in an `int` is decided by an overflow, and performing the
+overflow is what stops the program. So the language answers it — and the two
+are **one routine asked two ways** (`tc$rt$parse_int`, which `int(s)` calls and
+aborts on and `is_int(s)` calls and reports), so they cannot drift apart about
+what a number is.
+
+`char(n)` needs no equivalent, and the difference is worth naming: a program
+*can* ask that one for itself, with the comparisons `int` already has. `int(s)`
+was the only conversion whose question could not be asked in the language.
+
 ### What input changed underneath
 
 **The first functions the compiler provides.** `len` and `push` are *constructs*
 because no signature could describe them: one takes several unrelated types, the
-other takes a place rather than a value. `read_line` and `eof` have signatures a
-TinyC program could have written itself, so they are not syntax at all — they
-are two names already in the signature table when the first line is checked,
-reached through the ordinary call machinery, and differing from a declared
-function only in having no body to compile. A program that tries to declare one
-of their names collides with something already there:
+other takes a place rather than a value. `read_line`, `eof` and `is_int` have
+signatures a TinyC program could have written itself, so they are not syntax at
+all — they are names already in the signature table when the first line is
+checked, reached through the ordinary call machinery, and differing from a
+declared function only in having no body to compile. `is_int` is the first that
+takes something, and it needed no new machinery for that: its argument is
+checked by whatever checks every other call's. A program that tries to declare
+one of their names collides with something already there:
 
 ```
 error: `eof` is built in and cannot be redefined
@@ -1186,6 +1297,11 @@ system, `int(s)` on text that is not a number, a line asked for when there is
 none, input that is not valid UTF-8, and input the operating system refuses to
 hand over. **Ten ways to stop, one routine to report them, and not one of them
 answers wrongly instead.**
+
+Two of those ten are about the *data* rather than about the program, and each
+has a question that avoids it: `eof()` before `read_line()`, and `is_int(s)`
+before `int(s)`. Stopping is the right answer to a mistake in the program; it
+is not an answer to input a program was always going to be given.
 
 The rule is checked in whichever of two places can see it:
 

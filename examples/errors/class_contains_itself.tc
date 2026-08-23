@@ -1,0 +1,10 @@
+// An object holds its fields inside it, so this one would have to be bigger
+// than itself. TinyC has no reference type to break the ring with, which is
+// why a linked list is not a shape this language can describe.
+class Node {
+  int value;
+  Node next;
+}
+
+fn main() {
+}

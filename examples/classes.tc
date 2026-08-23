@@ -44,9 +44,10 @@ class Sealed {
   }
 }
 
-// `s` is an address borrowed from the caller. There is no way to keep it —
-// objects are not returned, not stored in anything, and do not nest — so it
-// cannot outlive the object it points at.
+// `s` is an address borrowed from the caller, and there is no way to keep it:
+// no reference type, no globals, and what an object stores it stores *inside*
+// itself rather than by address — see `composition.tc`. So it cannot outlive
+// the object it points at.
 fn report(Shape s) {
   print(s.name());
   print(s.area());

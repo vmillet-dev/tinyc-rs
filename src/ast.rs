@@ -153,15 +153,21 @@ impl TypeTable {
 
     /// How many bytes a value of this type occupies where it is *stored*.
     ///
-    /// Everything that fits in a register is eight, which is what makes a
-    /// field's offset its position. An object takes its hierarchy's room, and
-    /// an array its length times whatever it holds.
+    /// Everything that fits in a register is eight. An object takes its
+    /// hierarchy's room, and an array its length times whatever it holds — so
+    /// a field's offset is the sum of the sizes in front of it rather than its
+    /// position, ever since an object could hold either of those.
+    ///
+    /// Saturating, because this is asked of programs that have already been
+    /// refused: `sema` stops a class too big for the frame, and the answer to
+    /// one written a thousand times bigger still has to be that diagnostic
+    /// rather than a compiler that panics.
     pub fn size_of(&self, ty: Ty) -> u32 {
         match ty {
             Ty::Class(id) => self.class(id).storage,
             Ty::Array(id) => {
                 let info = self.array(id);
-                info.len * self.size_of(info.elem)
+                info.len.saturating_mul(self.size_of(info.elem))
             }
             _ => 8,
         }
@@ -436,28 +442,41 @@ pub enum Builtin {
     /// Answers *before* consuming anything, so `while (!eof())` reads every
     /// line and asks for none that is not there.
     Eof,
+    /// `is_int(string) -> bool` — whether `int(s)` would answer.
+    ///
+    /// The same bargain [`Self::Eof`] strikes with [`Self::ReadLine`], one type
+    /// further along: `int(s)` stops the program on text that spells no number,
+    /// and text that spells no number is *data* rather than a mistake in the
+    /// program — so there has to be a way to find out first. Nothing a program
+    /// could write itself would do: the overflow that decides whether a
+    /// nineteen-digit number fits can only be found by performing it, and
+    /// performing it is what stops the program.
+    IsInt,
 }
 
 impl Builtin {
-    pub const ALL: [Builtin; 2] = [Builtin::ReadLine, Builtin::Eof];
+    pub const ALL: [Builtin; 3] = [Builtin::ReadLine, Builtin::Eof, Builtin::IsInt];
 
     pub fn name(self) -> &'static str {
         match self {
             Builtin::ReadLine => "read_line",
             Builtin::Eof => "eof",
+            Builtin::IsInt => "is_int",
         }
     }
 
-    /// What it takes. Neither takes anything yet, and the array is here so that
-    /// one that does needs no new machinery.
+    /// What it takes.
     pub fn params(self) -> &'static [Ty] {
-        &[]
+        match self {
+            Builtin::ReadLine | Builtin::Eof => &[],
+            Builtin::IsInt => &[Ty::Str],
+        }
     }
 
     pub fn ret(self) -> Option<Ty> {
         match self {
             Builtin::ReadLine => Some(Ty::Str),
-            Builtin::Eof => Some(Ty::Bool),
+            Builtin::Eof | Builtin::IsInt => Some(Ty::Bool),
         }
     }
 
@@ -1564,10 +1583,14 @@ mod tests {
     fn a_builtin_is_found_by_the_name_it_answers_to_and_by_no_other() {
         for builtin in Builtin::ALL {
             assert_eq!(Builtin::from_name(builtin.name()), Some(builtin));
-            assert!(builtin.params().is_empty(), "neither takes anything yet");
+            // Every one answers something: a built-in called for its effect
+            // would have nothing to distinguish it from a statement.
+            assert!(builtin.ret().is_some());
         }
         assert_eq!(Builtin::ReadLine.ret(), Some(Ty::Str));
         assert_eq!(Builtin::Eof.ret(), Some(Ty::Bool));
+        assert_eq!(Builtin::IsInt.params(), &[Ty::Str]);
+        assert_eq!(Builtin::IsInt.ret(), Some(Ty::Bool));
         assert_eq!(Builtin::from_name("print"), None);
         assert_eq!(Builtin::from_name(""), None);
     }

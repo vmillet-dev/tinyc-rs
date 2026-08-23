@@ -222,12 +222,57 @@ fn already_declared(name: &str, at: Span, previous: Span) -> Diagnostic {
 /// Bytes an object spends on its vtable pointer, which sits at offset 0.
 const VPTR_SIZE: u32 = 8;
 
+/// How much room one object may take.
+///
+/// Not a limit of the representation but of the *stack*: an object lives in the
+/// frame, and containment multiplies — a class holding a thousand of something
+/// that itself holds a thousand `int`s is eight megabytes, which no thread has.
+/// The limit is what turns that into a diagnostic rather than a crash in a
+/// program that compiled. A list is what holds a quantity the frame cannot.
+pub const MAX_OBJECT_BYTES: u32 = 64 * 1024;
+
+/// A field whose type is settled but whose place in the object is not yet.
+///
+/// Resolving every field before measuring anything is what makes the layout
+/// *orderable*: a field holding an object reserves that object's room, so what
+/// a class contains has to be known before it can be given a size.
+#[derive(Clone)]
+struct ResolvedField {
+    name: String,
+    name_span: Span,
+    ty: Ty,
+    /// The type as written, which is what a diagnostic about it underlines.
+    ty_span: Span,
+}
+
+/// One class holding another, as the graph [`containment_order`] walks sees it.
+///
+/// The field travels with the edge because it is what a diagnostic points at: a
+/// containment that cannot be laid out is reported where it was *written*,
+/// rather than on the class that suffers from it.
+#[derive(Clone, Copy)]
+struct Contains {
+    /// The hierarchy reached, which is what has to be measured first.
+    to: ClassId,
+    /// The class whose field this is, and which of its fields.
+    owner: ClassId,
+    field: usize,
+}
+
+/// Where a hierarchy is in the walk: unvisited, on the path being followed, or
+/// finished. Reaching one that is still on the path *is* the cycle.
+#[derive(Clone, Copy, PartialEq)]
+enum Mark {
+    Unseen,
+    OnThePath,
+    Measured,
+}
+
 /// Pass 0b: resolve base classes, lay every object out, and settle the vtables.
 ///
 /// Names are registered first so that a field may mention any class and a base
-/// may be declared after its subclass. What has to happen in order is *layout*:
-/// a class's fields follow its base's, so a base is laid out before anything
-/// that extends it.
+/// may be declared after its subclass. What has to happen in order is *layout*,
+/// and two rules decide that order — see [`containment_order`].
 fn collect_classes(program: &Program, declared: &mut Declared, errors: &mut Vec<Diagnostic>) {
     // Every name first, with a placeholder layout, so the rest can refer to it.
     for class in &program.classes {
@@ -273,74 +318,293 @@ fn collect_classes(program: &Program, declared: &mut Declared, errors: &mut Vec<
         declared.table.classes[id.0 as usize].base = Some(base);
     }
 
-    // Layout, bases first. Every value in TinyC is eight bytes wide, so a
-    // field's place is its position — the same arithmetic an array index does.
-    for id in layout_order(declared) {
-        let class = &program.classes[declarations_index(program, declared, id)];
-        let base = declared.table.classes[id.0 as usize].base;
+    // What every class holds, before any of it is measured, and then the order
+    // the measuring has to happen in.
+    let fields = resolve_fields(program, declared, errors);
+    let order = containment_order(declared, &fields, errors);
+    lay_out(declared, &fields, &order, errors);
+}
 
-        let mut fields = match base {
-            Some(base) => declared.class(base).fields.clone(),
-            None => Vec::new(),
-        };
-        let mut offset = fields.last().map_or(VPTR_SIZE, |f| f.offset + 8);
-
+/// Turn every field's written type into the type it names.
+///
+/// The one type refused is a list, and the reason is the whole difference
+/// between the two kinds of aggregate. An array or an object lives *inside* the
+/// object that holds it, so copying the outer one copies it too. A list's
+/// elements live in the arena and a field would hold only their address — so
+/// two objects would end up naming one list, and writing through either would
+/// be visible through the other.
+fn resolve_fields(
+    program: &Program,
+    declared: &mut Declared,
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<Vec<ResolvedField>> {
+    let mut resolved = vec![Vec::new(); declared.table.classes.len()];
+    for (id, class) in order_of_declarations(program, declared) {
         for field in &class.fields {
-            let ty = resolve_type(declared, &field.ty, errors).unwrap_or(Ty::Int);
-            // A list would *fit* — it is one pointer — and that is exactly the
-            // trap. Copying an object copies its fields, so two objects would
-            // end up naming one list, and writing through either would be
-            // visible through the other. Every other type in the language
-            // either cannot be written to or is copied outright.
-            if !ty.fits_in_a_register() || matches!(ty, Ty::List(_)) {
+            let Some(ty) = resolve_type(declared, &field.ty, errors) else { continue };
+            if matches!(ty, Ty::List(_)) {
                 errors.push(
                     Diagnostic::new(
                         format!("a field cannot be {}", ty.with_article(&declared.table)),
                         field.ty.span,
                     )
-                    .with_label("every field of an object is one value")
+                    .with_label(
+                        "a list's elements live in the arena, and a field would hold their address",
+                    )
                     .with_note(
-                        "arrays, objects and lists do not nest in an object yet — copying one \
-                         would share what it holds rather than copy it",
+                        "copying the object would share them rather than copy them — an array \
+                         or another object nests, because it lives inside the object itself",
                         None,
                     ),
                 );
                 continue;
             }
-            if fields.iter().any(|f| f.name == field.name) {
-                errors.push(
-                    Diagnostic::new(
-                        format!("`{}` already has a field `{}`", class.name, field.name),
-                        field.name_span,
-                    )
-                    .with_label("a field may only be named once, base classes included"),
-                );
-                continue;
+            resolved[id.0 as usize].push(ResolvedField {
+                name: field.name.clone(),
+                name_span: field.name_span,
+                ty,
+                ty_span: field.ty.span,
+            });
+        }
+    }
+    resolved
+}
+
+/// The class a field of this type puts *inside* the object, if any.
+///
+/// An array holds its elements where it is, so an array of objects contains its
+/// element class as surely as a bare field of it does. Everything else is one
+/// register wide and contains nothing.
+fn contained_class(table: &TypeTable, ty: Ty) -> Option<ClassId> {
+    match ty {
+        Ty::Class(id) => Some(id),
+        Ty::Array(id) => contained_class(table, table.array(id).elem),
+        _ => None,
+    }
+}
+
+/// The order the classes have to be measured in, hierarchy by hierarchy.
+///
+/// Two rules meet here, and both are about what has to have a size first. A
+/// class's fields follow its base's, so a base comes first — the prefix rule
+/// that makes an upcast free. And a field holding an object reserves that
+/// object's room, so whatever it names has to have been measured already.
+///
+/// The second rule is about a whole *hierarchy* rather than one class, because
+/// every class in one reserves the same [`ClassInfo::storage`]: the biggest of
+/// them. So the graph walked here has one node per hierarchy, and a cycle in it
+/// is a class that would have to be bigger than itself. TinyC has no reference
+/// type to break one with, so a cycle is refused rather than represented — what
+/// comes back is the hierarchy *roots*, each after everything it contains.
+fn containment_order(
+    declared: &Declared,
+    fields: &[Vec<ResolvedField>],
+    errors: &mut Vec<Diagnostic>,
+) -> Vec<ClassId> {
+    let ids: Vec<ClassId> = (0..declared.table.classes.len() as u32).map(ClassId).collect();
+
+    let mut edges: HashMap<ClassId, Vec<Contains>> = HashMap::new();
+    for &id in &ids {
+        let from = declared.table.root_of(id);
+        for (at, field) in fields[id.0 as usize].iter().enumerate() {
+            if let Some(held) = contained_class(&declared.table, field.ty) {
+                let to = declared.table.root_of(held);
+                edges.entry(from).or_default().push(Contains { to, owner: id, field: at });
             }
-            fields.push(FieldInfo { name: field.name.clone(), ty, offset });
-            offset += 8;
+        }
+    }
+
+    let mut walk = Walk {
+        edges,
+        marks: vec![Mark::Unseen; ids.len()],
+        path: Vec::new(),
+        order: Vec::new(),
+        declared,
+        fields,
+    };
+    for &id in &ids {
+        if declared.table.root_of(id) == id && walk.marks[id.0 as usize] == Mark::Unseen {
+            walk.measure_after(id, errors);
+        }
+    }
+    walk.order
+}
+
+/// One walk over the containment graph, held together so that following an edge
+/// is one call rather than eight arguments.
+struct Walk<'a> {
+    edges: HashMap<ClassId, Vec<Contains>>,
+    marks: Vec<Mark>,
+    /// The chain of containments being followed, which is what names a ring.
+    path: Vec<Contains>,
+    /// Roots in the order they were finished: each after everything it holds.
+    order: Vec<ClassId>,
+    declared: &'a Declared,
+    fields: &'a [Vec<ResolvedField>],
+}
+
+impl Walk<'_> {
+    /// Visit `root` after everything it contains, and add it once they are in.
+    fn measure_after(&mut self, root: ClassId, errors: &mut Vec<Diagnostic>) {
+        self.marks[root.0 as usize] = Mark::OnThePath;
+        for at in 0..self.edges.get(&root).map_or(0, Vec::len) {
+            let edge = self.edges[&root][at];
+            match self.marks[edge.to.0 as usize] {
+                Mark::Measured => {}
+                // The edge closes a ring. Dropping it is what keeps the rest of
+                // the walk finite; the program is refused either way.
+                Mark::OnThePath => {
+                    errors.push(contains_itself(self.declared, self.fields, &self.path, edge))
+                }
+                Mark::Unseen => {
+                    self.path.push(edge);
+                    self.measure_after(edge.to, errors);
+                    self.path.pop();
+                }
+            }
+        }
+        self.marks[root.0 as usize] = Mark::Measured;
+        self.order.push(root);
+    }
+}
+
+/// The diagnostic for a class that would have to contain itself.
+///
+/// Reported on the field that closes the ring, which is the one that could be
+/// deleted to break it. When the ring passes through other classes the note
+/// names them all, because the field on its own does not look wrong.
+fn contains_itself(
+    declared: &Declared,
+    fields: &[Vec<ResolvedField>],
+    path: &[Contains],
+    closing: Contains,
+) -> Diagnostic {
+    let hop = |edge: &Contains| {
+        let field = &fields[edge.owner.0 as usize][edge.field];
+        format!(
+            "`{}` holds {} in `{}`",
+            declared.class(edge.owner).name,
+            field.ty.with_article(&declared.table),
+            field.name
+        )
+    };
+
+    let field = &fields[closing.owner.0 as usize][closing.field];
+    let diagnostic = Diagnostic::new(
+        format!(
+            "`{}` cannot contain {}",
+            declared.class(closing.owner).name,
+            field.ty.with_article(&declared.table)
+        ),
+        field.ty_span,
+    )
+    .with_label("a field lives inside the object, so its room is part of this one's");
+
+    // The ring is the stretch of the path that leads back to what this edge
+    // reached, and then this edge itself.
+    let from = path.iter().position(|edge| edge.to == closing.to).unwrap_or(0);
+    let ring: Vec<String> = path[from..].iter().chain(std::iter::once(&closing)).map(hop).collect();
+    match ring.len() {
+        1 => diagnostic.with_note(
+            "TinyC has no reference type, so what an object holds it holds outright",
+            None,
+        ),
+        _ => diagnostic.with_note(format!("{}, and round again", ring.join(", ")), None),
+    }
+}
+
+/// Give every field its place, hierarchy by hierarchy, in the order that makes
+/// every size knowable by the time it is needed.
+fn lay_out(
+    declared: &mut Declared,
+    fields: &[Vec<ResolvedField>],
+    order: &[ClassId],
+    errors: &mut Vec<Diagnostic>,
+) {
+    let depth_first = layout_order(declared);
+    for &root in order {
+        let hierarchy: Vec<ClassId> =
+            depth_first.iter().copied().filter(|&id| declared.table.root_of(id) == root).collect();
+        for &id in &hierarchy {
+            lay_out_class(declared, &fields[id.0 as usize], id, errors);
         }
 
-        let info = &mut declared.table.classes[id.0 as usize];
-        info.fields = fields;
-        info.size = offset;
+        // Storage is the biggest size in the *hierarchy*, and the same for
+        // every class in it. That is what lets a value of a base class hold any
+        // of its subclasses without being sliced — and, just as importantly,
+        // what keeps copying `storage` bytes out of the smallest of them in
+        // bounds. It is settled here, before anything containing one of these
+        // classes is measured.
+        let storage =
+            hierarchy.iter().map(|&id| declared.class(id).size).max().unwrap_or(VPTR_SIZE);
+        for &id in &hierarchy {
+            declared.table.classes[id.0 as usize].storage = storage;
+        }
+    }
+}
+
+/// Lay one class out: its base's fields, then its own, each where the one
+/// before it stops.
+fn lay_out_class(
+    declared: &mut Declared,
+    fields: &[ResolvedField],
+    id: ClassId,
+    errors: &mut Vec<Diagnostic>,
+) {
+    let base = declared.class(id).base;
+    let mut laid = match base {
+        Some(base) => declared.class(base).fields.clone(),
+        None => Vec::new(),
+    };
+    // A subclass's own fields start where its base's stop, which is what makes
+    // the base a *prefix* of it: one address serves as both.
+    let mut offset = base.map_or(VPTR_SIZE, |base| declared.class(base).size);
+
+    let name = declared.class(id).name.clone();
+    for field in fields {
+        if laid.iter().any(|f| f.name == field.name) {
+            errors.push(
+                Diagnostic::new(
+                    format!("`{name}` already has a field `{}`", field.name),
+                    field.name_span,
+                )
+                .with_label("a field may only be named once, base classes included"),
+            );
+            continue;
+        }
+        laid.push(FieldInfo { name: field.name.clone(), ty: field.ty, offset });
+        // Saturating, because this is arithmetic on a program that may already
+        // be nonsense: a class of a thousand of a thousand of a thousand does
+        // not fit in the number, and the answer to that is the diagnostic
+        // below rather than a compiler that panics.
+        offset = offset.saturating_add(declared.table.size_of(field.ty));
     }
 
-    // Storage is the biggest size in the *hierarchy*, and the same for every
-    // class in it. That is what lets a value of a base class hold any of its
-    // subclasses without being sliced — and, just as importantly, what keeps
-    // copying `storage` bytes out of the smallest of them in bounds.
-    let ids: Vec<ClassId> = (0..declared.table.classes.len() as u32).map(ClassId).collect();
-    for &id in &ids {
-        let root = declared.table.root_of(id);
-        let storage = ids
-            .iter()
-            .filter(|&&other| declared.table.root_of(other) == root)
-            .map(|&other| declared.class(other).size)
-            .max()
-            .unwrap_or(VPTR_SIZE);
-        declared.table.classes[id.0 as usize].storage = storage;
+    // An object lives in the frame, so what one costs is the stack's business.
+    if offset > MAX_OBJECT_BYTES {
+        let size = match offset == u32::MAX {
+            true => "more than four gigabytes".to_string(),
+            false => format!("{offset} bytes"),
+        };
+        errors.push(
+            Diagnostic::new(format!("`{name}` is too big"), declared.class_spans[id.0 as usize])
+                .with_label(format!("{size}, and at most {MAX_OBJECT_BYTES} are supported"))
+                .with_note(
+                    "an object lives in the frame, and containment multiplies; `int[]` is what \
+                     holds a quantity the frame cannot",
+                    None,
+                ),
+        );
+        // Recorded at the limit rather than at what it asked for, so that a
+        // class holding *this* one multiplies a number that still means
+        // something. Nothing is emitted for a program with an error in it; what
+        // this protects is the rest of the checking.
+        offset = MAX_OBJECT_BYTES;
     }
+
+    let info = &mut declared.table.classes[id.0 as usize];
+    info.fields = laid;
+    info.size = offset;
 }
 
 /// Pass 1b: settle every class's vtable, now that signatures exist.
@@ -1200,13 +1464,26 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 // A run of values has no rendering, and printing its address
                 // would answer a question nobody asked.
                 if !ty.is_printable() {
+                    // A run of values and an object are refused for the same
+                    // reason but answered differently: one has elements to loop
+                    // over, the other has fields to name.
+                    let (label, note) = match ty {
+                        Ty::Class(_) => (
+                            "`print` takes one value, and an object is several",
+                            "print the fields you meant, one at a time",
+                        ),
+                        _ => (
+                            "`print` takes one value, and this is many",
+                            "print the elements in a loop instead",
+                        ),
+                    };
                     self.error(
                         Diagnostic::new(
                             format!("cannot print {}", self.ty_article(ty)),
                             value.span,
                         )
-                        .with_label("`print` takes one value, and this is many")
-                        .with_note("print the elements in a loop instead", None),
+                        .with_label(label)
+                        .with_note(note, None),
                     );
                 }
             }
@@ -2940,6 +3217,30 @@ mod tests {
     }
 
     #[test]
+    fn there_is_a_way_to_ask_before_converting() {
+        // The bargain `eof` strikes with `read_line`, one type further along:
+        // `int(s)` stops the program on text that spells no number, and text
+        // that spells no number is data rather than a mistake.
+        assert!(
+            check_main("string s = read_line();\nif (is_int(s)) {\n  print(int(s));\n}").is_ok()
+        );
+
+        let errors = errors_in_main("print(is_int(42));");
+        assert!(
+            errors[0].message.contains("where a `string` is expected"),
+            "{}",
+            errors[0].message
+        );
+
+        let errors = errors_in_main("int n = is_int(\"1\");");
+        assert!(errors[0].message.contains("with a `bool` value"), "{}", errors[0].message);
+
+        let errors = check_src("fn is_int(string s) -> bool {\n  return true;\n}\nfn main() {\n}\n")
+            .expect_err("`is_int` is taken");
+        assert!(errors[0].message.contains("is built in"), "{}", errors[0].message);
+    }
+
+    #[test]
     fn a_char_list_seals_into_a_string() {
         // The point of the whole feature: characters accumulate in one place
         // that grows, and become a string once.
@@ -3415,23 +3716,136 @@ mod tests {
 
     #[test]
     fn rejects_printing_and_comparing_an_object() {
-        assert!(shape_errors("Circle c = Circle { r: 1 };\nprint(c);")[0]
-            .message
-            .contains("cannot print"));
+        let refused = &shape_errors("Circle c = Circle { r: 1 };\nprint(c);")[0];
+        assert!(refused.message.contains("cannot print"), "{}", refused.message);
+        // An object is not a run of values, so it is not answered like one.
+        assert!(
+            refused.label.as_ref().is_some_and(|text| text.contains("an object is several")),
+            "{:?}",
+            refused.label
+        );
         assert!(shape_errors("Circle c = Circle { r: 1 };\nprint(c == c);")[0]
             .message
             .contains("cannot be compared"));
     }
 
     #[test]
-    fn a_field_cannot_be_an_aggregate_yet() {
+    fn a_field_may_be_an_array_or_another_object() {
+        let types = check_src(
+            "class Point {\n  int x;\n  int y;\n}\n\
+             class Segment {\n  Point a;\n  Point b;\n}\n\
+             class Board {\n  int[4] cells;\n}\n\
+             fn main() {\n}",
+        )
+        .unwrap();
+        let table = types.table();
+        // A `Point` is a vtable pointer and two ints, so the second of the two
+        // a `Segment` holds starts on the far side of the first.
+        let segment = table.class(ClassId(1));
+        assert_eq!(segment.field("a").unwrap().offset, 8);
+        assert_eq!(segment.field("b").unwrap().offset, 8 + 24);
+        assert_eq!(segment.size, 8 + 24 + 24);
+        // An array field takes its whole length with it.
+        assert_eq!(table.class(ClassId(2)).size, 8 + 4 * 8);
+    }
+
+    #[test]
+    fn a_subclass_starts_where_its_base_stops_however_big_that_is() {
+        let types = check_src(
+            "class Point {\n  int x;\n}\n\
+             class Base {\n  Point p;\n}\n\
+             class Derived : Base {\n  int n;\n}\n\
+             fn main() {\n}",
+        )
+        .unwrap();
+        let derived = types.table().class(ClassId(2));
+        assert_eq!(derived.field("p").unwrap().offset, 8);
+        // The prefix rule with a field wider than a register: `n` starts after
+        // the whole `Point`, not eight bytes after it.
+        assert_eq!(derived.field("n").unwrap().offset, 8 + 16);
+    }
+
+    #[test]
+    fn a_field_cannot_be_a_list() {
+        let errors = check_src("class Bag {\n  int[] items;\n}\nfn main() {\n}").unwrap_err();
+        assert!(errors[0].message.contains("a field cannot be"), "{}", errors[0].message);
+    }
+
+    #[test]
+    fn a_class_cannot_contain_itself_however_it_is_reached() {
         for src in [
-            "class A {\n  int[2] xs;\n}\nfn main() {\n}",
-            "class B {\n  int x;\n}\nclass A {\n  B b;\n}\nfn main() {\n}",
+            // Directly.
+            "class Node {\n  Node next;\n}\nfn main() {\n}",
+            // Through an array, which holds its elements where it is.
+            "class Node {\n  Node[2] children;\n}\nfn main() {\n}",
+            // Through another class.
+            "class A {\n  B b;\n}\nclass B {\n  A a;\n}\nfn main() {\n}",
+            // Through a subclass: every class in a hierarchy reserves the room
+            // of the biggest, so holding a `B` is holding an `A`.
+            "class A {\n  B b;\n}\nclass B : A {\n}\nfn main() {\n}",
         ] {
             let errors = check_src(src).unwrap_err();
-            assert!(errors[0].message.contains("a field cannot be"), "{src}: {}", errors[0].message);
+            assert!(errors[0].message.contains("cannot contain"), "{src}: {}", errors[0].message);
         }
+    }
+
+    #[test]
+    fn a_containment_that_is_merely_deep_is_fine() {
+        // The same class held twice is not a cycle: this is a tree, and the
+        // walk has to tell the two apart.
+        assert!(
+            check_src(
+                "class Point {\n  int x;\n}\n\
+                 class Segment {\n  Point a;\n  Point b;\n}\n\
+                 class Path {\n  Segment[2] parts;\n  Point start;\n}\n\
+                 fn main() {\n}"
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_object_too_big_for_the_frame_is_refused_rather_than_crashing() {
+        // Two nested arrays of the longest length allowed is eight megabytes,
+        // which is more stack than a thread has.
+        let errors = check_src(
+            "class Row {\n  int[1024] cells;\n}\n\
+             class Grid {\n  Row[1024] rows;\n}\n\
+             fn main() {\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("is too big"), "{}", errors[0].message);
+
+        // One level further, the size stops fitting in the number sizes are
+        // counted in — and a refusal has to survive that rather than becoming
+        // a panic, which is why every step of it saturates.
+        let errors = check_src(
+            "class Row {\n  int[1024] cells;\n}\n\
+             class Grid {\n  Row[1024] rows;\n}\n\
+             class Cube {\n  Grid[1024] layers;\n}\n\
+             fn main() {\n}",
+        )
+        .unwrap_err();
+        assert!(errors.iter().all(|e| e.message.contains("is too big")), "{errors:?}");
+
+        // And the same for a sum rather than a product: enough big fields that
+        // the running total is what stops fitting. `Grid` is recorded at the
+        // limit once it has been refused, so what makes these big is the array
+        // around it — sixty-four of those is four gigabytes.
+        let fields: String = (0..70).map(|at| format!("  Grid[1024] g{at};\n")).collect();
+        let errors = check_src(&format!(
+            "class Row {{\n  int[1024] cells;\n}}\n\
+             class Grid {{\n  Row[1024] rows;\n}}\n\
+             class Wide {{\n{fields}}}\n\
+             fn main() {{\n}}"
+        ))
+        .unwrap_err();
+        let wide = errors.iter().find(|e| e.message.contains("`Wide`")).expect("`Wide` is refused");
+        assert!(
+            wide.label.as_ref().is_some_and(|text| text.contains("more than four gigabytes")),
+            "{:?}",
+            wide.label
+        );
     }
 
     #[test]

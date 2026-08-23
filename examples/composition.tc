@@ -1,0 +1,112 @@
+// Composition: an object may hold an array, and another object.
+//
+// A field is no longer one register wide. What a class holds, it holds
+// *inside* — so an object's size is the sum of its fields' sizes, and copying
+// one copies everything in it. There is no reference type to close a ring
+// with, which is why `class Node { Node next; }` is a compile error rather
+// than a linked list: what an object contains is a tree, never a graph.
+
+class Point {
+  int x;
+  int y;
+  fn sum(self) -> int {
+    return self.x + self.y;
+  }
+}
+
+// Two whole `Point`s, one after the other — not two addresses.
+class Segment {
+  Point a;
+  Point b;
+  fn span(self) -> int {
+    return self.b.x - self.a.x;
+  }
+}
+
+class Row {
+  int[3] cells;
+}
+
+// An array of objects inside an object: every element is a whole `Row`, and
+// the offsets multiply rather than counting registers.
+class Grid {
+  Row[2] rows;
+}
+
+class Shape {
+  fn area(self) -> int {
+    return 0;
+  }
+}
+
+class Circle : Shape {
+  int r;
+  fn area(self) -> int {
+    return 3 * self.r * self.r;
+  }
+}
+
+class Rect : Shape {
+  int w;
+  int h;
+  fn area(self) -> int {
+    return self.w * self.h;
+  }
+}
+
+// A field may be any class in a hierarchy: it reserves the room the biggest of
+// them needs, so what it holds keeps answering as itself.
+class Holder {
+  Shape held;
+  int tag;
+}
+
+// Nothing changes about passing and returning. A parameter still borrows the
+// caller's object however deep it is, so writing through one is visible to the
+// caller...
+fn stretch(Segment s) {
+  s.b.x = s.b.x * 2;
+}
+
+// ... and a returned object still fills room the caller reserved.
+fn widen(Segment s, int by) -> Segment {
+  return Segment { a: s.a, b: Point { x: s.b.x + by, y: s.b.y } };
+}
+
+fn main() {
+  Segment s = Segment { a: Point { x: 1, y: 1 }, b: Point { x: 5, y: 5 } };
+  print(s.a.x);          // 1
+  print(s.span());       // 4
+  print(s.b.sum());      // 10 — a method on a field of a field
+
+  // A whole object is copied out, and a whole one is written in.
+  Point p = s.b;
+  s.b = Point { x: 9, y: 9 };
+  print(p.x);            // 5 — `p` was a copy, not a second name for `s.b`
+  print(s.span());       // 8
+
+  // Copying the outer object copies the inner ones with it: they live in it.
+  Segment kept = s;
+  s.a.x = 100;
+  print(kept.a.x);       // 1
+
+  stretch(s);
+  print(s.b.x);          // 18
+  print(widen(s, 2).b.x);// 20
+
+  // An array field is indexed like any other array, and an array *of* objects
+  // hands back the object itself rather than a copy of it.
+  Grid g = Grid { rows: [Row { cells: [1, 2, 3] }, Row { cells: [4, 5, 6] }] };
+  print(g.rows[1].cells[2]);   // 6
+  g.rows[1].cells[2] = 60;
+  print(g.rows[1].cells[2]);   // 60
+  print(len(g.rows));          // 2
+
+  // The vtable pointer travels with the copy, so a field of the base class
+  // answers as whatever was put in it.
+  Holder h = Holder { held: Circle { r: 2 }, tag: 1 };
+  print(h.held.area());  // 12
+  h.held = Rect { w: 5, h: 5 };
+  print(h.held.area());  // 25
+  print(h.tag);          // 1 — the field beside it is untouched
+}

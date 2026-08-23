@@ -162,6 +162,9 @@ const ABORT_NO_INPUT: &str = "tc$rt$no_input";
 const ABORT_BAD_UTF8: &str = "tc$rt$bad_utf8";
 const ABORT_INPUT_FAILED: &str = "tc$rt$input_failed";
 const ABORT_NOT_A_NUMBER: &str = "tc$rt$not_a_number";
+/// The one routine `int(s)` and `is_int(s)` are both built on. Internal: no
+/// `Runtime` names it, because no program calls it directly.
+const PARSE_INT: &str = "tc$rt$parse_int";
 const ABORT_REPORT: &str = "tc$rt$abort";
 
 /// One way a program can stop rather than answer wrongly.
@@ -424,6 +427,7 @@ struct Used {
     char_str: bool,
     int_str: bool,
     str_int: bool,
+    is_int: bool,
     list_new: bool,
     list_push: bool,
     list_clone: bool,
@@ -447,6 +451,7 @@ impl Used {
             char_str: false,
             int_str: false,
             str_int: false,
+            is_int: false,
             list_new: false,
             list_push: false,
             list_clone: false,
@@ -478,6 +483,7 @@ impl Used {
                             Runtime::CharToStr => used.char_str = true,
                             Runtime::IntToStr => used.int_str = true,
                             Runtime::StrToInt => used.str_int = true,
+                            Runtime::IsInt => used.is_int = true,
                             Runtime::ListNew => used.list_new = true,
                             Runtime::ListPush => used.list_push = true,
                             Runtime::ListClone => used.list_clone = true,
@@ -503,6 +509,12 @@ impl Used {
 
     fn prints(&self, ty: Ty) -> bool {
         self.formats[format_index(ty)]
+    }
+
+    /// Whether the routine `int(s)` and `is_int(s)` are both wrappers around is
+    /// needed. Nothing in the IR names it: it is reached only through them.
+    fn parse_int(&self) -> bool {
+        self.str_int || self.is_int
     }
 
     /// Whether anything cuts memory out of the arena — which is what decides
@@ -1110,27 +1122,30 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         frame.ret(asm);
     }
 
-    if used.str_int {
+    // `int(s)` and `is_int(s)` are one routine asked two ways. They have to
+    // agree about what a number is — down to whether a nineteen-digit one
+    // fits — and the only way to be sure of that is for one of them to answer
+    // the question for both.
+    if used.parse_int() {
         asm.blank();
-        asm.comment("int(s): the number a string spells, and nothing else will do");
-        asm.line(&format!("{}:", runtime_symbol(Runtime::StrToInt)));
-        asm.comment("rcx = the text -> rax = the number");
+        asm.comment("the number a string spells, and whether it spells one at all");
+        asm.line(&format!("{PARSE_INT}:"));
+        asm.comment("rcx = the text -> rax = the number, rdx = 1 when there was one");
         let frame =
-
             StubFrame::enter(asm, &["rbx", "rsi", "rdi", "r12"], 40, "shadow space + alignment");
         asm.asm(&format!("mov  rsi, {RCX}"));
         asm.asm("mov  rbx, [rsi-8]    ; how many characters");
         asm.asm("xor  rdi, rdi        ; where we are");
         asm.asm("xor  r12, r12        ; was there a minus?");
         asm.asm("test rbx, rbx");
-        asm.asm(&format!("jz   {ABORT_NOT_A_NUMBER}    ; the empty string spells nothing"));
+        asm.asm("jz   .no             ; the empty string spells nothing");
         asm.asm("mov  eax, [rsi]");
         asm.asm("cmp  eax, 45    ; '-'");
         asm.asm("jne  .digits");
         asm.asm("mov  r12, 1");
         asm.asm("inc  rdi");
         asm.asm("cmp  rdi, rbx");
-        asm.asm(&format!("jae  {ABORT_NOT_A_NUMBER}    ; a minus on its own"));
+        asm.asm("jae  .no             ; a minus on its own");
         asm.line(".digits:");
         asm.comment("built on the negative side, so the most negative int needs no special case");
         asm.asm(&format!("xor  {RAX}, {RAX}"));
@@ -1140,20 +1155,49 @@ fn list_stubs(asm: &mut Asm, used: &Used) {
         asm.asm("mov  ecx, [rsi+rdi*4]");
         asm.asm("sub  ecx, 48    ; '0'");
         asm.asm("cmp  ecx, 9");
-        asm.asm(&format!("ja   {ABORT_NOT_A_NUMBER}    ; unsigned, so it catches both ends"));
+        asm.asm("ja   .no             ; unsigned, so it catches both ends");
         asm.asm(&format!("imul {RAX}, {RAX}, 10"));
-        asm.asm(&format!("jo   {ABORT_NOT_A_NUMBER}"));
+        asm.asm("jo   .no");
         asm.asm(&format!("movsxd {RDX}, ecx"));
         asm.asm(&format!("sub  {RAX}, {RDX}"));
-        asm.asm(&format!("jo   {ABORT_NOT_A_NUMBER}"));
+        asm.asm("jo   .no");
         asm.asm("inc  rdi");
         asm.asm("jmp  .next");
         asm.line(".complete:");
         asm.asm("test r12, r12");
         asm.asm("jnz  .signed");
         asm.asm(&format!("neg  {RAX}"));
-        asm.asm(&format!("jo   {ABORT_NOT_A_NUMBER}    ; only the one with no positive twin"));
+        asm.asm("jo   .no             ; only the one with no positive twin");
         asm.line(".signed:");
+        asm.asm(&format!("mov  {RDX}, 1"));
+        frame.ret(asm);
+        asm.line(".no:");
+        asm.comment("no number to hand back, and the caller decides what that means");
+        asm.asm(&format!("xor  {RAX}, {RAX}"));
+        asm.asm(&format!("xor  {RDX}, {RDX}"));
+        frame.ret(asm);
+    }
+
+    if used.str_int {
+        asm.blank();
+        asm.comment("int(s): the number a string spells, and nothing else will do");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::StrToInt)));
+        asm.comment("rcx = the text -> rax = the number");
+        let frame = StubFrame::enter(asm, &[], 40, "shadow space + alignment");
+        asm.asm(&format!("call {PARSE_INT}"));
+        asm.asm(&format!("test {RDX}, {RDX}"));
+        asm.asm(&format!("jz   {ABORT_NOT_A_NUMBER}"));
+        frame.ret(asm);
+    }
+
+    if used.is_int {
+        asm.blank();
+        asm.comment("is_int(s): whether `int(s)` would answer rather than stop the program");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::IsInt)));
+        asm.comment("rcx = the text -> rax = whether it spells a number");
+        let frame = StubFrame::enter(asm, &[], 40, "shadow space + alignment");
+        asm.asm(&format!("call {PARSE_INT}"));
+        asm.asm(&format!("mov  {RAX}, {RDX}"));
         frame.ret(asm);
     }
 
@@ -2739,6 +2783,29 @@ mod tests {
         }
         assert!(asm.contains("extern _read"), "{asm}");
         assert!(asm.contains(&format!("{INPUT}:")), "{asm}");
+    }
+
+    #[test]
+    fn converting_and_asking_first_are_one_routine() {
+        // What makes `is_int(s)` trustworthy is that it is not a second opinion:
+        // both go through the same parse, so neither can come to disagree about
+        // what a number is. Either one alone brings it.
+        for src in ["print(int(t(\"1\")));", "print(is_int(t(\"1\")));"] {
+            let asm = compile_src(&format!(
+                "fn t(string v) -> string {{\n  return v;\n}}\nfn main() {{\n{src}\n}}\n"
+            ));
+            assert!(asm.contains(&format!("{PARSE_INT}:")), "{asm}");
+        }
+
+        // And the abort belongs to the wrapper, not to the parse: the routine
+        // that answers `is_int` has nowhere to stop the program.
+        let asm = compile_src(
+            "fn t(string v) -> string {\n  return v;\n}\n\
+             fn main() {\nprint(is_int(t(\"1\")));\n}\n",
+        );
+        let parse = asm.split(&format!("{PARSE_INT}:")).nth(1).expect("the routine is emitted");
+        let parse = parse.split(&runtime_symbol(Runtime::IsInt)).next().expect("something follows");
+        assert!(!parse.contains(ABORT_NOT_A_NUMBER), "{parse}");
     }
 
     #[test]

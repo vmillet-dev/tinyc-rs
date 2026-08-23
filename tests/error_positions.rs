@@ -273,7 +273,7 @@ fn pushing_onto_an_array_points_at_the_keyword() {
 
 #[test]
 fn a_list_in_a_field_points_at_the_field() {
-    assert_error_at("list_in_a_field.tc", "4:3");
+    assert_error_at("list_in_a_field.tc", "5:3");
 }
 
 #[test]
@@ -288,6 +288,24 @@ fn a_missing_field_points_at_the_whole_literal() {
     // No one field is wrong — it is what the literal does not say, so the
     // caret covers the object that had to be complete.
     assert_error_at("object_missing_field.tc", "7:14");
+}
+
+#[test]
+fn a_class_containing_itself_points_at_the_field_that_closes_the_ring() {
+    // The field is what could be deleted to fix it, so it is what the caret
+    // covers — on the class, nothing would look wrong.
+    assert_error_at("class_contains_itself.tc", "6:3");
+}
+
+#[test]
+fn a_ring_of_classes_points_at_the_field_that_closes_it() {
+    assert_error_at("classes_contain_each_other.tc", "8:3");
+}
+
+#[test]
+fn an_object_too_big_points_at_the_class() {
+    // The opposite case: no one field is at fault, it is what they add up to.
+    assert_error_at("object_too_big.tc", "8:7");
 }
 
 #[test]

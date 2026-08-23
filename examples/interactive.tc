@@ -12,6 +12,10 @@
 // Everything the file gives is UTF-8; everything TinyC holds is characters. The
 // decoding happens here, at the edge, and a byte sequence that spells no
 // character stops the program rather than turning into a question mark.
+//
+// `is_int(s)` is the third built-in, and it exists for the same reason `eof()`
+// does: `int(s)` stops the program on text that spells no number, and text that
+// spells no number is *data* rather than a mistake in the program.
 
 fn max_of(int[] xs) -> int {
   int best = xs[0];
@@ -46,18 +50,16 @@ fn main() {
       continue;
     }
 
-    // A line that is all digits is a number; anything else is a word. The
-    // compiler converts nothing on its own, so this asks first and only then
-    // says `int(line)`.
-    bool numeric = true;
-    for (int i = 0; i < len(line); i = i + 1) {
-      char c = line[i];
-      if (c < '0' || c > '9') {
-        numeric = false;
-      }
-    }
-
-    if (numeric) {
+    // A line that spells a number is a number; anything else is a word.
+    // `int(line)` stops the program on text that spells none, so this asks
+    // first — the same bargain `eof()` strikes with `read_line()`.
+    //
+    // Checking it by hand would very nearly work, and the "very nearly" is the
+    // point: a loop over the characters would take `-13` for a word, and it
+    // would take twenty digits for a number right up until the conversion
+    // stopped the program. Whether a number still fits can only be found out
+    // by performing the overflow, which is why the language answers it.
+    if (is_int(line)) {
       push(numbers, int(line));
       print("number " + line);
     } else {

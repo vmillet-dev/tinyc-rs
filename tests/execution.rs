@@ -540,6 +540,81 @@ fn a_polymorphic_value_keeps_what_it_is_when_it_is_copied() {
     harness.each_prints_after("poly", prelude, &cases);
 }
 
+/// What an object contains, it contains *inside* itself.
+///
+/// The one feature where a field's offset stops being its position: an
+/// aggregate field takes its whole size, so everything after it moves along by
+/// that much and a copy carries all of it. A wrong offset here reads a
+/// neighbouring field, and a missing copy shows up as one object changing when
+/// another is written to — both of which are wrong *numbers* rather than
+/// crashes.
+#[test]
+fn objects_hold_what_they_contain_inside_them() {
+    let Some(harness) = Harness::find() else { return };
+
+    let prelude = "class Point {\n  int x;\n  int y;\n  \
+                   fn sum(self) -> int { return self.x + self.y; }\n}\n\
+                   class Segment {\n  Point a;\n  Point b;\n}\n\
+                   class Row {\n  int[3] cells;\n}\n\
+                   class Grid {\n  Row[2] rows;\n}\n\
+                   class Shape {\n  fn area(self) -> int { return 0; }\n}\n\
+                   class Circle : Shape {\n  int r;\n  \
+                   fn area(self) -> int { return 3 * self.r * self.r; }\n}\n\
+                   class Holder {\n  Shape held;\n  int tag;\n}\n\
+                   fn seg() -> Segment {\n  \
+                   return Segment { a: Point { x: 1, y: 2 }, b: Point { x: 10, y: 20 } };\n}\n\
+                   fn widen(Segment s) {\n  s.b.x = s.b.x + 1;\n}\n\
+                   fn moved(Segment s, int by) -> Segment {\n  \
+                   return Segment { a: s.a, b: Point { x: s.b.x + by, y: s.b.y } };\n}\n";
+
+    let cases: [(&str, &str); 13] = [
+        // Two levels down, read and written. `b` starts past the whole of `a`,
+        // so a field offset that still counted registers would land in `a.y`.
+        ("Segment s = seg();\nprint(s.b.x);", "10"),
+        ("Segment s = seg();\ns.b.x = 30;\nprint(s.b.x);", "30"),
+        ("Segment s = seg();\nprint(s.a.sum() + s.b.sum());", "33"),
+        // Copying the outer object copies the inner ones with it.
+        ("Segment s = seg();\nSegment t = s;\ns.a.x = 100;\nprint(t.a.x);", "1"),
+        // ... and copying an inner one out is a copy too, not a second name.
+        ("Segment s = seg();\nPoint p = s.b;\ns.b.x = 99;\nprint(p.x);", "10"),
+        // A whole object written into a field.
+        ("Segment s = seg();\ns.b = Point { x: 7, y: 8 };\nprint(s.b.sum());", "15"),
+        // A parameter still borrows the caller's object, however deep the write
+        // goes, and a returned one still fills room the caller reserved.
+        ("Segment s = seg();\nwiden(s);\nprint(s.b.x);", "11"),
+        ("Segment s = seg();\nprint(moved(s, 5).b.x);", "15"),
+        // An array field: its elements are the object's own bytes.
+        (
+            "Row r = Row { cells: [1, 2, 3] };\nr.cells[1] = 5;\n\
+             print(r.cells[0] + r.cells[1] + r.cells[2]);",
+            "9",
+        ),
+        // An array of objects inside an object, indexed twice over.
+        (
+            "Grid g = Grid { rows: [Row { cells: [1, 2, 3] }, Row { cells: [4, 5, 6] }] };\n\
+             g.rows[1].cells[2] = 60;\nprint(g.rows[0].cells[0] + g.rows[1].cells[2]);",
+            "61",
+        ),
+        // Writing through an element that is an object: the address of the
+        // element is the object, with nothing to read out of it first.
+        (
+            "Point[2] ps = [Point { x: 1, y: 1 }, Point { x: 2, y: 2 }];\n\
+             ps[1].x = 7;\nprint(ps[1].x + ps[0].x);",
+            "8",
+        ),
+        // A field may be any class in a hierarchy: it reserves the biggest, and
+        // the vtable pointer travels with the copy. The field beside it, which
+        // starts past all of that room, must be untouched.
+        (
+            "Holder h = Holder { held: Circle { r: 2 }, tag: 5 };\nprint(h.held.area() + h.tag);",
+            "17",
+        ),
+        ("Holder h = Holder { held: Circle { r: 2 }, tag: 5 };\nHolder g = h;\nh.tag = 9;\nprint(g.tag);", "5"),
+    ];
+
+    harness.each_prints_after("nested", prelude, &cases);
+}
+
 /// Arrays really read and write the memory they claim to.
 ///
 /// The only feature whose values live outside registers, so this is the one
@@ -729,6 +804,43 @@ fn a_conversion_answers_everything_right_up_to_the_boundary() {
     let prelude = "fn n(int v) -> int {\n  return v;\n}\n\
                    fn t(string v) -> string {\n  return v;\n}\n";
     harness.each_prints_after("boundary", prelude, &cases);
+}
+
+/// `is_int(s)` and `int(s)` have to agree, and this is where that is checked.
+///
+/// They are one routine asked two ways, so a disagreement would mean the
+/// wrapper rather than the parse — but the property is the whole point of the
+/// built-in, so it is asserted rather than assumed: every case here converts
+/// exactly when it was told it could, and the program must survive it.
+#[test]
+fn asking_whether_text_is_a_number_agrees_with_converting_it() {
+    let Some(harness) = Harness::find() else { return };
+
+    // Through a call, so nothing is a constant `sema` could settle: what is
+    // under test is the routine in the emitted code.
+    let prelude = "fn t(string v) -> string {\n  return v;\n}\n\
+                   fn show(string s) {\n  if (is_int(s)) {\n    print(int(s));\n  } else {\n    \
+                   print(\"no\");\n  }\n}\n";
+
+    let cases: [(&str, &str); 3] = [
+        (
+            "show(t(\"42\"));\nshow(t(\"-42\"));\nshow(t(\"007\"));\nshow(t(\"\"));\n\
+             show(t(\"-\"));\nshow(t(\"abc\"));\nshow(t(\"12a\"));\nshow(t(\" 7\"));\n\
+             show(t(\"4 \"));\nshow(t(\"+7\"));",
+            "42\n-42\n7\nno\nno\nno\nno\nno\nno\nno",
+        ),
+        // The edge of the range is the one place the two could come apart,
+        // because there it is an overflow that decides rather than a character.
+        (
+            "show(t(\"9223372036854775807\"));\nshow(t(\"9223372036854775808\"));\n\
+             show(t(\"-9223372036854775808\"));\nshow(t(\"-9223372036854775809\"));",
+            "9223372036854775807\nno\n-9223372036854775808\nno",
+        ),
+        // The answer is an ordinary `bool` and prints as one.
+        ("print(is_int(t(\"1\")));\nprint(is_int(t(\"x\")));", "true\nfalse"),
+    ];
+
+    harness.each_prints_after("isint", prelude, &cases);
 }
 
 /// A `match` used as a value, where getting the control flow wrong shows up as

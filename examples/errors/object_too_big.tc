@@ -1,0 +1,13 @@
+// Containment multiplies: a thousand rows of a thousand ints is eight
+// megabytes, and an object lives in the frame. A list holds a quantity the
+// stack cannot.
+class Row {
+  int[1024] cells;
+}
+
+class Grid {
+  Row[1024] rows;
+}
+
+fn main() {
+}

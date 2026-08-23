@@ -1,0 +1,12 @@
+// The same impossibility, one step further round: `Room` holds a `Door` and a
+// `Door` holds a `Room`, so neither could be laid out first.
+class Room {
+  Door way;
+}
+
+class Door {
+  Room to;
+}
+
+fn main() {
+}

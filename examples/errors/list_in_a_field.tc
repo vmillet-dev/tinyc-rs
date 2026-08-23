@@ -1,5 +1,6 @@
-// Copying the object would copy the handle, so two objects would share one
-// list — and writing through either would be visible through the other.
+// An array or another object nests, because it lives inside the object that
+// holds it. A list does not: its elements live in the arena and the field
+// would hold only their address, so copying the object would share them.
 class Bag {
   int[] items;
 }
