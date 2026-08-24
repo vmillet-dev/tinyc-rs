@@ -7,7 +7,7 @@
 
 use tinyc::codegen::Target;
 use tinyc::parser::MAX_NESTING;
-use tinyc::{Stage, compile, compile_with, with_compiler_stack};
+use tinyc::{Options, Stage, compile, compile_with, with_compiler_stack};
 
 /// Run the whole pipeline on the stack the CLI gives it.
 ///
@@ -125,7 +125,7 @@ fn an_observer_that_says_no_stops_the_pipeline_where_it_said_so() {
     let source = "fn main(int a) {\n  println(a);\n}\n";
 
     let mut seen = Vec::new();
-    let stopped = compile_with(source, Target::X86_64Windows, |stage| {
+    let stopped = compile_with(source, Target::X86_64Windows, Options::default(), |stage| {
         seen.push(match stage {
             Stage::Tokens(_) => "tokens",
             Stage::Ast(_) => "ast",
@@ -142,7 +142,7 @@ fn the_stages_arrive_in_the_order_the_pipeline_runs_them() {
     let source = "fn main() {\n  println(1 + 2);\n}\n";
 
     let mut seen = Vec::new();
-    let compiled = compile_with(source, Target::X86_64Windows, |stage| {
+    let compiled = compile_with(source, Target::X86_64Windows, Options::default(), |stage| {
         match stage {
             Stage::Tokens(tokens) => {
                 seen.push("tokens");
@@ -177,7 +177,7 @@ fn a_stage_that_fails_shows_nothing_after_it() {
     let source = "fn main() {\n  int x = \"not a number\";\n}\n";
 
     let mut seen = Vec::new();
-    let result = compile_with(source, Target::X86_64Windows, |stage| {
+    let result = compile_with(source, Target::X86_64Windows, Options::default(), |stage| {
         seen.push(match stage {
             Stage::Tokens(_) => "tokens",
             Stage::Ast(_) => "ast",

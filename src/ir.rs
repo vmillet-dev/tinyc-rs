@@ -41,6 +41,7 @@ use crate::ast::{
     ArmBody, BinOp, Block as AstBlock, Builtin, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
     MatchArm, Place, Prim, PrintPart, Program as Ast, Stmt, Ty, TypeTable, is_scalar_value,
 };
+use crate::diag::{Diagnostic, Result};
 use crate::sema::Types;
 
 /// A virtual register: a value name, not yet a machine register. Scoped to one
@@ -58,6 +59,20 @@ pub const CHAR_BYTES: u32 = 4;
 
 /// Bytes of header in front of a string's characters, holding the count.
 pub const STR_HEADER: u32 = 8;
+
+/// Bytes of frame one function's locals may take.
+///
+/// The stack is the one resource a program is handed rather than asking for,
+/// and it is the smaller of the two machines that decides how much: a Windows
+/// thread gets a megabyte by default, a Linux one eight. A single function that
+/// wants a quarter of the smaller is not a program that will run and be
+/// unlucky — it is one that cannot recurse at all, and the compiler can see
+/// that before it emits a `sub rsp` no stack could satisfy.
+///
+/// This is [`crate::sema::MAX_OBJECT_BYTES`] one level up. That one bounds a
+/// single object; this one bounds what a function declares, which containment
+/// and repetition can push far past any single object's size.
+pub const MAX_FRAME_BYTES: u32 = 256 * 1024;
 
 /// Index into [`Program::strings`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,6 +480,79 @@ impl Instr {
         }
     }
 
+    /// Whether this instruction can stop the program rather than answer.
+    ///
+    /// A fact about the *language*, not about a machine: it is the list of
+    /// places TinyC promised to refuse rather than answer wrongly. Two readers
+    /// need it and would otherwise each have their own opinion — the backend,
+    /// which emits a guard and therefore has to declare the abort routine, and
+    /// [`crate::opt`], which may not delete a computation whose fault is the
+    /// whole reason the program stops where it does.
+    pub fn can_fail(&self) -> bool {
+        match self {
+            // A constant index into a length known here was settled by `sema`;
+            // anything else — including every index into a string, whose length
+            // is never known here — is checked where it lands.
+            Instr::Elem { index, len, .. } => {
+                !matches!((index, len), (Value::Const(_), Value::Const(_)))
+            }
+            Instr::Bin { op, lhs, rhs, .. } if op.divides() => DivGuards::of(lhs, rhs).any(),
+            // `add`, `sub` and `imul` are all guarded; a folded result never
+            // reaches an instruction in the first place.
+            Instr::Bin { .. } => true,
+            // Every runtime routine can fail: the two that allocate run out of
+            // memory, and the one that checks a character refuses.
+            Instr::RtCall { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Show `visit` every operand, so that it may be replaced.
+    ///
+    /// The counterpart of [`Self::uses`], and the whole of what a rewrite needs
+    /// to substitute one value for another. Listing the operands twice is worth
+    /// it: an instruction added to the enum without a row here would silently
+    /// stop being optimised rather than fail to compile — which is why the
+    /// exhaustive `match` has no wildcard arm.
+    pub fn values_mut(&mut self, mut visit: impl FnMut(&mut Value)) {
+        match self {
+            Instr::Const { .. }
+            | Instr::StrAddr { .. }
+            | Instr::Param { .. }
+            | Instr::Frame { .. }
+            | Instr::PrintText { .. }
+            | Instr::VTable { .. } => {}
+            Instr::Copy { src: value, .. }
+            | Instr::Load { addr: value, .. }
+            | Instr::LoadChar { addr: value, .. }
+            | Instr::Count { of: value, .. }
+            | Instr::Field { base: value, .. }
+            | Instr::Print { val: value, .. } => visit(value),
+            Instr::Bin { lhs, rhs, .. } | Instr::Cmp { lhs, rhs, .. } => {
+                visit(lhs);
+                visit(rhs);
+            }
+            Instr::Elem { base, index, len, .. } => {
+                visit(base);
+                visit(index);
+                visit(len);
+            }
+            Instr::Store { addr, value } => {
+                visit(addr);
+                visit(value);
+            }
+            Instr::CopyBytes { dst, src, .. } => {
+                visit(dst);
+                visit(src);
+            }
+            Instr::Call { args, .. } | Instr::RtCall { args, .. } => args.iter_mut().for_each(visit),
+            Instr::CallVirtual { receiver, args, .. } => {
+                visit(receiver);
+                args.iter_mut().for_each(visit);
+            }
+        }
+    }
+
     /// Whether this instruction performs a call, and therefore destroys the
     /// caller-saved registers.
     pub fn is_call(&self) -> bool {
@@ -476,6 +564,41 @@ impl Instr {
                 | Instr::CallVirtual { .. }
                 | Instr::RtCall { .. }
         )
+    }
+}
+
+/// Which of division's two faults a division still has to rule out.
+///
+/// Division traps on a zero divisor, and also on `i64::MIN / -1`, whose
+/// quotient does not fit in the width it would have to come back in. Every
+/// check an operand already known here answers is one the emitted code does not
+/// carry — which is why this is asked of [`Value`]s rather than of registers.
+///
+/// It lives beside the IR rather than in a backend because it is a fact about
+/// TinyC's arithmetic that happens to be true of x86 as well: a machine that
+/// divided without trapping would still have to be told to stop, because the
+/// language says so. The backend reads both fields to choose which guards to
+/// emit; [`Instr::can_fail`] reads only whether either is left.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DivGuards {
+    pub zero: bool,
+    pub overflow: bool,
+}
+
+impl DivGuards {
+    pub fn of(lhs: &Value, rhs: &Value) -> DivGuards {
+        let zero = !matches!(rhs, Value::Const(c) if *c != 0);
+        let overflow = match (lhs, rhs) {
+            // Only `i64::MIN` can overflow, and only when divided by -1.
+            (Value::Const(dividend), _) if *dividend != i64::MIN => false,
+            (_, Value::Const(divisor)) => *divisor == -1,
+            _ => true,
+        };
+        DivGuards { zero, overflow }
+    }
+
+    pub fn any(self) -> bool {
+        self.zero || self.overflow
     }
 }
 
@@ -704,7 +827,12 @@ fn op_name(op: BinOp) -> &'static str {
 }
 
 /// Lower a type-checked AST to IR. Assumes [`crate::sema::check`] succeeded.
-pub fn lower(ast: &Ast, types: &Types) -> Program {
+///
+/// The one thing that can still fail here is the size of a frame, and it can
+/// only fail here: how much stack a function wants is not a fact about its
+/// types, it is the sum of every aggregate this stage hands room to. The number
+/// that goes into `sub rsp` is the number checked, so the two cannot drift.
+pub fn lower(ast: &Ast, types: &Types) -> Result<Program> {
     // Function ids follow declaration order, so a call can be lowered to an
     // index without caring whether the callee has been lowered yet — which is
     // exactly what recursion and forward calls need.
@@ -725,6 +853,7 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
 
     let mut strings = Strings::default();
     let mut functions = Vec::new();
+    let mut errors = Vec::new();
     for (index, decl) in ast.functions.iter().enumerate() {
         let lowering = Lowering {
             blocks: Vec::new(),
@@ -744,6 +873,9 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
         let mut lowered =
             lowering.run(decl, types.ret_of(index), types.params_of(index));
         lowered.name = names[index].clone();
+        if lowered.frame_bytes > MAX_FRAME_BYTES {
+            errors.push(too_much_stack(&lowered, decl));
+        }
         functions.push(lowered);
     }
 
@@ -755,15 +887,40 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
         .map(|class| class.methods.iter().map(|m| func_ids[m.function]).collect())
         .collect();
 
+    // Before the pruning, deliberately: a frame nothing reaches is still one
+    // the program asked for, and `sema` reports a mistake in an uncalled
+    // function too. What is emitted must not decide what is diagnosed, or a
+    // program would start failing to compile the moment something called it.
+    if !errors.is_empty() {
+        errors.sort_by_key(|d| d.span.offset);
+        return Err(errors);
+    }
+
     let (functions, vtables) =
         prune_unreachable_functions(functions, vtables, ids.get(crate::sema::ENTRY_POINT));
-    Program {
+    Ok(Program {
         functions,
         strings: strings.chars,
         texts: strings.texts,
         table: types.table().clone(),
         vtables,
-    }
+    })
+}
+
+/// A function whose locals no stack would hold.
+fn too_much_stack(lowered: &Function, decl: &FnDecl) -> Diagnostic {
+    let bytes = lowered.frame_bytes;
+    let size = match bytes == u32::MAX {
+        true => "more than four gigabytes".to_string(),
+        false => format!("{bytes} bytes"),
+    };
+    Diagnostic::new(format!("`{}` needs too much stack", decl.name), decl.name_span)
+        .with_label(format!("{size} of locals, and at most {MAX_FRAME_BYTES} are supported"))
+        .with_note(
+            "every value too big for a register lives in the frame, and the frame is reserved \
+             for the whole call; `int[]` is what holds a quantity the stack cannot",
+            None,
+        )
 }
 
 /// The name each of the program's functions is known by once methods and free
@@ -868,7 +1025,7 @@ fn prune_unreachable_functions(
 /// usually nothing at all. Without this pass every function ending in a
 /// `return` would carry a stray block, and the backend would dutifully emit a
 /// second, unreachable epilogue for it.
-fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
+pub(crate) fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
     let mut reachable = vec![false; blocks.len()];
     let mut stack = vec![BlockId(0)];
     while let Some(id) = stack.pop() {
@@ -1793,9 +1950,13 @@ impl Lowering<'_> {
     }
 
     /// Reserve `bytes` of frame and put their address in `dst`.
+    ///
+    /// Saturating, like the object layout it is the sum of: a function with
+    /// four gigabytes of locals is answered by [`too_much_stack`], not by a
+    /// total that wrapped and looked reasonable.
     fn allocate(&mut self, dst: VReg, bytes: u32) {
         let offset = self.frame_bytes;
-        self.frame_bytes += bytes;
+        self.frame_bytes = self.frame_bytes.saturating_add(bytes);
         self.emit(Instr::Frame { dst, offset });
     }
 
@@ -2308,7 +2469,7 @@ fn builds_its_own(expr: &Expr) -> bool {
 /// the same constants through the same [`BinOp::apply`]. What reaches here is
 /// what sema could not see, such as an operand that only became a constant
 /// during lowering.
-fn fold_bin(op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
+pub(crate) fn fold_bin(op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
     let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else { return None };
     op.apply(a, b)
 }
@@ -2328,7 +2489,7 @@ fn fold_logic(op: LogicOp, lhs: Value) -> Option<i64> {
 }
 
 /// The same for a comparison, whose result is the 0 or 1 a `bool` is.
-fn fold_cmp(op: CmpOp, lhs: Value, rhs: Value) -> Option<i64> {
+pub(crate) fn fold_cmp(op: CmpOp, lhs: Value, rhs: Value) -> Option<i64> {
     let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else { return None };
     let answer = match op {
         CmpOp::Eq => a == b,
@@ -2347,6 +2508,10 @@ mod tests {
     use crate::{lexer, parser, sema};
 
     fn lower_src(src: &str) -> Program {
+        try_lower(src).expect("the frames should fit")
+    }
+
+    fn try_lower(src: &str) -> Result<Program> {
         let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
         let types = sema::check(&ast, 4).unwrap();
         lower(&ast, &types)
@@ -2664,6 +2829,48 @@ mod tests {
             })
             .collect();
         assert_eq!(offsets, vec![0, 24]);
+    }
+
+    /// One `int[1024]` is 8,192 bytes, so the limit falls between the
+    /// thirty-second and the thirty-third. The boundary is checked from both
+    /// sides because an off-by-one here is a program that either crashes or is
+    /// refused for no reason.
+    fn arrays_worth(bytes: u32) -> String {
+        let elements = vec!["0"; 1024].join(", ");
+        let count = bytes.div_ceil(1024 * 8);
+        let declarations: String =
+            (0..count).map(|i| format!("  int[1024] a{i} = [{elements}];\n")).collect();
+        format!("fn main() {{\n{declarations}  println(a0[0]);\n}}\n")
+    }
+
+    #[test]
+    fn a_frame_no_stack_would_hold_is_refused() {
+        let Err(errors) = try_lower(&arrays_worth(MAX_FRAME_BYTES + 1)) else {
+            panic!("past the limit is past the limit");
+        };
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].message.contains("needs too much stack"), "{:?}", errors[0]);
+        // The caret goes on the function's name, which is the one place a
+        // reader can act on: no single declaration is the culprit.
+        assert!(errors[0].label.as_ref().is_some_and(|l| l.contains("262144")), "{:?}", errors[0]);
+    }
+
+    #[test]
+    fn a_frame_that_only_just_fits_is_not() {
+        let ir = try_lower(&arrays_worth(MAX_FRAME_BYTES)).expect("exactly the limit is allowed");
+        assert_eq!(ir.functions[0].frame_bytes, MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn a_frame_is_measured_in_the_function_that_declares_it() {
+        // Two functions of half the limit each. Neither is refused: a frame is
+        // one call's, and these two are never on the stack at the same time
+        // unless one calls the other — which is what the *runtime* check is
+        // for, and it is a question about depth, not about size.
+        let half = MAX_FRAME_BYTES / 2;
+        let mut src = arrays_worth(half).replace("fn main()", "fn other()");
+        src.push_str(&arrays_worth(half));
+        try_lower(&src).expect("two half-sized frames are two frames, not one");
     }
 
     #[test]

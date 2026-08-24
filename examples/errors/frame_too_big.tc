@@ -1,0 +1,26 @@
+// A frame holds every local at once and for the whole call: the room is
+// reserved on the way in and given back only on the way out. So what one
+// function declares adds up, even when the values never exist together.
+//
+// Not one of these classes is too big — a cube is well under the limit an
+// object has. Six cubes are, because assignment copies, and each copy is
+// another whole cube standing in the frame beside the last.
+class Cell { int[8] v; }              //     72 bytes
+class Row  { Cell[8] cells; }         //    584 bytes
+class Grid { Row[8] rows; }           //  4,680 bytes
+class Cube { Grid[8] grids; }         // 37,448 bytes
+
+fn main() {
+  Cell c = Cell { v: [0, 0, 0, 0, 0, 0, 0, 0] };
+  Row  r = Row  { cells: [c, c, c, c, c, c, c, c] };
+  Grid g = Grid { rows:  [r, r, r, r, r, r, r, r] };
+
+  Cube one = Cube { grids: [g, g, g, g, g, g, g, g] };
+  Cube two = one;
+  Cube three = one;
+  Cube four = one;
+  Cube five = one;
+  Cube six = one;
+
+  println(six.grids[0].rows[0].cells[0].v[0]);
+}

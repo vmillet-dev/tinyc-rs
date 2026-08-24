@@ -9,17 +9,20 @@
 
 use crate::ast::{BinOp, Ty};
 use crate::codegen::{Allocation, Location, RegisterFile};
-use crate::ir::{Block, Function, Instr, Program, STR_HEADER, Terminator, VReg, Value};
+use crate::ir::{
+    Block, DivGuards, Function, Instr, Program, STR_HEADER, Terminator, VReg, Value,
+};
 
 use super::asm::Asm;
 use super::data::{BOOL_FALSE, BOOL_TRUE, FMT_BOOL, FMT_INT, FMT_STR};
 use super::runtime::{
-    ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_OVERFLOW, PRINT_CHAR, PRINT_STR,
+    ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_OVERFLOW, ABORT_STACK, PRINT_CHAR,
+    PRINT_STR, STACK_LIMIT, STACK_MARGIN,
 };
 use super::used::{Used, enum_table, text_label, vtable_label};
 use super::{
-    Abi, DivGuards, ENTRY_POINT, Platform, RAX, RDX, SCRATCH0, SCRATCH1, SCRATCH1_8, half,
-    jump_if_false, narrow, runtime_symbol, setcc, symbol,
+    Abi, ENTRY_POINT, PAGE_BYTES, Platform, RAX, RDX, SCRATCH0, SCRATCH1, SCRATCH1_8,
+    half, jump_if_false, narrow, runtime_symbol, setcc, symbol,
 };
 
 pub struct FnEmitter<'a, 'o> {
@@ -53,10 +56,15 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         //
         // The entry point may not be a leaf even when nothing in it calls
         // anything: on a platform whose console has to be told what encoding is
-        // coming, saying so is a call. Reading never adds one here — whatever a
+        // coming, saying so is a call, and so is asking the operating system
+        // where the stack ends. Reading never adds one here — whatever a
         // console needs is settled inside `tc$rt$refill`.
+        //
+        // The second of those is the shared one: both platforms ask, so the
+        // condition is `Used`'s rather than the platform's.
         let entry = function.name == ENTRY_POINT;
-        let leaf = !(entry && platform.entry_calls(used))
+        let entry_calls = platform.entry_calls(used) || used.checks_stack;
+        let leaf = !(entry && entry_calls)
             && !function
                 .blocks
                 .iter()
@@ -87,6 +95,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         self.asm.line(&format!("{}:", symbol(&self.function.name)));
         self.prologue();
         if self.is_entry_point() {
+            self.set_stack_limit();
             self.platform.entry_setup(self.asm, self.used);
         }
 
@@ -138,9 +147,109 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         for reg in saved {
             self.asm.asm(&format!("push {reg}"));
         }
-        if self.frame.size > 0 {
-            self.asm.asm(&format!("sub  rsp, {}    ; {}", self.frame.size, self.frame.describe()));
+        self.stack_check();
+        self.reserve_frame();
+    }
+
+    /// Whether this function's prologue asks whether there is stack left.
+    ///
+    /// Every function does, except the entry point — which cannot, because it
+    /// is what works the limit out, and its own frame is taken before the
+    /// answer exists. That is not a hole: `main` is entered exactly once, so
+    /// the depth this guards against is the one thing it cannot reach. What
+    /// bounds *its* frame is [`crate::ir::MAX_FRAME_BYTES`], at compile time.
+    ///
+    /// Checking in every other function rather than only in the ones that
+    /// recurse is what keeps [`STACK_MARGIN`] small. What runs unchecked below
+    /// a passing check is then only the runtime's own routines and the C
+    /// library — never another TinyC frame, which could be a quarter of a
+    /// megabyte on its own.
+    fn needs_stack_check(&self) -> bool {
+        self.used.checks_stack && !self.is_entry_point()
+    }
+
+    /// Stop rather than take a frame the stack has no room for.
+    ///
+    /// Asked *before* the frame is reserved, so what it proves is that after
+    /// the prologue there is still [`STACK_MARGIN`] left — which is what the
+    /// abort path needs in order to be able to say what happened. A check made
+    /// afterwards would be asked from the very place it was meant to protect.
+    ///
+    /// Unsigned, because these are addresses: `jb`, not `jl`.
+    fn stack_check(&mut self) {
+        if !self.needs_stack_check() {
+            return;
         }
+        self.asm.comment("stop rather than take a frame the stack has no room for");
+        match self.frame.size {
+            // Nothing to reserve, so `rsp` is already where it will stay.
+            0 => self.asm.asm(&format!("cmp  rsp, [{STACK_LIMIT}]")),
+            size => {
+                self.asm.asm(&format!("lea  {RAX}, [rsp-{size}]"));
+                self.asm.asm(&format!("cmp  {RAX}, [{STACK_LIMIT}]"));
+            }
+        }
+        self.asm.asm(&format!("jb   {ABORT_STACK}"));
+    }
+
+    /// Take the frame — one page at a time when it is bigger than one.
+    ///
+    /// A stack is not simply *there* down to its end. Below the pages in use
+    /// sits one whose whole purpose is to be touched, and touching it is what
+    /// makes the next one exist. So `sub rsp, 245792` followed by a write is
+    /// two mistakes in a row: it steps over that page without touching it, and
+    /// then writes to memory the program was never given. On Windows that is an
+    /// access violation on a stack with room to spare — a program the compiler
+    /// accepted, crashing for a reason nothing in it could explain.
+    ///
+    /// Walking down instead touches every page in order, which is exactly what
+    /// the mechanism is waiting for. The loop leaves `rsp` at the same place
+    /// the single `sub` would have, so the epilogue is unchanged.
+    fn reserve_frame(&mut self) {
+        let size = self.frame.size;
+        if size == 0 {
+            return;
+        }
+        if size <= PAGE_BYTES {
+            self.asm.asm(&format!("sub  rsp, {size}    ; {}", self.frame.describe()));
+            return;
+        }
+
+        let again = self.local_label("probe");
+        self.asm.comment(&format!("{}, which is more than one page:", self.frame.describe()));
+        self.asm.comment("walk down it touching each one, because a stack only");
+        self.asm.comment("reaches as far as it has been written to");
+        self.asm.asm(&format!("mov  {RAX}, {size}    ; still to reserve"));
+        self.asm.line(&format!(".{again}:"));
+        self.asm.asm(&format!("sub  rsp, {PAGE_BYTES}"));
+        self.asm.asm("mov  qword [rsp], 0    ; the touch; nothing is there yet to lose");
+        self.asm.asm(&format!("sub  {RAX}, {PAGE_BYTES}"));
+        self.asm.asm(&format!("cmp  {RAX}, {PAGE_BYTES}"));
+        self.asm.asm(&format!("ja   .{again}"));
+        self.asm.comment("what is left is under a page, so the frame's own first write");
+        self.asm.comment("lands on the page after the last one touched");
+        self.asm.asm(&format!("sub  rsp, {RAX}"));
+    }
+
+    /// Work out where the stack ends, once, for every prologue after this one.
+    ///
+    /// The entry point is the only place this can happen: it is the first thing
+    /// to run, and the answer has to be there before the second function is
+    /// called. Asking per call would be a system call per call.
+    fn set_stack_limit(&mut self) {
+        if !self.used.checks_stack {
+            return;
+        }
+        self.asm.comment("where this thread's stack ends, asked once and read by every prologue");
+        self.platform.stack_bottom(self.asm);
+        let known = self.local_label("stack_limit");
+        self.asm.comment("a platform that could not say leaves zero, and a zero never fires");
+        self.asm.asm(&format!("test {RAX}, {RAX}"));
+        self.asm.asm(&format!("jz   .{known}"));
+        let margin = format!("add  {RAX}, {STACK_MARGIN}    ; left over for the report to run in");
+        self.asm.asm(&margin);
+        self.asm.asm(&format!("mov  [{STACK_LIMIT}], {RAX}"));
+        self.asm.line(&format!(".{known}:"));
     }
 
     fn epilogue(&mut self) {

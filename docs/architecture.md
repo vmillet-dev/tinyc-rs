@@ -35,6 +35,7 @@ Each arrow is a module, and each stage can be inspected on its own with
 | parsing | [`src/parser.rs`](../src/parser.rs), [`src/ast.rs`](../src/ast.rs) | an AST |
 | type checking | [`src/sema.rs`](../src/sema.rs) | the type of every expression |
 | lowering | [`src/ir.rs`](../src/ir.rs) | a control flow graph of three-address code |
+| optimisation | [`src/opt.rs`](../src/opt.rs) | the same graph, with less in it |
 | register allocation | [`src/codegen/regalloc.rs`](../src/codegen/regalloc.rs) | a machine register or stack slot per value |
 | emission | [`src/codegen/x64/`](../src/codegen/x64/) | NASM assembly |
 
@@ -1387,7 +1388,9 @@ Three things worth noticing:
 
 * `%t3` reuses `rsi`, the register `%y` occupied — a temporary hands its register
   to the next one as soon as it dies, so long expressions do not need long rows
-  of registers. `examples/arith.tc` computes twenty-one temporaries in two.
+  of registers. `examples/arith.tc --no-optimise --dump-regalloc` computes
+  twenty-one temporaries in two — the flag because, left to itself, that
+  example now folds to the ten numbers it prints and has nothing to allocate.
 * `%s` is still needed after the first `printf`, so it must survive that call.
   `%t3` dies before it and can share `rsi` with `%y`.
 * When registers run out the longest-lived value is spilled to a stack slot, and
@@ -1409,19 +1412,132 @@ make explicit.
 
 ## What gets optimised
 
-Four passes, each small enough to read in one sitting, and each visible in the
-output of some `--emit`.
+Six things, each small enough to read in one sitting, and each visible in the
+output of some `--emit`. Two happen while the tree is being lowered, two are
+passes over the finished graph, and two belong to the backend.
 
-**Constant folding, during lowering.** `print(1 + 2 * 3)` reaches the backend as
-`print int 7`: no `add`, no `mul`, and no register to hold the answer. A division
-the machine would refuse is deliberately *not* folded — `checked_div` answers
-`None` for both `x / 0` and `i64::MIN / -1`, so those stay instructions and the
-program fails where it was written rather than inside the compiler.
+`--no-optimise` hands the backend the IR exactly as lowering produced it, which
+makes the middle two readable as a diff:
 
-**Dead functions, during lowering.** `ir::prune_unreachable_functions` walks the
-call graph from `main` exactly as `prune_unreachable` walks the control flow
-graph from block 0, and renumbers the `FuncId`s the survivors call each other
-by. A helper nobody calls costs a label, a prologue and an epilogue otherwise.
+```bash
+cargo run -- examples/arith.tc --emit ir --no-optimise   # the arithmetic
+cargo run -- examples/arith.tc --emit ir                 # the answers
+```
+
+### The rule the passes live by
+
+**A pass may change how long a program takes and how much it spells out. It may
+not change what the program does — including where it stops.**
+
+That is a platitude in most languages and a real constraint in this one, because
+TinyC stops rather than answer wrongly, so *an overflow is observable
+behaviour*. Two things follow that a language with wrapping arithmetic never has
+to think about, and they are the reason `src/opt.rs` is the shape it is:
+
+* **Folding is allowed exactly when the answer exists.** `ir::fold_bin` is the
+  same function lowering uses and answers `None` for anything the machine would
+  refuse, so `a * b` that overflows stays an instruction and the program still
+  stops where it was written.
+* **Dead code that can fail is not dead.** `int unread = n * n;` computes
+  nothing anybody reads, and removing it would move where the program ends.
+  `Instr::can_fail` is what the eliminator asks before it removes anything, and
+  it is the reason that question moved out of the backend and into the IR: the
+  optimiser and the code generator have to mean the same thing by it.
+
+### The two during lowering
+
+**Constant folding of what is written down.** `print(1 + 2 * 3)` reaches the IR
+as `print int 7` without any pass at all. This folds *syntax* — it stops the
+moment a value goes through a variable, which is exactly what the pass below
+picks up.
+
+**Dead functions.** `ir::prune_unreachable_functions` walks the call graph from
+`main` exactly as `prune_unreachable` walks the control flow graph from block 0,
+and renumbers the `FuncId`s the survivors call each other by. A helper nobody
+calls costs a label, a prologue and an epilogue otherwise.
+
+### The two passes
+
+**Constant propagation** is a forward dataflow analysis over the control flow
+graph: for each block, what is known on entry, met over its predecessors and
+carried through its instructions. Where lowering asked "is this operand a
+literal", the pass asks "what reaches here", which is a different question as
+soon as a variable exists:
+
+```
+int a = 6;  int b = 7;  int c = 2;  println(a + b * c);
+```
+
+```text
+--no-optimise            optimised
+  %a = const 6             print int 20
+  %b = const 7             print text0 "\n"
+  %c = const 2             return
+  %t3 = mul %b, %c
+  %t4 = add %a, %t3
+  print int %t4
+```
+
+A branch whose condition it settles becomes a jump, and a block nothing can
+reach any more goes away — through the same `prune_unreachable` lowering
+already used. That is what makes the pass worth running twice: a folded branch
+can leave a variable constant on the only path that is left.
+
+Every block starts out knowing *nothing* rather than knowing everything is
+unknown, which is what makes a loop answerable: the back edge contributes
+nothing on the first round and properly once the body has been walked. The
+lattice is three deep — unreached, one known value, no longer one value — so
+the rounds run out.
+
+**Dead code elimination** removes every instruction whose destination nothing in
+the function reads and which cannot fail, is not a call, and is not a
+parameter's arrival. Read means *anywhere*, not "after this point": a variable
+keeps one register for its whole life and may be written many times, so a write
+nothing reads before the next one is dead and is kept anyway. Seeing that needs
+the backward liveness the register allocator computes, and this pass does not
+have it. Every dead *temporary* is caught regardless, because a temporary is
+written exactly once.
+
+### The index that is deliberately left alone
+
+One rewrite in the pass is dangerous, and it is worth reading `substitute` for.
+An `elem` whose index and length are both constants carries **no bounds check**:
+`sema` settled it while the program was being checked. That bargain holds for an
+index written as a literal. It does not hold for one the pass just worked out:
+
+```
+int i = 5;  int[3] xs = [1, 2, 3];  println(xs[i]);
+```
+
+Nobody proved that 5 is in range, so substituting it would delete the very check
+that catches it. An index known to be out of range is therefore left as the
+register it was, and the program stops in exactly the place and with exactly the
+message it would have without the pass.
+
+The tempting alternative — report it, since the compiler can now see it — is
+wrong twice over: it would make `--no-optimise` a different language, and it
+would refuse code on a path nothing ever takes.
+
+### What it is worth
+
+Across `examples/`, counting instructions:
+
+| | IR | assembly |
+|---|---|---|
+| `arith.tc` | 47 → 21 | 251 → 69 |
+| `control_flow.tc` | 112 → 90 | 299 → 238 |
+| every example | 1483 → 1402 | 6814 → 6509 |
+
+The totals are modest because most of an example's assembly is the runtime it
+carries — the arena, the UTF-8 encoder, the list routines — and no pass here
+touches those. Where a program's own code is arithmetic, the reduction is what
+`arith.tc` shows.
+
+Nothing here helps a *loop*, which is where a real program spends its time.
+Loop-invariant hoisting, strength reduction and common subexpression
+elimination are the obvious next passes, and the infrastructure they need now
+exists: a pass is a function from a `Function` to a changed one, and the rule it
+must obey is written above.
 
 **Compare-and-branch fusion, in the backend.** x86 compares by setting flags and
 `jcc` reads them straight back, so a comparison whose only reader is the branch
@@ -1543,6 +1659,132 @@ syntax does not oblige anyone to C's semantics.
 
 There is deliberately no escape hatch. If wrapping is ever wanted on purpose it
 should be spelled out at the operator, not switched on for a whole program.
+
+## The stack is a resource too
+
+Arithmetic, indices and allocation all follow the same rule: what cannot be
+answered stops the program with a message. The stack was the one place that
+rule did not reach. Recursion with no way out left `0xC00000FD` on Windows and
+a `SIGSEGV` on Linux — no line written, nothing to read, and no clue that the
+compiler had anything to do with it.
+
+Three separate things go wrong with a stack, and they are answered in three
+different places.
+
+### A frame no stack would hold — answered while compiling
+
+How much stack one function wants is not a fact about its types: it is the sum
+of every aggregate the lowering hands room to. So `ir::lower` is the only stage
+that can know it, and it is the stage that checks it — the number that goes into
+`sub rsp` is the number tested, which is what keeps the two from drifting.
+
+```
+error: `main` needs too much stack
+  --> examples/errors/frame_too_big.tc:13:4
+   |
+13 | fn main() {
+   |    ^^^^ 272776 bytes of locals, and at most 262144 are supported
+   = note: every value too big for a register lives in the frame, and the frame is
+     reserved for the whole call; `int[]` is what holds a quantity the stack cannot
+```
+
+`MAX_FRAME_BYTES` is a quarter of the smallest stack a TinyC program is given —
+a Windows thread's megabyte. It is `MAX_OBJECT_BYTES` one level up: that one
+bounds a single object, this one bounds what a whole function declares, which
+copying and repetition push far past any single object's size.
+
+The check runs *before* dead functions are pruned, deliberately. A frame nothing
+reaches is still one the program asked for, and `sema` reports a mistake in an
+uncalled function too — what is emitted must not decide what is diagnosed, or a
+program would start failing to compile the moment something called it.
+
+### A frame bigger than a page — answered by walking down it
+
+A stack does not simply exist down to its end. Below the pages in use sits one
+whose entire purpose is to be touched, and touching it is what makes the next
+one exist. `sub rsp, 245792` steps clean over that page, and the first write
+into the frame lands on memory the program was never given.
+
+This was a real miscompilation, not a hypothetical one: a program with 240 KiB
+of local arrays — well inside a megabyte — died with an access violation on
+Windows after the compiler had accepted it. So a frame bigger than a page is
+taken a page at a time:
+
+```
+    mov  rax, 245792    ; still to reserve
+.probe0:
+    sub  rsp, 4096
+    mov  qword [rsp], 0    ; the touch; nothing is there yet to lose
+    sub  rax, 4096
+    cmp  rax, 4096
+    ja   .probe0
+    sub  rsp, rax
+```
+
+The loop leaves `rsp` exactly where the single `sub` would have, so the epilogue
+is unchanged: one `add` of the whole frame. The last remainder is reserved
+without being touched, which is fine — it is under a page, so the frame's own
+first write is what lands on the next page down.
+
+### Going too deep — answered while running
+
+How deep a program recurses is a fact about its *data*, so nothing at compile
+time can see it. Every function but the entry point asks, before it takes its
+frame, whether there is room for it:
+
+```
+tc$down:
+    push rbx
+    push rsi
+    lea  rax, [rsp-40]              ; where the frame would leave rsp
+    cmp  rax, [tc$rt$stack_limit]
+    jb   tc$rt$stack_exhausted
+    sub  rsp, 40
+```
+
+Three instructions and one load. Asked *before* the reservation, so what it
+proves is that after the prologue there is still `STACK_MARGIN` — 64 KiB — left
+over, which is what the abort path needs in order to be able to run at all. A
+report that overflowed the stack while reporting a stack overflow is the one
+failure this must not have.
+
+Every function checks, not only the ones that recurse. That is what keeps the
+margin small: what runs below a passing check without checking is then only the
+runtime's own routines and the C library, never another TinyC frame — which
+could be a quarter of a megabyte on its own.
+
+The entry point is the exception, and cannot be otherwise: it is what works the
+limit out, and its own frame is taken before the answer exists. That is not a
+hole, because `main` is entered exactly once — the depth this guards against is
+the one thing it cannot reach — and `MAX_FRAME_BYTES` is what bounds its frame.
+
+### Where the limit comes from
+
+The one question about the machine that `rsp` cannot answer. A stack is a range
+the program was *given*, and nothing in the running program records where it
+ends, so both platforms have to ask — and they ask different things, which makes
+this the second genuinely platform-specific piece of code in the backend, beside
+reading a console.
+
+| | |
+|---|---|
+| Windows | `GetCurrentThreadStackLimits(&low, &high)` — the range the stack was *reserved* in, which is the number wanted: how much is committed right now would be a question about the past |
+| Linux | `pthread_getattr_np(pthread_self(), &attr)` then `pthread_attr_getstack` — the only call that reports the main thread's stack as the kernel actually mapped it |
+
+Guessing was the alternative and was rejected: `getrlimit` gives the size but not
+where it starts, and filling that in from `rsp` at the entry point is wrong by
+however many bytes of argument and environment strings sit above it — in the
+direction that fails to catch an overflow. A number that is right on one machine
+and silently wrong on the next is not an answer this compiler gives.
+
+A platform that cannot say leaves zero, and a zero can never fire the check:
+every real `rsp` is above it. The program then behaves exactly as it did before
+any of this existed, which is the honest degradation.
+
+Everything here is paid for only by programs that need it. A program that calls
+nothing carries no limit in `.bss`, asks the operating system nothing, and has
+no check in any prologue: nothing can nest, so there is no depth to guard
+against.
 
 ## Symbol names
 
@@ -1675,6 +1917,13 @@ that module. Six integration suites sit on top:
   values to force spills — and for what a string does, where each case answers a
   *number* wherever it can, so that a mangled character shows up as a wrong
   count rather than as output that merely looks odd.
+
+  One test there is the only one that can hold the optimiser to its promise.
+  `optimising_never_changes_what_a_program_prints` builds every example **both
+  ways** and compares stdout, stderr and exit status, then does the same for
+  four programs whose whole point is that they stop — an overflow only the pass
+  can see, one nothing reads, a divisor that becomes zero by propagation, and an
+  index that does. A dump can be read; only a running program can be believed.
 
 ### The execution harness
 

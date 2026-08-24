@@ -567,7 +567,7 @@ mod tests {
     fn ir_of(src: &str) -> Program {
         let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
         let types = sema::check(&ast, 4).unwrap();
-        crate::ir::lower(&ast, &types)
+        crate::ir::lower(&ast, &types).expect("the frames should fit")
     }
 
     /// Lower a `main` body; every test below is about one function's frame.

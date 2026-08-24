@@ -8,6 +8,7 @@
 //!   -> parser  -> AST             (parser.rs, ast.rs)
 //!   -> sema    -> types           (sema.rs)
 //!   -> ir      -> three-address code (ir.rs)
+//!   -> opt     -> the same, with less of it (opt.rs)
 //!   -> codegen -> assembly        (codegen/)
 //! ```
 //!
@@ -20,6 +21,7 @@ pub mod codegen;
 pub mod diag;
 pub mod ir;
 pub mod lexer;
+pub mod opt;
 pub mod parser;
 pub mod sema;
 pub mod token;
@@ -69,9 +71,32 @@ pub enum Stage<'a> {
     Ir(&'a ir::Program),
 }
 
+/// What to do with a program beyond compiling it.
+///
+/// One field so far, and a struct rather than a bare `bool` because the next
+/// one should not have to change every call site — and because
+/// `compile_with(source, target, true, observe)` says nothing at all about what
+/// the `true` is for.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Whether to run [`opt`] over the IR before it reaches the backend.
+    ///
+    /// Turning it off is what makes the passes *readable*: `--emit ir` twice,
+    /// once each way, is the diff. It is also what the test suite uses to check
+    /// the rule the optimiser lives by — that the two settings must print the
+    /// same thing.
+    pub optimise: bool,
+}
+
+impl Default for Options {
+    fn default() -> Options {
+        Options { optimise: true }
+    }
+}
+
 /// Run the whole pipeline. Errors carry spans into `source`.
 pub fn compile(source: &str, target: Target) -> diag::Result<Compiled> {
-    let compiled = compile_with(source, target, |_| true)?;
+    let compiled = compile_with(source, target, Options::default(), |_| true)?;
     Ok(compiled.expect("nothing asked this pipeline to stop early"))
 }
 
@@ -84,6 +109,7 @@ pub fn compile(source: &str, target: Target) -> diag::Result<Compiled> {
 pub fn compile_with(
     source: &str,
     target: Target,
+    options: Options,
     mut observe: impl FnMut(Stage<'_>) -> bool,
 ) -> diag::Result<Option<Compiled>> {
     let backend = codegen::backend_for(target);
@@ -101,7 +127,12 @@ pub fn compile_with(
     // How many arguments fit in registers is the target's business, not the
     // type checker's; the front end only asks.
     let types = sema::check(&ast, backend.register_file().max_args)?;
-    let ir = ir::lower(&ast, &types);
+    // Optimised before it is shown, not after: `--emit ir` is meant to print
+    // what the backend is about to be handed, not a draft of it.
+    let mut ir = ir::lower(&ast, &types)?;
+    if options.optimise {
+        opt::optimise(&mut ir);
+    }
     if !observe(Stage::Ir(&ir)) {
         return Ok(None);
     }

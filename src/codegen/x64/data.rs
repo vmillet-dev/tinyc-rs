@@ -6,7 +6,7 @@ use crate::ir::Program;
 use super::asm::Asm;
 use super::runtime::{
     ABORTS, ARENA_END, ARENA_NEXT, FIRST_READ, INPUT, INPUT_BYTES, INPUT_DONE, INPUT_LEN,
-    INPUT_POS, SCRATCH, SCRATCH_CAP,
+    INPUT_POS, SCRATCH, SCRATCH_CAP, STACK_LIMIT,
 };
 use super::used::{Used, enum_table, enum_variant_text, text_label, vtable_label};
 use super::{ENTRY_POINT, Platform, symbol};
@@ -148,8 +148,16 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     // Uninitialised, so the arena's bookkeeping costs nothing in the file: a
     // next pointer and an end pointer that start equal at zero, which is what
     // sends the very first allocation to ask for a chunk.
-    if used.allocates() || used.print_str || used.reads_text() {
+    if used.allocates() || used.print_str || used.reads_text() || used.checks_stack {
         asm.line("section .bss");
+        // Where the stack ends, worked out once by the entry point. Zero until
+        // then, and a zero can never fire the check — which is exactly what the
+        // entry point's own prologue needs, since it runs before the answer
+        // exists.
+        if used.checks_stack {
+            asm.asm(&format!("{STACK_LIMIT}: resq 1"));
+            platform.stack_bss(asm);
+        }
         if used.allocates() {
             asm.asm(&format!("{ARENA_NEXT}: resq 1"));
             asm.asm(&format!("{ARENA_END}: resq 1"));

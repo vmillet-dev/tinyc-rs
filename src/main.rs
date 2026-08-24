@@ -36,6 +36,13 @@ struct Cli {
     /// Print live intervals and register assignments.
     #[arg(long)]
     dump_regalloc: bool,
+
+    /// Hand the backend the IR exactly as lowering produced it.
+    ///
+    /// `--emit ir` twice, once with this and once without, is the whole of what
+    /// the optimiser did.
+    #[arg(long)]
+    no_optimise: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -89,7 +96,9 @@ fn run(cli: &Cli) -> Result<(), String> {
 
     // `--emit` stops the pipeline after a stage by answering `false`; the order
     // of the stages themselves lives in `tinyc::compile_with`, not here.
-    let compiled = tinyc::compile_with(source.text(), target, |stage| match (stage, cli.emit) {
+    let options = tinyc::Options { optimise: !cli.no_optimise };
+    let emit = cli.emit;
+    let compiled = tinyc::compile_with(source.text(), target, options, |stage| match (stage, emit) {
         (Stage::Tokens(tokens), Emit::Tokens) => {
             for token in tokens {
                 let (line, col) = source.line_col(token.span.offset);

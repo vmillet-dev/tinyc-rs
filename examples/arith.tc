@@ -1,6 +1,15 @@
 // Exercises precedence, parentheses, unary minus, division and remainder.
-// Each nested product becomes a temporary that dies as soon as it is consumed,
-// so the register allocator reuses the same machine registers over and over.
+//
+// It is also the shortest way to see what the optimiser does, because none of
+// these numbers is a secret: every operand traces back to a literal, so the
+// whole program folds to the ten answers it prints and not one `add` survives.
+//
+//   tinyc examples/arith.tc --emit ir --no-optimise    # the arithmetic
+//   tinyc examples/arith.tc --emit ir                  # the answers
+//
+// The pass that folds this is the same one that would refuse to: an operation
+// whose answer does not fit stays an instruction, so the program still stops
+// where it was written. Nothing here overflows, so nothing here survives.
 fn main() {
   int a = 6;
   int b = 7;

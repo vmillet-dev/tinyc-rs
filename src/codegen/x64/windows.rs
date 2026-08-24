@@ -55,6 +55,12 @@ const CTRL_Z: u32 = 0x1A;
 /// `GetStdHandle(STD_INPUT_HANDLE)`.
 const STD_INPUT_HANDLE: i32 = -10;
 
+/// Where `GetCurrentThreadStackLimits` answers: the two ends of the range this
+/// thread's stack was reserved in. Only the low one is read; the high one has
+/// to be somewhere, because the call writes both.
+const STACK_LOW: &str = "tc$rt$stack_low";
+const STACK_HIGH: &str = "tc$rt$stack_high";
+
 pub struct Windows;
 
 impl Platform for Windows {
@@ -70,6 +76,11 @@ impl Platform for Windows {
         let mut names = Vec::new();
         if used.writes_text() {
             names.push("SetConsoleOutputCP");
+        }
+        if used.checks_stack {
+            // Where this thread's stack ends. Windows 8 and later; nothing
+            // older is a target here.
+            names.push("GetCurrentThreadStackLimits");
         }
         if used.reads_text() {
             // A console is not a file and cannot be read as one — see
@@ -103,6 +114,26 @@ impl Platform for Windows {
         asm.asm(&format!("{STDIN_KIND}: resq 1"));
         asm.asm(&format!("{STDIN_HANDLE}: resq 1"));
         asm.asm(&format!("{CONSOLE_SCRATCH}: resq 1"));
+    }
+
+    fn stack_bss(&self, asm: &mut Asm) {
+        asm.asm(&format!("{STACK_LOW}: resq 1"));
+        asm.asm(&format!("{STACK_HIGH}: resq 1"));
+    }
+
+    /// `GetCurrentThreadStackLimits` reports the range the thread's stack was
+    /// *reserved* in, which is the number wanted: the committed part grows
+    /// towards the low end as the stack is used, so asking how much is
+    /// committed right now would answer a question about the past.
+    ///
+    /// It returns nothing and cannot fail, so there is no "I do not know" case
+    /// on this platform.
+    fn stack_bottom(&self, asm: &mut Asm) {
+        asm.comment("GetCurrentThreadStackLimits(&low, &high) -> the reserved range");
+        asm.asm(&format!("lea  rcx, [{STACK_LOW}]"));
+        asm.asm(&format!("lea  rdx, [{STACK_HIGH}]"));
+        asm.asm("call GetCurrentThreadStackLimits");
+        asm.asm(&format!("mov  {RAX}, [{STACK_LOW}]"));
     }
 
     /// Eight arguments is the widest call made here, so four of them travel on

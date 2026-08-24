@@ -46,15 +46,23 @@ rather than answering wrongly.
   `i64::MIN / -1` stop the program with a message instead of wrapping.
 * **Every index is checked.** One the compiler can work out is checked before
   the program is built; only one it cannot see costs anything at run time.
+* **Running out of stack is a message, not a crash.** A function whose locals
+  no stack would hold is refused while the program is built; a recursion that
+  goes too deep stops with the same line every other runtime failure prints,
+  rather than the `0xC00000FD` or `SIGSEGV` a stack overflow otherwise is.
 * **Diagnostics point at a line and a column**, with a window of the source and
   a caret, sorted into source order, one message per mistake, and columns
   counted in characters so accents do not shift them.
 
 **The compiler**
 
-* Constant folding, dead-function elimination, compare-and-branch fusion and
-  frameless leaf functions — each small enough to read in one sitting, and each
-  visible in the output of some `--emit`.
+* **Constant propagation and dead code elimination** as real passes over the
+  control flow graph, plus folding, dead-function elimination,
+  compare-and-branch fusion and frameless leaf functions — each small enough to
+  read in one sitting, and `--no-optimise` shows you the difference as a diff.
+  A pass may change how long a program takes, never where it stops: an
+  operation whose answer does not fit is not folded, and one that can fail is
+  never dead.
 * Linear-scan register allocation over live ranges computed by a backward
   dataflow pass on the control flow graph, run once per function.
 * Target-independent up to and including register allocation: a backend
@@ -128,6 +136,7 @@ cargo run -- examples/hello.tc --emit ir
 | `--emit tokens\|ast\|ir\|asm` | stop after a stage and print its result |
 | `--target <NAME>` | `x86_64-windows` or `x86_64-linux` (default: this machine's) |
 | `--dump-regalloc` | print live intervals and register assignments |
+| `--no-optimise` | hand the backend the IR exactly as lowering produced it |
 
 ## How it works
 
@@ -139,8 +148,67 @@ Each arrow is a module, and each stage can be inspected with `--emit`:
 | parsing | [`src/parser.rs`](src/parser.rs), [`src/ast.rs`](src/ast.rs) | an AST |
 | type checking | [`src/sema.rs`](src/sema.rs) | the type of every expression |
 | lowering | [`src/ir.rs`](src/ir.rs) | a control flow graph of three-address code |
+| optimisation | [`src/opt.rs`](src/opt.rs) | the same graph, with less in it |
 | register allocation | [`src/codegen/regalloc.rs`](src/codegen/regalloc.rs) | a machine register or stack slot per value |
 | emission | [`src/codegen/x64/`](src/codegen/x64/) | NASM assembly, for either platform |
+
+### What the optimiser does
+
+`--no-optimise` hands the backend the IR exactly as lowering produced it, so
+the passes read as a diff:
+
+```bash
+cargo run -- examples/arith.tc --emit ir --no-optimise
+cargo run -- examples/arith.tc --emit ir
+```
+
+```text
+int a = 6;  int b = 7;  int c = 2;  println(a + b * c);
+
+  %a = const 6                              print int 20
+  %b = const 7            becomes           print text0 "\n"
+  %c = const 2            ------->          return
+  %t3 = mul %b, %c
+  %t4 = add %a, %t3
+  print int %t4
+```
+
+Two passes over the control flow graph do that. **Constant propagation** works
+out what reaches each point — which is a different question from "was a literal
+written here", the only one lowering could answer — and folds what that
+settles, turning a branch on a known condition into a jump and dropping the
+blocks nothing can reach any more. **Dead code elimination** removes what
+nothing reads.
+
+The rule they live by is one line: *a pass may change how long a program takes,
+never where it stops*. In a language that halts rather than answer wrongly that
+has teeth — an overflow is observable, so an operation whose answer does not fit
+is never folded, and an operation that can fail is never dead however little
+anybody wanted its result. The whole of it, including the one rewrite that is
+genuinely dangerous, is in
+[docs/architecture.md](docs/architecture.md#what-gets-optimised).
+
+### The stack
+
+The stack is the one resource a program is handed rather than asking for, and
+running out of it is the one failure that used to escape the language's promise
+entirely — a bare `0xC00000FD` or `SIGSEGV`, with nothing written. Three things
+go wrong with it, and each is answered where it can be:
+
+* **A frame no stack would hold** is refused while the program is built.
+  Lowering is the only stage that knows how much room a function's locals take,
+  so it is the stage that checks — the number that goes into `sub rsp` is the
+  number tested.
+* **A frame bigger than a page** is taken a page at a time. A stack only
+  reaches as far as it has been written to, so a single `sub rsp` past the next
+  page down skips the one whose being touched is what makes the rest exist.
+* **A recursion that goes too deep** stops with a message. Every function but
+  `main` asks, in three instructions, whether there is room for its frame
+  before taking it — and the entry point asks the operating system once where
+  the stack actually ends, rather than guessing.
+
+The whole story, including why guessing was not good enough, is in
+[docs/architecture.md](docs/architecture.md#the-stack-is-a-resource-too).
 
 ## Examples
 

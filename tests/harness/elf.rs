@@ -59,7 +59,20 @@ impl Toolchain for Elf {
         // does not. Most distributions link PIE by default, so this is the one
         // flag a TinyC program cannot be built without — `scripts/build.sh`
         // passes it too.
-        step("cc", Command::new(&self.cc).arg("-no-pie").arg(&obj).arg("-o").arg(exe))
+        //
+        // `-lpthread`: `pthread_getattr_np` is how the prologue's stack check
+        // finds out where the stack ends. Since glibc 2.34 it is in libc proper
+        // and this asks for nothing; on anything older it is where the symbol
+        // lives.
+        step(
+            "cc",
+            Command::new(&self.cc)
+                .arg("-no-pie")
+                .arg(&obj)
+                .arg("-o")
+                .arg(exe)
+                .arg("-lpthread"),
+        )
     }
 }
 

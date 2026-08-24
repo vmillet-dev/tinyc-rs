@@ -155,6 +155,22 @@ impl Harness {
     /// leaves its source and its assembly behind under [`Harness::scratch`] to
     /// be looked at by hand.
     pub fn build_and_run(&self, name: &str, source: &str, input: &[u8]) -> Run {
+        self.build_and_run_with(name, source, input, tinyc::Options::default())
+    }
+
+    /// The same, for a test that wants to say how the program is compiled.
+    ///
+    /// There is one such test, and it is the one that matters most about the
+    /// optimiser: a pass may change how long a program takes, never what it
+    /// prints. Building each example both ways and comparing is the only way to
+    /// check that against a program rather than against a dump.
+    pub fn build_and_run_with(
+        &self,
+        name: &str,
+        source: &str,
+        input: &[u8],
+        options: tinyc::Options,
+    ) -> Run {
         let tc = self.scratch.join(format!("{name}.tc"));
         let asm = self.scratch.join(format!("{name}.asm"));
         // The host is the only machine that can run what it builds, so its own
@@ -163,8 +179,11 @@ impl Harness {
         std::fs::write(&tc, source).expect("the scratch directory should be writable");
 
         let target = self.toolchain.target();
-        let compiled = tinyc::with_compiler_stack(|| tinyc::compile(source, target))
-            .unwrap_or_else(|errors| panic!("{name} failed to compile: {errors:?}"));
+        let compiled = tinyc::with_compiler_stack(|| {
+            tinyc::compile_with(source, target, options, |_| true)
+        })
+        .unwrap_or_else(|errors| panic!("{name} failed to compile: {errors:?}"))
+        .expect("nothing stopped the pipeline");
         std::fs::write(&asm, &compiled.asm).expect("the assembly should be writable");
 
         if let Err(problem) = self.toolchain.build(&self.scratch, &asm, &exe) {

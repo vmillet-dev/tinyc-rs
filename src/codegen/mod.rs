@@ -114,7 +114,7 @@ mod tests {
         let backend = backend_for(Target::X86_64Windows);
         let types = crate::sema::check(&ast, backend.register_file().max_args)
             .expect("the source should check");
-        crate::ir::lower(&ast, &types)
+        crate::ir::lower(&ast, &types).expect("the frames should fit")
     }
 
     #[test]

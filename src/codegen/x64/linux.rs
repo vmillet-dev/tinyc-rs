@@ -54,6 +54,18 @@ static ABI: Abi = Abi {
     read: "read",
 };
 
+/// Where `pthread_getattr_np` writes the thread's attributes, and where
+/// `pthread_attr_getstack` answers out of them.
+///
+/// A `pthread_attr_t` is 56 bytes on x86-64 in both glibc and musl. This
+/// reserves more than twice that, because the size is a fact about a C header
+/// this compiler does not read, and `.bss` costs nothing in the file — a wrong
+/// guess here would be a buffer the C library writes past.
+const STACK_ATTR: &str = "tc$rt$stack_attr";
+const STACK_ATTR_BYTES: u32 = 128;
+const STACK_LOW: &str = "tc$rt$stack_low";
+const STACK_SIZE: &str = "tc$rt$stack_size";
+
 pub struct Linux;
 
 impl Platform for Linux {
@@ -65,10 +77,19 @@ impl Platform for Linux {
         &ABI
     }
 
-    /// Nothing beyond the C library every platform already imports. There is no
-    /// console API here: a terminal is a file.
-    fn externs(&self, _used: &Used) -> Vec<&'static str> {
-        Vec::new()
+    /// Nothing beyond the C library every platform already imports — there is
+    /// no console API here, a terminal is a file — except the four calls it
+    /// takes to find out where the stack ends.
+    fn externs(&self, used: &Used) -> Vec<&'static str> {
+        match used.checks_stack {
+            true => vec![
+                "pthread_self",
+                "pthread_getattr_np",
+                "pthread_attr_getstack",
+                "pthread_attr_destroy",
+            ],
+            false => Vec::new(),
+        }
     }
 
     /// A terminal on Linux carries UTF-8 because the locale says so, and the
@@ -83,6 +104,45 @@ impl Platform for Linux {
 
     /// Nothing to remember: the one way of reading is the only way.
     fn input_bss(&self, _asm: &mut Asm) {}
+
+    fn stack_bss(&self, asm: &mut Asm) {
+        asm.asm(&format!("{STACK_ATTR}: resb {STACK_ATTR_BYTES}"));
+        asm.asm(&format!("{STACK_LOW}: resq 1"));
+        asm.asm(&format!("{STACK_SIZE}: resq 1"));
+    }
+
+    /// `pthread_getattr_np` is the one call that reports the *main* thread's
+    /// stack as the kernel actually mapped it. `getrlimit` would give the size
+    /// but not where it starts, and the obvious way to fill that in — take
+    /// `rsp` at the entry point as the top — is wrong by however many bytes of
+    /// argument and environment strings sit above it, in the unsafe direction.
+    ///
+    /// It can fail, which is what the zero answer is for: a program then runs
+    /// with no check at all rather than with a limit that was made up.
+    fn stack_bottom(&self, asm: &mut Asm) {
+        let abi = self.abi();
+        asm.comment("pthread_getattr_np(pthread_self(), &attr), then read the stack out of it");
+        asm.asm("call pthread_self");
+        asm.asm(&format!("mov  {}, {RAX}", abi.arg(0)));
+        asm.asm(&format!("lea  {}, [{STACK_ATTR}]", abi.arg(1)));
+        asm.asm("call pthread_getattr_np");
+        asm.comment("a refusal is answered with `no limit`, never with a guess");
+        asm.asm("test eax, eax");
+        asm.asm("jnz  .no_stack_bottom");
+
+        asm.asm(&format!("lea  {}, [{STACK_ATTR}]", abi.arg(0)));
+        asm.asm(&format!("lea  {}, [{STACK_LOW}]", abi.arg(1)));
+        asm.asm(&format!("lea  {}, [{STACK_SIZE}]", abi.arg(2)));
+        asm.asm("call pthread_attr_getstack");
+        asm.asm(&format!("lea  {}, [{STACK_ATTR}]", abi.arg(0)));
+        asm.asm("call pthread_attr_destroy");
+        asm.asm(&format!("mov  {RAX}, [{STACK_LOW}]"));
+        asm.asm("jmp  .stack_bottom_known");
+
+        asm.line(".no_stack_bottom:");
+        asm.asm(&format!("xor  {0}, {0}", half(RAX)));
+        asm.line(".stack_bottom_known:");
+    }
 
     fn refill_read(&self, asm: &mut Asm, _frame: &StubFrame) {
         let abi = self.abi();
@@ -116,7 +176,7 @@ mod tests {
     fn compile_src(src: &str) -> String {
         let ast = crate::parser::parse(&crate::lexer::lex(src).unwrap()).unwrap();
         let types = crate::sema::check(&ast, super::super::MAX_ARGS).unwrap();
-        let ir = crate::ir::lower(&ast, &types);
+        let ir = crate::ir::lower(&ast, &types).expect("the frames should fit");
         let backend = X64::linux();
         let allocations: Vec<Allocation> =
             ir.functions.iter().map(|f| regalloc::allocate(f, backend.register_file())).collect();
@@ -157,6 +217,34 @@ mod tests {
             );
         }
         assert!(asm.contains("call printf"), "the program should print: {asm}");
+    }
+
+    #[test]
+    fn the_stack_is_found_through_pthread_rather_than_guessed_at() {
+        // Where a stack ends is the one question `rsp` cannot answer, and the
+        // two platforms ask it differently. `getrlimit` would give the size but
+        // not where it starts, and taking `rsp` at the entry point as the top
+        // is wrong by however many bytes of argument and environment strings
+        // sit above it — in the direction that fails to catch an overflow.
+        let asm = compile_src(
+            "fn down(int n) -> int {\n  if (n == 0) { return 0; }\n  return down(n - 1);\n}\n\
+             fn main() {\n  println(down(3));\n}",
+        );
+        for name in ["pthread_self", "pthread_getattr_np", "pthread_attr_getstack"] {
+            assert!(asm.contains(&format!("extern {name}")), "{name} is not imported: {asm}");
+            assert!(asm.contains(&format!("call {name}")), "{name} is not called: {asm}");
+        }
+        // The attributes are given back, and the answer is read out of them.
+        assert!(asm.contains("call pthread_attr_destroy"), "{asm}");
+        assert!(asm.contains(&format!("mov  {RAX}, [{STACK_LOW}]")), "{asm}");
+        // Nothing Windows needs appears here.
+        assert!(!asm.contains("GetCurrentThreadStackLimits"), "{asm}");
+    }
+
+    #[test]
+    fn a_program_that_never_calls_asks_nothing_about_the_stack() {
+        let asm = compile("println(1 + 2);");
+        assert!(!asm.contains("pthread"), "{asm}");
     }
 
     #[test]

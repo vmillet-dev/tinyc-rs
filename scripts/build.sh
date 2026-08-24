@@ -59,13 +59,17 @@ nasm -f elf64 -o "$obj" "$asm"
 #    -no-pie: a position-independent executable reaches every symbol through
 #    the GOT or the PLT, and assembly that names them outright does not. Most
 #    distributions link PIE by default, so this flag is not optional.
+#
+#    -lpthread: `pthread_getattr_np` is how the prologue's stack check finds out
+#    where the stack ends. Since glibc 2.34 it is in libc proper and this is a
+#    no-op; on anything older it is where the symbol lives.
 cc=""
 for candidate in cc gcc clang; do
     if command -v "$candidate" >/dev/null; then cc="$candidate"; break; fi
 done
 [ -n "$cc" ] || { echo "no C compiler found (apt install build-essential)" >&2; exit 1; }
 echo "==> $cc"
-"$cc" -no-pie "$obj" -o "$exe"
+"$cc" -no-pie "$obj" -o "$exe" -lpthread
 
 echo "==> built $exe"
 if [ "$run" -eq 1 ]; then

@@ -1,19 +1,30 @@
 // Twelve variables are all live at once when the sum starts, which is more than
 // the seven allocatable registers: the allocator has to spill to the stack, and
 // reuses each slot as soon as its value dies.
+//
+// Each one comes back from a call rather than being written down, and that is
+// the point. Constant propagation does not follow a value into a function, so
+// these twelve are the compiler's first honestly unknown numbers — written as
+// literals, the whole program would fold to the 78 it prints and there would be
+// nothing left to allocate. `--emit ir --no-optimise` on any other example
+// shows the arithmetic that folding takes away.
+fn value(int n) -> int {
+  return n;
+}
+
 fn main() {
-  int v1 = 1;
-  int v2 = 2;
-  int v3 = 3;
-  int v4 = 4;
-  int v5 = 5;
-  int v6 = 6;
-  int v7 = 7;
-  int v8 = 8;
-  int v9 = 9;
-  int v10 = 10;
-  int v11 = 11;
-  int v12 = 12;
+  int v1 = value(1);
+  int v2 = value(2);
+  int v3 = value(3);
+  int v4 = value(4);
+  int v5 = value(5);
+  int v6 = value(6);
+  int v7 = value(7);
+  int v8 = value(8);
+  int v9 = value(9);
+  int v10 = value(10);
+  int v11 = value(11);
+  int v12 = value(12);
   string done = "sum of 1..12:";
   println(done);
   println(v1 + v2 + v3 + v4 + v5 + v6 + v7 + v8 + v9 + v10 + v11 + v12);  // 78

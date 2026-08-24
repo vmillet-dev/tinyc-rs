@@ -11,7 +11,7 @@
 use crate::ast::{ClassId, EnumId, Ty};
 use crate::ir::{Instr, Program, Runtime};
 
-use super::{format_index, may_abort};
+use super::{ENTRY_POINT, format_index};
 
 pub struct Used {
     formats: [bool; 3],
@@ -23,6 +23,13 @@ pub struct Used {
     /// emitted. A class nothing builds has no objects to dispatch on.
     pub vtables: Vec<bool>,
     pub aborts: bool,
+    /// Whether any prologue guards against running out of stack, and so whether
+    /// the entry point has to find out where the stack ends.
+    ///
+    /// A program of one function cannot go deeper than it already is: `main` is
+    /// entered once, and only a *call* can nest. So a program that makes none
+    /// carries no limit, no check and neither platform's way of asking for one.
+    pub checks_stack: bool,
     /// Which of the compiler's own routines the program reaches, directly or
     /// through another one. A program that never touches a string pays for
     /// none of them — not even the arena.
@@ -55,6 +62,9 @@ impl Used {
             enums: vec![false; program.table.enums.len()],
             vtables: vec![false; program.vtables.len()],
             aborts: false,
+            // Dead functions are gone by now, so anything left beside the entry
+            // point is something the program really calls.
+            checks_stack: program.functions.iter().any(|f| f.name != ENTRY_POINT),
             concat: false,
             str_eq: false,
             check_char: false,
@@ -92,7 +102,7 @@ impl Used {
                 }
                 Instr::VTable { class, .. } => used.vtables[class.0 as usize] = true,
                 other => {
-                    used.aborts |= may_abort(other);
+                    used.aborts |= other.can_fail();
                     if let Instr::RtCall { callee, .. } = other {
                         match callee {
                             Runtime::Concat => used.concat = true,
@@ -121,8 +131,9 @@ impl Used {
         used.list_new |= used.list_clone | used.read_line;
         used.list_push |= used.read_line;
         used.chars_str |= used.read_line;
-        // Asking the arena for memory is a way to fail like any other.
-        used.aborts |= used.allocates();
+        // Asking the arena for memory is a way to fail like any other, and so
+        // is asking for a frame there is no room for.
+        used.aborts |= used.allocates() | used.checks_stack;
         used
     }
 

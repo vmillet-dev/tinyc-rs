@@ -183,13 +183,48 @@ fn an_early_emit_does_not_wait_for_a_later_stage_to_fail() {
 #[test]
 fn dump_regalloc_names_registers_and_still_writes_the_assembly() {
     let dir = scratch("regalloc");
-    let source = source_in(&dir, "hello.tc", "fn main() {\n  int x = 1;\n  println(x + 1);\n}\n");
+    // `x` comes back from a call, so the optimiser cannot fold it away and
+    // there is really a value to allocate a register to. Written as a literal
+    // there would be nothing left in the dump to name.
+    let source = source_in(
+        &dir,
+        "hello.tc",
+        "fn one() -> int {\n  return 1;\n}\nfn main() {\n  int x = one();\n  println(x + 1);\n}\n",
+    );
 
     let ran = tinyc(&[source.as_os_str(), "--dump-regalloc".as_ref()]);
     assert!(ran.succeeded(), "{}{}", ran.stdout, ran.stderr);
-    assert!(ran.stdout.contains("main"), "the dump names the function: {}", ran.stdout);
-    assert!(ran.stdout.contains('x'), "the dump names the value: {}", ran.stdout);
+    assert!(ran.stdout.contains("fn main()"), "the dump names the function: {}", ran.stdout);
+    assert!(ran.stdout.contains("%x"), "the dump names the value: {}", ran.stdout);
     assert!(dir.join("hello.asm").exists(), "the build still happened");
+}
+
+/// `--no-optimise` is what makes the passes readable: the same program, twice,
+/// and the difference is exactly what they did.
+#[test]
+fn no_optimise_hands_the_backend_what_lowering_produced() {
+    let dir = scratch("no_optimise");
+    let source = source_in(
+        &dir,
+        "arith.tc",
+        "fn main() {\n  int a = 6;\n  int b = 7;\n  println(a + b);\n}\n",
+    );
+
+    let emit_ir: [&std::ffi::OsStr; 2] = ["--emit".as_ref(), "ir".as_ref()];
+    let raw = tinyc(&[source.as_os_str(), emit_ir[0], emit_ir[1], "--no-optimise".as_ref()]);
+    assert!(raw.succeeded(), "{}{}", raw.stdout, raw.stderr);
+    assert!(raw.stdout.contains("add %a, %b"), "the addition should survive:\n{}", raw.stdout);
+
+    let optimised = tinyc(&[source.as_os_str(), emit_ir[0], emit_ir[1]]);
+    assert!(optimised.succeeded(), "{}{}", optimised.stdout, optimised.stderr);
+    assert!(optimised.stdout.contains("print int 13"), "{}", optimised.stdout);
+    assert!(!optimised.stdout.contains("add"), "{}", optimised.stdout);
+
+    // And it is a compiler flag, not an inspection one: it changes the build.
+    let built = tinyc(&[source.as_os_str(), "--no-optimise".as_ref()]);
+    assert!(built.succeeded(), "{}{}", built.stdout, built.stderr);
+    let asm = std::fs::read_to_string(dir.join("arith.asm")).expect("the assembly");
+    assert!(asm.contains("add "), "the unoptimised build still adds:\n{asm}");
 }
 
 // -- targets ---------------------------------------------------------------

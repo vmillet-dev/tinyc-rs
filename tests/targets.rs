@@ -180,7 +180,7 @@ fn the_tree_the_front_end_builds_is_the_same_for_every_target() {
 
         for (name, target) in every_target() {
             let mut seen = None;
-            let _ = tinyc::compile_with(&text, target, |stage| match stage {
+            let _ = tinyc::compile_with(&text, target, tinyc::Options::default(), |stage| match stage {
                 tinyc::Stage::Ast(ast) => {
                     seen = Some((tinyc::ast::dump(ast), 0));
                     false

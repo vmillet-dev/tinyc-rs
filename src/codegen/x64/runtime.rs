@@ -33,6 +33,7 @@ pub const ABORT_NO_INPUT: &str = "tc$rt$no_input";
 pub const ABORT_BAD_UTF8: &str = "tc$rt$bad_utf8";
 pub const ABORT_INPUT_FAILED: &str = "tc$rt$input_failed";
 pub const ABORT_NOT_A_NUMBER: &str = "tc$rt$not_a_number";
+pub const ABORT_STACK: &str = "tc$rt$stack_exhausted";
 pub const ABORT_REPORT: &str = "tc$rt$abort";
 
 /// Where an operation that cannot be performed lands.
@@ -40,7 +41,7 @@ pub const ABORT_REPORT: &str = "tc$rt$abort";
 /// Each is a label the failing instruction jumps to, paired with the text it
 /// reports. They are kept together so that adding a way to fail means adding
 /// one row rather than touching four places.
-pub const ABORTS: [Abort; 10] = [
+pub const ABORTS: [Abort; 11] = [
     Abort::new(ABORT_DIV_ZERO, "division by zero"),
     Abort::new(ABORT_DIV_OVERFLOW, "division overflows an int"),
     Abort::new(ABORT_OVERFLOW, "arithmetic overflows an int"),
@@ -51,6 +52,7 @@ pub const ABORTS: [Abort; 10] = [
     Abort::new(ABORT_BAD_UTF8, "the input is not valid UTF-8"),
     Abort::new(ABORT_INPUT_FAILED, "the input could not be read"),
     Abort::new(ABORT_NOT_A_NUMBER, "this text is not a number an int can hold"),
+    Abort::new(ABORT_STACK, "the stack is exhausted, so this call cannot be made"),
 ];
 
 /// One way a program can stop rather than answer wrongly.
@@ -76,6 +78,27 @@ impl Abort {
         format!("runtime error: {}\n", self.what)
     }
 }
+
+// -- the stack -------------------------------------------------------------
+
+/// The lowest address a function may leave `rsp` at, worked out once by the
+/// entry point and read by every prologue afterwards.
+///
+/// Zero means it could not be worked out, and a zero here can never fire the
+/// check: every real `rsp` is above it. That is the honest degradation — the
+/// program behaves exactly as it did before this existed — and it is why
+/// [`super::Platform::stack_bottom`] is allowed to answer "I do not know".
+pub const STACK_LIMIT: &str = "tc$rt$stack_limit";
+
+/// How much of the stack is left unspent below [`STACK_LIMIT`].
+///
+/// The check is made before a function's frame is reserved, so once it passes,
+/// this much is still there — and it has to cover everything that runs *without*
+/// checking: the runtime's own routines, the C library calls they make, and
+/// above all the abort path itself, which has to be able to call `fflush`,
+/// `write` and `exit` to say what happened. A report that overflowed the stack
+/// while reporting a stack overflow is the one failure this must not have.
+pub const STACK_MARGIN: u32 = 64 * 1024;
 
 // -- the arena and its bookkeeping -----------------------------------------
 

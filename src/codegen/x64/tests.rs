@@ -16,7 +16,8 @@
 use super::data::{FMT_BOOL, FMT_INT, FMT_STR};
 use super::runtime::{
     ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_NOT_A_NUMBER, ABORT_OOM, ABORT_REPORT,
-    ALLOC, INPUT, PARSE_INT, PRINT_CHAR, READY, REFILL, UTF8, UTF8_DECODE,
+    ABORT_STACK, ALLOC, INPUT, PARSE_INT, PRINT_CHAR, READY, REFILL, STACK_LIMIT, UTF8,
+    UTF8_DECODE,
 };
 use super::*;
 use crate::codegen::regalloc;
@@ -39,7 +40,7 @@ fn frame_of(allocation: &Allocation, frame_bytes: u32, leaf: bool) -> func::Fram
 fn compile_src(src: &str) -> String {
     let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
     let types = sema::check(&ast, 4).unwrap();
-    let ir = crate::ir::lower(&ast, &types);
+    let ir = crate::ir::lower(&ast, &types).expect("the frames should fit");
     let backend = X64::windows();
     let allocations: Vec<Allocation> =
         ir.functions.iter().map(|f| regalloc::allocate(f, backend.register_file())).collect();
@@ -794,6 +795,112 @@ fn the_abort_routine_builds_the_frame_its_calls_need() {
     assert!(body.contains(&format!("sub  rsp, {SHADOW_SPACE}")), "{body}");
 }
 
+// -- the stack, and what stops a program running out of it -------------
+
+/// A program with one call in it, which is what puts a check in a prologue.
+const RECURSIVE: &str = "fn down(int n) -> int {\n  \
+                         if (n == 0) { return 0; }\n  \
+                         return 1 + down(n - 1);\n}\n\
+                         fn main() {\n  println(down(3));\n}";
+
+#[test]
+fn a_function_that_can_be_entered_again_checks_there_is_stack_left() {
+    let asm = compile_src(RECURSIVE);
+    let (_, body) =
+        functions_in(&asm).into_iter().find(|(name, _)| *name == "tc$down").expect("the callee");
+    // Asked before the frame is taken, and against the frame it is about to
+    // take — not against `rsp` as it stands.
+    assert!(body.contains(&format!("cmp  {RAX}, [{STACK_LIMIT}]")), "{body}");
+    assert!(body.contains(&format!("lea  {RAX}, [rsp-")), "{body}");
+    assert!(body.contains(&format!("jb   {ABORT_STACK}")), "{body}");
+    // Before the reservation, or it would be asked from the place it guards.
+    let check = body.find("jb   ").expect("the check");
+    let reserve = body.find("sub  rsp,").expect("the reservation");
+    assert!(check < reserve, "the check has to come first: {body}");
+}
+
+#[test]
+fn the_entry_point_finds_the_limit_out_rather_than_checking_against_it() {
+    let asm = compile_src(RECURSIVE);
+    let (_, body) =
+        functions_in(&asm).into_iter().find(|(name, _)| *name == "main").expect("the entry point");
+    // It is what works the answer out, so there is nothing to check against
+    // yet — and nothing to check, since `main` is entered once.
+    assert!(!body.contains(ABORT_STACK), "{body}");
+    assert!(body.contains("call GetCurrentThreadStackLimits"), "{body}");
+    assert!(body.contains(&format!("mov  [{STACK_LIMIT}], {RAX}")), "{body}");
+    assert!(asm.contains(&format!("{STACK_LIMIT}: resq 1")), "{asm}");
+}
+
+#[test]
+fn a_program_that_calls_nothing_carries_no_stack_machinery() {
+    // Nothing can nest, so there is no depth to guard against: no limit in
+    // `.bss`, no question asked of the operating system, and nothing jumping
+    // to the abort.
+    let asm = compile("int x = 1;\nprintln(x + 1);");
+    assert!(!asm.contains(STACK_LIMIT), "{asm}");
+    assert!(!asm.contains("GetCurrentThreadStackLimits"), "{asm}");
+    assert!(!asm.contains(&format!("jb   {ABORT_STACK}")), "{asm}");
+}
+
+/// A declaration of `bytes` worth of `int[1024]` locals, which is how these
+/// tests make a frame of a given size without a repeat form in the language.
+fn arrays_worth(bytes: u32) -> String {
+    let elements = vec!["0"; 1024].join(", ");
+    (0..bytes.div_ceil(1024 * 8))
+        .map(|i| format!("int[1024] a{i} = [{elements}];\n"))
+        .collect::<String>()
+        + "println(a0[0]);"
+}
+
+#[test]
+fn a_frame_that_fits_in_a_page_is_taken_in_one_instruction() {
+    let asm = compile("int[3] a = [1, 2, 3];\nprintln(a[0]);");
+    assert!(asm.contains("sub  rsp, 72    ; 32 bytes of shadow space"), "{asm}");
+    assert!(!asm.contains(".probe"), "{asm}");
+}
+
+#[test]
+fn a_frame_bigger_than_a_page_is_taken_a_page_at_a_time() {
+    // A single `sub rsp` past the page below the one in use steps over the
+    // page whose being touched is what makes the next one exist. The first
+    // write into the frame then lands on memory the program does not have —
+    // an access violation on a stack with room to spare.
+    let asm = compile(&arrays_worth(3 * PAGE_BYTES));
+    assert!(asm.contains(&format!("sub  rsp, {PAGE_BYTES}")), "{asm}");
+    assert!(asm.contains("mov  qword [rsp], 0"), "{asm}");
+    assert!(asm.contains(&format!("cmp  {RAX}, {PAGE_BYTES}")), "{asm}");
+    assert!(asm.contains(".probe0"), "{asm}");
+    // Whatever is left over after the last whole page, so `rsp` lands exactly
+    // where a single `sub` would have put it — which is why the epilogue is
+    // still one `add` of the whole frame.
+    assert!(asm.contains(&format!("sub  rsp, {RAX}")), "{asm}");
+    assert!(asm.contains("add  rsp, 16416"), "{asm}");
+}
+
+#[test]
+fn the_probe_walks_the_whole_frame_and_stops_exactly_at_it() {
+    // The loop is short enough to run here: how far `rsp` travels, and that no
+    // step is longer than a page, are the two things it must get right.
+    for size in [PAGE_BYTES + 8, 2 * PAGE_BYTES, 3 * PAGE_BYTES - 8, 10 * PAGE_BYTES] {
+        let (mut moved, mut left, mut biggest_step) = (0u32, size, 0u32);
+        loop {
+            moved += PAGE_BYTES;
+            biggest_step = biggest_step.max(PAGE_BYTES);
+            left -= PAGE_BYTES;
+            if left <= PAGE_BYTES {
+                break;
+            }
+        }
+        // The last step reserves the remainder without touching it, so the
+        // frame's own first write is what lands on the next page down.
+        biggest_step = biggest_step.max(left);
+        moved += left;
+        assert_eq!(moved, size, "the probe has to reserve exactly the frame");
+        assert!(biggest_step <= PAGE_BYTES, "no step may skip a page: {biggest_step}");
+    }
+}
+
 // -- frames ------------------------------------------------------------
 
 #[test]
@@ -982,7 +1089,12 @@ fn every_function_undoes_its_prologue_on_every_path() {
             // A leaf that spills nothing reserves no frame, and so has
             // nothing to release — but a `sub` without a matching `add` on
             // some path would leave the stack wrong.
-            let reserved = body.matches("sub  rsp,").count();
+            //
+            // Counted as *whether* the frame was taken rather than as how many
+            // `sub`s it took: a frame bigger than a page is walked down a page
+            // at a time, so the prologue holds two of them and a loop, while
+            // the epilogue is still the one `add` of the whole thing.
+            let reserved = usize::from(body.contains("sub  rsp,"));
             assert_eq!(
                 body.matches("add  rsp,").count(),
                 reserved * exits,

@@ -1309,3 +1309,128 @@ fn print_leaves_the_line_open_and_println_ends_it() {
         );
     }
 }
+
+/// Running out of stack is a *diagnosed* end, not a crash.
+///
+/// This is the one failure that used to escape the language's promise
+/// altogether: unbounded recursion left `0xC00000FD` on Windows and a `SIGSEGV`
+/// on Linux, with nothing written and nothing to read. Both are now the same
+/// line every other runtime failure prints.
+#[test]
+fn running_out_of_stack_reports_and_exits() {
+    let Some(harness) = Harness::find() else { return };
+
+    let exhausted = "the stack is exhausted";
+    let cases = [
+        // Recursion with no base case at all.
+        (
+            "fn down(int n) -> int {\n  return 1 + down(n - 1);\n}\n\
+             fn main() {\n  println(down(1));\n}",
+            exhausted,
+        ),
+        // One with a base case it will never reach, which is what the mistake
+        // actually looks like in a program someone wrote.
+        (
+            "fn down(int n) -> int {\n  if (n == 0) { return 0; }\n  return 1 + down(n + 1);\n}\n\
+             fn main() {\n  println(down(1));\n}",
+            exhausted,
+        ),
+        // Mutual recursion: neither function alone is suspicious.
+        (
+            "fn ping(int n) -> int {\n  return pong(n + 1);\n}\n\
+             fn pong(int n) -> int {\n  return ping(n + 1);\n}\n\
+             fn main() {\n  println(ping(0));\n}",
+            exhausted,
+        ),
+    ];
+    harness.each_stops_with("stack", &cases);
+}
+
+/// A frame of many pages is taken a page at a time, so it really is there.
+///
+/// Reserving it in one `sub rsp` steps over the page whose being touched is
+/// what makes the next one exist, and the first write into the frame then
+/// lands on memory the program was never given. On Windows that was an access
+/// violation on a stack with room to spare — for a program the compiler had
+/// accepted.
+#[test]
+fn a_frame_of_many_pages_is_usable_all_the_way_down() {
+    let Some(harness) = Harness::find() else { return };
+
+    // Twelve arrays of a thousand ints: ninety-six kibibytes, twenty-four
+    // pages, and comfortably inside the megabyte a Windows thread is given.
+    let elements = vec!["0"; 1024].join(", ");
+    let declarations: String =
+        (0..12).map(|i| format!("  int[1024] a{i} = [{elements}];\n")).collect();
+    // Write to the far end of the frame and to the near one, then read both
+    // back: what the probe has to get right is that every page in between is
+    // really there.
+    let source = format!(
+        "fn main() {{\n{declarations}  a0[0] = 1;\n  a11[1023] = 2;\n  \
+         println(a0[0] + a11[1023]);\n}}\n"
+    );
+
+    let run = harness.build_and_run("bigframe", &source, b"");
+    assert!(run.status.success(), "exited with {}\n{}", run.status, run.stderr);
+    assert_eq!(normalise(&run.stdout), "3\n");
+}
+
+/// The rule the optimiser lives by, checked against running programs.
+///
+/// A pass may change how long a program takes and how much assembly it spells
+/// out. It may not change what the program *does* — and in a language that
+/// stops rather than answer wrongly, "what it does" includes where it stops.
+/// Every example is built both ways and run, and the two must agree byte for
+/// byte, exit status included.
+///
+/// This is the only test that could catch a fold that quietly deleted an
+/// overflow, or an index whose bounds check went away with it. A dump can be
+/// read; only a running program can be believed.
+#[test]
+fn optimising_never_changes_what_a_program_prints() {
+    let Some(harness) = Harness::find() else { return };
+
+    let raw = tinyc::Options { optimise: false };
+    for file in EXAMPLES {
+        let source = std::fs::read_to_string(examples().join(file))
+            .unwrap_or_else(|e| panic!("{file}: {e}"));
+        let input = examples().join("expected").join(file.replace(".tc", ".in"));
+        let input = std::fs::read(&input).unwrap_or_default();
+
+        let stem = file.trim_end_matches(".tc");
+        let optimised = harness.build_and_run(&format!("{stem}_opt"), &source, &input);
+        let plain = harness.build_and_run_with(&format!("{stem}_raw"), &source, &input, raw);
+
+        assert_eq!(normalise(&plain.stdout), normalise(&optimised.stdout), "{file}: stdout");
+        assert_eq!(normalise(&plain.stderr), normalise(&optimised.stderr), "{file}: stderr");
+        assert_eq!(plain.status.code(), optimised.status.code(), "{file}: exit status");
+    }
+
+    // And the programs whose whole point is that they stop. An optimiser that
+    // folded away a fault would still print the right thing up to it, so these
+    // are checked for stopping in the same place with the same message.
+    let stoppers = [
+        // Overflow that only the pass can see, since it is not written as a
+        // literal anywhere.
+        "fn main() {\n  int big = 9223372036854775807;\n  int step = 1;\n  \
+         int sum = big + step;\n  println(sum);\n}",
+        // The same, with nothing reading the answer: still where this program
+        // ends.
+        "fn main() {\n  int big = 9223372036854775807;\n  int step = 1;\n  \
+         int unread = big + step;\n  println(0);\n}",
+        // A divisor that becomes zero only once the pass has propagated it.
+        "fn main() {\n  int n = 10;\n  int d = 0;\n  println(n / d);\n}",
+        // An index the pass can work out, past the end of an array whose
+        // length it also knows.
+        "fn main() {\n  int i = 5;\n  int[3] xs = [1, 2, 3];\n  println(xs[i]);\n}",
+    ];
+    for (index, source) in stoppers.iter().enumerate() {
+        let optimised = harness.build_and_run(&format!("stop{index}_opt"), source, b"");
+        let plain = harness.build_and_run_with(&format!("stop{index}_raw"), source, b"", raw);
+
+        assert!(!plain.status.success(), "case {index} was expected to stop: {}", plain.stdout);
+        assert_eq!(normalise(&plain.stderr), normalise(&optimised.stderr), "case {index}: stderr");
+        assert_eq!(normalise(&plain.stdout), normalise(&optimised.stdout), "case {index}: stdout");
+        assert_eq!(plain.status.code(), optimised.status.code(), "case {index}: exit status");
+    }
+}

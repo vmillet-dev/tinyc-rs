@@ -101,7 +101,7 @@ mod tests;
 
 use crate::ast::{CmpOp, Ty};
 use crate::codegen::{Allocation, Backend, PhysReg, RegisterFile};
-use crate::ir::{Instr, Program, Runtime, Value};
+use crate::ir::{Program, Runtime};
 
 use asm::Asm;
 pub use linux::Linux;
@@ -170,6 +170,16 @@ const ENTRY_POINT: &str = "main";
 
 /// The file descriptor a runtime failure is reported on.
 const STDERR: u32 = 2;
+
+/// Bytes in a page of memory, on x86-64 and on both platforms.
+///
+/// A stack does not simply exist down to its end: the pages below the one in
+/// use are not there yet, and what puts them there is *touching* the one right
+/// after the last. So a frame bigger than this cannot be taken in a single
+/// `sub rsp` — that would step over the page whose job is to notice, and the
+/// first write into the frame would land on memory the program does not have.
+/// See `func::FnEmitter::reserve_frame`.
+const PAGE_BYTES: u32 = 4096;
 
 // -- what the two platforms disagree about ---------------------------------
 
@@ -259,6 +269,27 @@ pub trait Platform: Send + Sync {
 
     /// Storage only this platform's input path needs, emitted into `.bss`.
     fn input_bss(&self, asm: &mut Asm);
+
+    /// Storage only this platform's [`Self::stack_bottom`] needs, emitted into
+    /// `.bss`. Both answers arrive through out-parameters, and the two calls
+    /// want different room for them.
+    fn stack_bss(&self, asm: &mut Asm);
+
+    /// Leave the lowest address of this thread's stack in `rax`, or zero if
+    /// this platform could not say.
+    ///
+    /// The one question about the machine that `rsp` cannot answer. A stack is
+    /// a range the program was *given*, and nothing in the running program
+    /// records where it ends — so both platforms have to ask, and they ask
+    /// different things. Guessing instead (a fixed budget below the first
+    /// `rsp`, say) would be a number that is right on one machine and silently
+    /// wrong on the next, which is the kind of answer this compiler does not
+    /// give.
+    ///
+    /// Emitted in the entry point once its frame exists, so a `call` is fine
+    /// here. Zero is a permitted answer and disables the check rather than
+    /// guessing at one — see [`runtime::STACK_LIMIT`].
+    fn stack_bottom(&self, asm: &mut Asm);
 
     /// Bytes of its own that [`Self::refill_read`] needs on the stack, above
     /// the shadow space. A call with more arguments than fit in registers
@@ -427,59 +458,6 @@ fn setcc(op: CmpOp) -> &'static str {
         CmpOp::Le => "setle",
         CmpOp::Gt => "setg",
         CmpOp::Ge => "setge",
-    }
-}
-
-/// Which of `idiv`'s two faults a division still has to rule out.
-///
-/// `idiv` traps on a zero divisor, and also on `i64::MIN / -1`, whose quotient
-/// does not fit in the register it would have to go in. Every check that a
-/// literal operand already answers is one the emitted code does not carry.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct DivGuards {
-    zero: bool,
-    overflow: bool,
-}
-
-impl DivGuards {
-    fn of(lhs: &Value, rhs: &Value) -> DivGuards {
-        let zero = !matches!(rhs, Value::Const(c) if *c != 0);
-        let overflow = match (lhs, rhs) {
-            // Only `i64::MIN` can overflow, and only when divided by -1.
-            (Value::Const(dividend), _) if *dividend != i64::MIN => false,
-            (_, Value::Const(divisor)) => *divisor == -1,
-            _ => true,
-        };
-        DivGuards { zero, overflow }
-    }
-
-    fn any(self) -> bool {
-        self.zero || self.overflow
-    }
-}
-
-/// Whether an instruction may jump to a runtime abort, and so whether the
-/// program needs the abort routine emitted at all.
-///
-/// Guarded arithmetic is nearly everything now: only a division both of whose
-/// faults a literal operand rules out escapes, and the operators that cannot
-/// fail at all.
-fn may_abort(instr: &Instr) -> bool {
-    match instr {
-        // A constant index into an array of known length was settled at
-        // compile time; anything else — including every index into a string,
-        // whose length is never known here — is checked where it lands.
-        Instr::Elem { index, len, .. } => {
-            !matches!((index, len), (Value::Const(_), Value::Const(_)))
-        }
-        Instr::Bin { op, lhs, rhs, .. } if op.divides() => DivGuards::of(lhs, rhs).any(),
-        // `add`, `sub` and `imul` are all guarded; a folded result never
-        // reaches an instruction in the first place.
-        Instr::Bin { .. } => true,
-        // Every runtime routine can fail: the two that allocate run out of
-        // memory, and the one that checks a character refuses.
-        Instr::RtCall { .. } => true,
-        _ => false,
     }
 }
 
