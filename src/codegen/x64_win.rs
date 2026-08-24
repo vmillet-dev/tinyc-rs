@@ -421,7 +421,7 @@ impl Backend for X64Windows {
         }
         string_stubs(&mut asm, &used);
         list_stubs(&mut asm, &used);
-        if used.writes_text() {
+        if used.encodes_text() {
             text_stubs(&mut asm, &used);
         }
         if used.reads_text() {
@@ -464,6 +464,10 @@ struct Used {
     read_line: bool,
     eof: bool,
     print_str: bool,
+    /// Whether any run of literal text is written out. Its bytes are in the
+    /// file already, so it needs no arena and no encoder — but it does still
+    /// put characters on the console, which is a question of its own.
+    print_text: bool,
     print_char: bool,
 }
 
@@ -490,6 +494,7 @@ impl Used {
             eof: false,
             print_str: false,
             print_char: false,
+            print_text: false,
         };
         for instr in program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instrs) {
             match instr {
@@ -501,6 +506,12 @@ impl Used {
                         Ty::Char => used.print_char = true,
                         _ => {}
                     }
+                }
+                // Text is written by handing `printf` bytes that are already in
+                // the file, so it needs the `%s` format and nothing else.
+                Instr::PrintText { .. } => {
+                    used.formats[format_index(Ty::Str)] = true;
+                    used.print_text = true;
                 }
                 Instr::VTable { class, .. } => used.vtables[class.0 as usize] = true,
                 other => {
@@ -567,16 +578,27 @@ impl Used {
             || self.print_str
     }
 
-    /// Whether any character is ever written out, and so whether the encoder
-    /// and the console's code page are needed.
+    /// Whether any character reaches the console, and so whether its code page
+    /// has to be set. Literal text counts: its bytes are UTF-8 too.
+    fn writes_text(&self) -> bool {
+        self.print_str || self.print_char || self.print_text
+    }
+
+    /// Whether anything has to be *turned into* UTF-8 first, and so whether the
+    /// encoder is needed at all.
+    ///
+    /// A different question from [`Self::writes_text`], and the text table is
+    /// what pulled them apart: a run of literal text is already the bytes it
+    /// will be written as, so a program that only writes literals sets the code
+    /// page and carries no encoder.
+    fn encodes_text(&self) -> bool {
+        self.print_str || self.print_char
+    }
+
     /// Whether anything is read from the input, and so whether the buffer and
     /// the decoder are needed.
     fn reads_text(&self) -> bool {
         self.read_line || self.eof
-    }
-
-    fn writes_text(&self) -> bool {
-        self.print_str || self.print_char
     }
 }
 
@@ -594,6 +616,11 @@ fn format_index(ty: Ty) -> usize {
         // thought about here instead of quietly getting `%s` applied to it.
         Ty::Str | Ty::Char | Ty::Enum(_) | Ty::Array(_) | Ty::List(_) | Ty::Class(_) => 1,
     }
+}
+
+/// The label of one run of literal text.
+fn text_label(index: usize) -> String {
+    format!("text{index}")
 }
 
 /// The label of a class's method table.
@@ -744,13 +771,13 @@ fn header(asm: &mut Asm, target: &str, used: &Used) {
 fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
     asm.line("section .data");
     if used.prints(Ty::Int) {
-        asm.asm(&format!("{FMT_INT}: db \"%lld\", 10, 0"));
+        asm.asm(&format!("{FMT_INT}: db \"%lld\", 0"));
     }
     if used.prints(Ty::Str) {
-        asm.asm(&format!("{FMT_STR}: db \"%s\", 10, 0"));
+        asm.asm(&format!("{FMT_STR}: db \"%s\", 0"));
     }
     if used.prints(Ty::Bool) {
-        asm.asm(&format!("{FMT_BOOL}: db \"%s\", 10, 0"));
+        asm.asm(&format!("{FMT_BOOL}: db \"%s\", 0"));
         asm.asm(&format!("{BOOL_TRUE}: db \"true\", 0"));
         asm.asm(&format!("{BOOL_FALSE}: db \"false\", 0"));
     }
@@ -797,6 +824,18 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
         for abort in &ABORTS {
             asm.asm(&format!("{}: db {}", abort.message(), bytes_of(&abort.text())));
         }
+    }
+    // Literal text, as the bytes it will be written as. Nothing at run time
+    // encodes it, counts it or copies it — which is the whole reason the words
+    // around a format's specifiers are not string literals by the time they
+    // reach here.
+    for (index, text) in program.texts.iter().enumerate() {
+        asm.asm(&format!(
+            "{}: db {}, 0    ; {:?}",
+            text_label(index),
+            bytes_of(text),
+            text
+        ));
     }
     // A literal is laid out exactly as a string built at run time is: the
     // character count in the eight bytes before the characters, and the
@@ -2299,6 +2338,15 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 self.asm.asm(&format!("call {}", runtime_symbol(*callee)));
                 self.take_result(*dst);
             }
+            // Bytes that are already in the file: one call, no arena, no
+            // encoder. The text is `printf`'s *argument* and never its format —
+            // a `%%` in a TinyC format has become one `%` by now, and handing
+            // that to `printf` as a format would make it a specifier again.
+            Instr::PrintText { id } => {
+                self.asm.asm(&format!("lea  {RCX}, [{FMT_STR}]"));
+                self.asm.asm(&format!("lea  {RDX}, [{}]", text_label(id.0 as usize)));
+                self.asm.asm("call printf");
+            }
             // A string and a character are written by a routine rather than by
             // `printf`, because what they hold has to be encoded first. The
             // routine ends in the same `printf` all the same, so everything
@@ -2668,7 +2716,7 @@ mod tests {
     #[test]
     fn bool_data_is_emitted_only_when_a_bool_is_printed() {
         let with_bool = compile("print(true);");
-        assert!(with_bool.contains("fmt_bool: db \"%s\", 10, 0"), "{with_bool}");
+        assert!(with_bool.contains("fmt_bool: db \"%s\", 0"), "{with_bool}");
         assert!(with_bool.contains("bool_true: db \"true\", 0"), "{with_bool}");
         assert!(with_bool.contains("bool_false: db \"false\", 0"), "{with_bool}");
 
@@ -3016,15 +3064,28 @@ mod tests {
         assert!(!asm.contains("SetConsoleOutputCP"), "{asm}");
     }
 
+    /// A string *value* has to be encoded before it can be written. A literal
+    /// does not, and that is the whole difference the text table buys.
     #[test]
     fn printing_a_string_brings_the_arena_and_the_encoder_with_it() {
-        // Printing encodes into a buffer cut from the arena, so even a program
-        // that only prints a literal allocates — and can therefore run out of
-        // memory, which is why the abort stubs come too.
-        let asm = compile("print(\"hi\");");
+        // The characters are four bytes each in memory and have to become UTF-8
+        // somewhere; the arena is where. So even this can run out of memory,
+        // which is why the abort stubs come too.
+        let asm = compile("string s = \"hi\";\nprint(s);");
         assert!(asm.contains("extern malloc"), "{asm}");
         assert!(asm.contains(&format!("{ABORT_OOM}:")), "{asm}");
         assert!(asm.contains(&format!("{UTF8}:")), "{asm}");
+    }
+
+    #[test]
+    fn printing_a_literal_brings_neither() {
+        let asm = compile("print(\"hi\");");
+        assert!(asm.contains("text0: db"), "the bytes are in the file: {asm}");
+        assert!(!asm.contains("extern malloc"), "{asm}");
+        assert!(!asm.contains(&format!("{UTF8}:")), "{asm}");
+        // What it still needs: the console has to be told which encoding those
+        // bytes are in, or a literal with an accent in it comes out wrong.
+        assert!(asm.contains("SetConsoleOutputCP"), "{asm}");
     }
 
     #[test]
@@ -3555,5 +3616,60 @@ mod tests {
         assert!(!names.iter().any(|n| is_runtime_symbol(n) && *n == "tc$rt"), "{names:?}");
         assert!(!is_runtime_symbol("tc$rt"), "a function called `rt` is not a runtime helper");
         assert!(is_runtime_symbol("tc$rt$concat"), "a real helper is one");
+    }
+
+    // -- writing things out -------------------------------------------------
+
+    /// Literal text is bytes in the file, handed to `printf` as its *argument*.
+    ///
+    /// Never as its format: a `%%` in a TinyC format has already become one `%`
+    /// by the time it reaches here, and giving that to `printf` as a format
+    /// would make it a specifier again — of a variadic argument nobody passed.
+    #[test]
+    fn literal_text_is_an_argument_to_printf_and_never_its_format() {
+        let asm = compile("print(\"100%% sure\");");
+        assert!(asm.contains("text0: db"), "{asm}");
+        assert!(asm.contains("; \"100% sure\""), "the percent survives as one: {asm}");
+        // `rcx` is the format and `rdx` the argument: the text is in `rdx`.
+        let at = asm.find("lea  rdx, [text0]").expect("the text as an argument");
+        assert!(asm[..at].ends_with("lea  rcx, [fmt_str]\n    "), "{asm}");
+    }
+
+    /// The format strings do not end a line any more. `print` writes what it was
+    /// given and no more, and the newline of a `println` is a piece of text like
+    /// any other.
+    #[test]
+    fn no_format_string_carries_a_newline() {
+        let asm = compile("int n = 1;\nprintln(n);\nprintln(true);\nprintln(\"s\");");
+        for format in [FMT_INT, FMT_STR, FMT_BOOL] {
+            let line = asm
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("{format}:")))
+                .unwrap_or_else(|| panic!("{format} should be emitted: {asm}"));
+            assert!(!line.contains(", 10,"), "{format} still ends a line: {line}");
+        }
+    }
+
+    /// A program that only writes literal text needs the console's code page
+    /// set, and nothing else: no arena, no encoder, no `malloc`.
+    ///
+    /// The two questions came apart when text stopped being a string. Getting
+    /// this wrong in the other direction would be silent — an accented literal
+    /// on a console still in the machine's old code page comes out as mojibake.
+    #[test]
+    fn writing_only_literals_sets_the_code_page_and_carries_no_encoder() {
+        let asm = compile("println(\"héllo\");");
+        assert!(asm.contains("SetConsoleOutputCP"), "{asm}");
+        assert!(!asm.contains(&format!("{UTF8}:")), "{asm}");
+        assert!(!asm.contains("extern malloc"), "{asm}");
+    }
+
+    /// Nothing is emitted for a program that writes nothing.
+    #[test]
+    fn a_program_that_writes_nothing_declares_nothing_to_write_with() {
+        let asm = compile("int n = 1;\nprint();");
+        assert!(!asm.contains("text0"), "{asm}");
+        assert!(!asm.contains("fmt_str"), "{asm}");
+        assert!(!asm.contains("SetConsoleOutputCP"), "{asm}");
     }
 }

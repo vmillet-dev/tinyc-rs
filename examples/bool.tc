@@ -2,9 +2,9 @@
 fn main() {
   bool ready = true;
   bool done = false;
-  print(ready);    // true
-  print(done);     // false
+  println(ready);    // true
+  println(done);     // false
   done = true;
-  print(done);     // true
-  print(false);    // a literal can be printed directly
+  println(done);     // true
+  println(false);    // a literal can be printed directly
 }

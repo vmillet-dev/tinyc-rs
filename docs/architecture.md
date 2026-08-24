@@ -14,8 +14,8 @@ fn add(int a, int b) -> int {
 
 fn main() {
   string s = "Hello World";
-  print(add(10, 20));
-  print(s);
+  println(add(10, 20));
+  println(s);
 }
 ```
 
@@ -102,10 +102,11 @@ link /subsystem:console /entry:mainCRTStartup /out:out\hello.exe out\hello.obj m
 `-f win64` produces a COFF object, which is exactly what `link.exe` expects — so
 NASM and the Microsoft linker work together without anything in between.
 
-`print` is compiled into a call to the C runtime's `printf`, which is why the
-CRT is linked in. `legacy_stdio_definitions.lib` provides `printf` as a real
-symbol, since the UCRT headers normally supply it as an inline function. A
-program containing guarded arithmetic also reaches for `_write` and `exit`, both
+Writing anything out is compiled into a call to the C runtime's `printf`,
+which is why the CRT is linked in. A TinyC format never reaches it — see
+[Writing things out](#writing-things-out). `legacy_stdio_definitions.lib`
+provides `printf` as a real symbol, since the UCRT headers normally supply it
+as an inline function. A program containing guarded arithmetic also reaches for `_write` and `exit`, both
 from the same library — see
 [Arithmetic never answers wrongly](#arithmetic-never-answers-wrongly).
 
@@ -125,7 +126,9 @@ stmt    := decl | assign | print | push | if | while | for | match | return
 decl    := type IDENT "=" expr ";"
 assign  := place "=" expr ";"
 place   := IDENT (("[" expr "]") | ("." IDENT))*
-print   := "print" "(" expr ")" ";"
+print   := ("print" | "println") "(" args? ")" ";"
+args    := format ("," expr)* | expr
+format  := STRING          -- a literal; its `%`s are checked at compile time
 push    := "push" "(" place "," expr ")" ";"
 if      := "if" "(" expr ")" block ("else" (block | if))?
 while   := "while" "(" expr ")" block
@@ -186,7 +189,7 @@ fn add(int a, int b) -> int {
 }
 
 fn banner(string title) {     // no `->`: this one returns nothing
-  print(title);
+  println(title);
 }
 
 fn fib(int n) -> int {
@@ -257,7 +260,7 @@ class Circle : Shape {
 }
 
 fn report(Shape s) {
-  print(s.area());     // 75 when handed a Circle
+  println(s.area());   // 75 when handed a Circle
 }
 ```
 
@@ -312,9 +315,9 @@ That one decision is what lets a polymorphic value be a local, a return and an
 element:
 
 ```c
-Shape held = c;        // room for the biggest Shape; the Circle is copied in
+Shape held = c;          // room for the biggest Shape; the Circle is copied in
 c.r = 100;
-print(held.area());    // 75, not 30000 — a copy, not an alias
+println(held.area());    // 75, not 30000 — a copy, not an alias
 ```
 
 The copy carries the vtable pointer, so the value keeps answering as a `Circle`.
@@ -429,7 +432,7 @@ error: `Grid` is too big
 * **An object is complete or it does not exist.** Every field is named in the
   literal, inherited ones included; there is no default and no partial object,
   which is what removes the question `null` would have answered.
-* **No printing and no comparing.** `print` takes one value, and comparing
+* **No printing and no comparing.** `print` writes one value, and comparing
   addresses would quietly answer a different question.
 * **A field may not be a list.** Everything else nests — see
   [Composition](#composition) — because it lives inside the object and is
@@ -494,7 +497,7 @@ ever travels outward, which is the whole safety story in one sentence. See
 The rest of the rules fall out of the same reasoning: an array literal's length
 is its element count and the declaration must agree with it; every element must
 have the same type; arrays answer no comparison and no arithmetic; and `print`
-takes one value, so it refuses an array.
+writes one value, so it refuses an array.
 
 ### What arrays changed underneath
 
@@ -533,11 +536,11 @@ A `string` is a run of **characters**, not of bytes
 
 ```c
 string a = "héllo";
-print(len(a));                 // 5 — five characters, six bytes to write
-print(a[1]);                   // é
-print(a + " wörld");           // héllo wörld
-print(a == "héllo");           // true — the contents, not the address
-print("count = " + string(5)); // count = 5
+println(len(a));                 // 5 — five characters, six bytes to write
+println(a[1]);                   // é
+println(a + " wörld");           // héllo wörld
+println(a == "héllo");           // true — the contents, not the address
+println("count = " + string(5)); // count = 5
 ```
 
 `len` counts characters, `s[i]` is one character, and a letter written with an
@@ -676,8 +679,8 @@ int[] xs = [];
 for (int i = 1; i <= 3; i = i + 1) {
   push(xs, i * i);
 }
-print(len(xs));    // 3
-print(xs[2]);      // 9
+println(len(xs));    // 3
+println(xs[2]);      // 9
 ```
 
 `int[3]` and `int[]` are different types, and neither replaces the other: use
@@ -797,6 +800,110 @@ rather than a bare type, for one question asked in one place: `push` onto a
 parameter is refused. That is the smallest amount of ownership tracking that
 makes the arena safe to grow things in.
 
+### Writing things out
+
+`print` writes what it is given. `println` writes it and ends the line. That is
+the only difference between them, and it lasts exactly as long as the tree:
+
+```c
+println("Grade: %c for student %s", grade, student);
+```
+
+A **string literal in first position is a format**. Its `%`s say what goes
+where, and one value must follow for each:
+
+| Specifier | Writes |
+|-----------|--------|
+| `%d` | an `int` |
+| `%c` | a `char` |
+| `%s` | a `string` |
+| `%b` | a `bool` |
+| `%e` | the name of an enum's variant |
+| `%%` | a percent sign |
+
+There is deliberately no specifier meaning *whatever this happens to be*. A
+specifier is a claim the program makes about its own argument, and the type
+checker holds it to the claim — the same bargain `string(n)` strikes, and for
+the same reason: a format string is the one place a number most wants to become
+text by itself, and here too it does not.
+
+#### Nothing at run time reads a `%`
+
+The parser splits a format once, into the text and the specifiers it is made of,
+and the `%` never survives that. Everything that could be wrong with one is
+therefore a compile error with a column:
+
+```
+error: cannot write a `string` with `%d`
+ --> t.tc:3:21
+  |
+3 |   println("n = %d", name);
+  |                     ^^^^ `%d` writes an int
+  = note: this is the specifier it has to match
+ --> t.tc:3:16
+  |
+3 |   println("n = %d", name);
+  |                ^^
+```
+
+Pointing *inside* a literal is the one place in the compiler where a span has to
+be worked out rather than read off a token: an escape earlier in the string has
+already turned two characters of source into one, so counting from the opening
+quote lands in the wrong column. The lexer keeps each character's own byte
+offset beside it, and `StrLit::span` cuts a span from those.
+
+It also settles a question C never did. `printf` is only ever handed a format
+this compiler wrote — `"%lld"`, `"%s"` — with exactly one value beside it.
+Text the program wrote is `printf`'s *argument*, never its format, which
+matters as soon as `%%` exists: by the time a piece of text reaches the backend
+the doubled sign has become one `%`, and handing that to `printf` as a format
+would make it a specifier again.
+
+The cost is that a format must be written out where it is used. A `string`
+variable cannot be one, because there would be nothing to check it against.
+
+#### A literal is not a string
+
+Splitting a format at compile time leaves the words around the specifiers as
+runs of text that will never change, so they are emitted as the bytes they will
+be written as:
+
+```asm
+    text0: db 78, 117, 109, 98, 101, 114, 32, 105, 115, 58, 32, 0    ; "Number is: "
+```
+
+A TinyC `string` cannot be written that way. It is four bytes per character with
+a count in front — see [Strings and characters](#strings-and-characters) — so
+writing one means encoding it into UTF-8 somewhere first, and that somewhere is
+the arena. A literal skips all of it: one `printf`, no allocation, no encoder.
+`print("hi")` compiles into a program that never calls `malloc`.
+
+The two live in separate tables, `Program::strings` and `Program::texts`, and
+the same words can be in both — a literal that is *printed* and a literal that
+is *assigned to a variable* are the same characters in two different layouts.
+
+It also splits a question that used to be one. Writing a `string` or a `char`
+needs the encoder; writing anything at all needs the console's code page set, or
+an accented literal comes out as mojibake. `Used::encodes_text` and
+`Used::writes_text` are those two questions.
+
+#### Where the newline goes
+
+`println` stops being a separate statement during lowering: its line ending
+becomes one more piece of text, joined to the text in front of it when there is
+any. So `println("done")` is a single write of `"done\n"`, and the format
+strings themselves no longer end a line — `fmt_int` is `"%lld", 0`, not
+`"%lld", 10, 0`.
+
+The tree keeps the two spellings apart even so, because `--emit ast` should show
+the program that was written rather than the desugaring. `for` is treated the
+same way, and becomes a `while` at the same stage.
+
+One rule the order follows: **every value is evaluated before anything is
+written**. A `print` is written like a call and read like one, so its arguments
+go first — otherwise a call that writes something itself would land in the
+middle of the line rather than before it.
+
 ### Reading input
 
 Three functions the compiler provides, and the first programs that do not know
@@ -805,7 +912,7 @@ what they will be given ([`examples/interactive.tc`](../examples/interactive.tc)
 ```c
 while (!eof()) {
   string line = read_line();
-  print(line + " (" + string(len(line)) + " characters)");
+  println(line + " (" + string(len(line)) + " characters)");
 }
 ```
 
@@ -841,9 +948,9 @@ able to handle it.
 ```c
 string line = read_line();
 if (is_int(line)) {
-  print(int(line) * 2);
+  println(int(line) * 2);
 } else {
-  print("that is not a number");
+  println("that is not a number");
 }
 ```
 
@@ -1086,7 +1193,7 @@ deeply a statement is nested — is what rejects them.
 for (int c = 1; c <= 10; c = c + 1) {
   if (c == 2) { continue; }   // the step still runs on the way past
   if (c == 4) { break; }
-  print(c);                   // 1, 3
+  println(c);                   // 1, 3
 }
 ```
 
@@ -1104,7 +1211,7 @@ already settled the answer, which is what makes a guard like this work:
 
 ```c
 int zero = 0;
-print(zero == 0 || total / zero > 1);   // true, without ever dividing
+println(zero == 0 || total / zero > 1); // true, without ever dividing
 ```
 
 They are **not** `BinOp`s in the AST, and there is no `and` or `or` instruction

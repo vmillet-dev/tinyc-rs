@@ -75,38 +75,38 @@ fn widen(Segment s, int by) -> Segment {
 
 fn main() {
   Segment s = Segment { a: Point { x: 1, y: 1 }, b: Point { x: 5, y: 5 } };
-  print(s.a.x);          // 1
-  print(s.span());       // 4
-  print(s.b.sum());      // 10 — a method on a field of a field
+  println(s.a.x);          // 1
+  println(s.span());       // 4
+  println(s.b.sum());      // 10 — a method on a field of a field
 
   // A whole object is copied out, and a whole one is written in.
   Point p = s.b;
   s.b = Point { x: 9, y: 9 };
-  print(p.x);            // 5 — `p` was a copy, not a second name for `s.b`
-  print(s.span());       // 8
+  println(p.x);            // 5 — `p` was a copy, not a second name for `s.b`
+  println(s.span());       // 8
 
   // Copying the outer object copies the inner ones with it: they live in it.
   Segment kept = s;
   s.a.x = 100;
-  print(kept.a.x);       // 1
+  println(kept.a.x);       // 1
 
   stretch(s);
-  print(s.b.x);          // 18
-  print(widen(s, 2).b.x);// 20
+  println(s.b.x);          // 18
+  println(widen(s, 2).b.x);// 20
 
   // An array field is indexed like any other array, and an array *of* objects
   // hands back the object itself rather than a copy of it.
   Grid g = Grid { rows: [Row { cells: [1, 2, 3] }, Row { cells: [4, 5, 6] }] };
-  print(g.rows[1].cells[2]);   // 6
+  println(g.rows[1].cells[2]);   // 6
   g.rows[1].cells[2] = 60;
-  print(g.rows[1].cells[2]);   // 60
-  print(len(g.rows));          // 2
+  println(g.rows[1].cells[2]);   // 60
+  println(len(g.rows));          // 2
 
   // The vtable pointer travels with the copy, so a field of the base class
   // answers as whatever was put in it.
   Holder h = Holder { held: Circle { r: 2 }, tag: 1 };
-  print(h.held.area());  // 12
+  println(h.held.area());  // 12
   h.held = Rect { w: 5, h: 5 };
-  print(h.held.area());  // 25
-  print(h.tag);          // 1 — the field beside it is untouched
+  println(h.held.area());  // 25
+  println(h.tag);          // 1 — the field beside it is untouched
 }

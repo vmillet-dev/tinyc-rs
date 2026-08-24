@@ -3,14 +3,14 @@ fn main() {
   int x = -10;
   int y = 20;
   string s = "Hello World";
-  print(x + y);
-  print(s);
+  println(x + y);
+  println(s);
   bool isReady = true;
-  print(isReady);
+  println(isReady);
 
   int i = 3;
   while (i > 0) {
-    print(i);
+    println(i);
     i = i - 1;
   }
 }

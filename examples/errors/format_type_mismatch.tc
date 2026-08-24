@@ -1,0 +1,4 @@
+fn main() {
+  string name = "Toto";
+  println("n = %d", name);
+}

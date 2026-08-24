@@ -33,16 +33,16 @@ fn refused_for_depth(src: &str) -> bool {
 /// rather than a diagnostic until the count was made about the tree instead.
 fn nested(levels: usize) -> Vec<(&'static str, String)> {
     vec![
-        ("parentheses", format!("fn main() {{ print({}1{}); }}", "(".repeat(levels), ")".repeat(levels))),
-        ("unary operators", format!("fn main() {{ print({}1); }}", "-".repeat(levels))),
+        ("parentheses", format!("fn main() {{ println({}1{}); }}", "(".repeat(levels), ")".repeat(levels))),
+        ("unary operators", format!("fn main() {{ println({}1); }}", "-".repeat(levels))),
         (
             "blocks",
             format!("fn main() {{ {}{} }}", "if (true) { ".repeat(levels), "}".repeat(levels)),
         ),
-        ("a chain of operators", format!("fn main() {{ print(1{}); }}", " + 1".repeat(levels))),
+        ("a chain of operators", format!("fn main() {{ println(1{}); }}", " + 1".repeat(levels))),
         (
             "a chain of short circuits",
-            format!("fn main() {{ print(true{}); }}", " && true".repeat(levels)),
+            format!("fn main() {{ println(true{}); }}", " && true".repeat(levels)),
         ),
         (
             "an else-if chain",
@@ -100,15 +100,15 @@ fn a_chain_far_past_the_limit_is_still_a_diagnostic() {
 #[test]
 fn a_wide_program_is_not_a_deep_one() {
     let elements = vec!["1"; 1000].join(", ");
-    let source = format!("fn main() {{ int[1000] xs = [{elements}];\n  print(xs[999]); }}");
+    let source = format!("fn main() {{ int[1000] xs = [{elements}];\n  println(xs[999]); }}");
     assert!(compiles(&source), "a thousand elements is width, not depth");
 
-    let statements = "print(1);\n".repeat(2000);
+    let statements = "println(1);\n".repeat(2000);
     assert!(compiles(&format!("fn main() {{ {statements} }}")), "statements are siblings too");
 
     let functions: String =
         (0..500).map(|n| format!("fn f{n}() -> int {{ return {n}; }}\n")).collect();
-    assert!(compiles(&format!("{functions}fn main() {{ print(f499()); }}")));
+    assert!(compiles(&format!("{functions}fn main() {{ println(f499()); }}")));
 }
 
 // -- stopping early --------------------------------------------------------
@@ -122,7 +122,7 @@ fn a_wide_program_is_not_a_deep_one() {
 #[test]
 fn an_observer_that_says_no_stops_the_pipeline_where_it_said_so() {
     // Lexes, parses, and does not type-check: `main` must take nothing.
-    let source = "fn main(int a) {\n  print(a);\n}\n";
+    let source = "fn main(int a) {\n  println(a);\n}\n";
 
     let mut seen = Vec::new();
     let stopped = compile_with(source, Target::X86_64Windows, |stage| {
@@ -139,7 +139,7 @@ fn an_observer_that_says_no_stops_the_pipeline_where_it_said_so() {
 
 #[test]
 fn the_stages_arrive_in_the_order_the_pipeline_runs_them() {
-    let source = "fn main() {\n  print(1 + 2);\n}\n";
+    let source = "fn main() {\n  println(1 + 2);\n}\n";
 
     let mut seen = Vec::new();
     let compiled = compile_with(source, Target::X86_64Windows, |stage| {
@@ -196,9 +196,9 @@ fn a_stage_that_fails_shows_nothing_after_it() {
 #[test]
 fn a_failure_from_any_stage_carries_a_span_into_the_source() {
     let cases = [
-        ("the lexer", "fn main() {\n  print(@);\n}\n"),
-        ("the parser", "fn main() {\n  print(1\n}\n"),
-        ("the type checker", "fn main() {\n  print(nope);\n}\n"),
+        ("the lexer", "fn main() {\n  println(@);\n}\n"),
+        ("the parser", "fn main() {\n  println(1\n}\n"),
+        ("the type checker", "fn main() {\n  println(nope);\n}\n"),
     ];
 
     for (stage, source) in cases {

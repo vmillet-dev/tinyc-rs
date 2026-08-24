@@ -14,7 +14,9 @@
 //! decl    := type IDENT "=" expr ";"
 //! assign  := place "=" expr ";"
 //! place   := IDENT ("[" expr "]")?
-//! print   := "print" "(" expr ")" ";"
+//! print   := ("print" | "println") "(" args? ")" ";"
+//! args    := format ("," expr)* | expr
+//! format  := STRING          -- a literal, whose `%`s are checked here
 //! if      := "if" "(" expr ")" block ("else" (block | if))?
 //! while   := "while" "(" expr ")" block
 //! for     := "for" "(" (decl | assign) expr ";" assign-no-semi ")" block
@@ -46,11 +48,11 @@
 use crate::ast;
 use crate::ast::{
     ArmBody, BinOp, Block, ClassDecl, CmpOp, EnumDecl, Expr, ExprKind, FieldDecl, FieldInit,
-    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Prim, Program, Shape, Stmt, TypeRef,
-    Variant,
+    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Prim, PrintPart, Program, Shape, Spec, Stmt,
+    TypeRef, Variant,
 };
 use crate::diag::{Diagnostic, Result, Span};
-use crate::token::{Token, TokenKind};
+use crate::token::{StrLit, Token, TokenKind};
 
 pub fn parse(tokens: &[Token]) -> Result<Program> {
     Parser { tokens, pos: 0, next_id: 0, depth: 0 }.run().map_err(|d| vec![d])
@@ -469,7 +471,7 @@ impl<'a> Parser<'a> {
             return self.decl();
         }
         match self.peek().kind {
-            TokenKind::KwPrint => self.print_stmt(),
+            TokenKind::KwPrint | TokenKind::KwPrintln => self.print_stmt(),
             TokenKind::KwPush => self.push_stmt(),
             TokenKind::KwIf => self.if_stmt(),
             TokenKind::KwWhile => self.while_stmt(),
@@ -725,13 +727,118 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `print(...)` and `println(...)`, split into what they write.
+    ///
+    /// The first argument decides how the rest are read. A **string literal**
+    /// there is a *format*: its `%`s are specifiers, and exactly one value must
+    /// follow for each. Anything else is a single value to write, which is the
+    /// whole of the one-argument form this statement used to have.
+    ///
+    /// Splitting it here, once, is the design. Nothing at run time ever reads a
+    /// `%`, so every mistake in a format — an unknown letter, a missing value,
+    /// a value of the wrong type — is a compile error with a column; and the C
+    /// `printf` underneath is never handed text the program wrote, which is the
+    /// other half of the same decision.
     fn print_stmt(&mut self) -> PResult<Stmt> {
-        let span = self.bump().span;
+        let keyword = self.bump();
+        let span = keyword.span;
+        let newline = keyword.kind == TokenKind::KwPrintln;
         let open = self.expect(TokenKind::LParen)?.span;
-        let value = self.expr()?;
+
+        // Asked before the literal is reached, not as a guard after it: an
+        // empty argument list is `print()`, and a format that happens to be the
+        // only argument is not.
+        let parts = if self.peek().kind == TokenKind::RParen {
+            // `println()` writes nothing but the line ending, and `print()`
+            // writes nothing at all. One rule rather than two, and a blank line
+            // is what the first is for.
+            Vec::new()
+        } else if let Some((format, at)) = self.format_literal() {
+            self.formatted(format, at)?
+        } else {
+            let value = self.expr()?;
+            if self.peek().kind == TokenKind::Comma {
+                return Err(
+                    Diagnostic::new("a format has to be written out here", value.span)
+                        .with_label("this is not a string literal")
+                        .with_note(
+                            "only a literal can be checked against the values after it, \
+                             so only a literal may be a format",
+                            None,
+                        ),
+                );
+            }
+            vec![PrintPart::Value(value)]
+        };
+
         self.expect_closing_paren(open)?;
         self.expect(TokenKind::Semi)?;
-        Ok(Stmt::Print { span, value })
+        Ok(Stmt::Print { span, newline, parts })
+    }
+
+    /// The string literal in first position, if that is what is there.
+    ///
+    /// A literal *followed by an operator* is not one: `print("a" + s)` joins
+    /// two strings and writes the answer, and only a literal that is the whole
+    /// argument can be a format. So the token after it has to end the argument.
+    fn format_literal(&mut self) -> Option<(StrLit, Span)> {
+        let TokenKind::Str(lit) = &self.peek().kind else { return None };
+        if !matches!(self.peek_at(1).kind, TokenKind::Comma | TokenKind::RParen) {
+            return None;
+        }
+        let lit = lit.clone();
+        // The token span, quotes included: a note about the format as a whole
+        // should underline the whole of it, and the offsets inside a literal
+        // start after the opening quote.
+        Some((lit, self.bump().span))
+    }
+
+    /// A format string and the values that fill it, paired up.
+    fn formatted(&mut self, format: StrLit, at: Span) -> PResult<Vec<PrintPart>> {
+        let pieces = split_format(&format)?;
+
+        let mut values = Vec::new();
+        while self.eat(&TokenKind::Comma) {
+            values.push(self.expr()?);
+        }
+
+        let wanted = pieces.iter().filter(|piece| matches!(piece, Piece::Spec(..))).count();
+        if values.len() > wanted {
+            // The first value with nothing to write it is the one to point at:
+            // the ones before it are accounted for, whatever went wrong.
+            return Err(Diagnostic::new(
+                "too many values for this format",
+                values[wanted].span,
+            )
+            .with_label("no specifier is left for this one")
+            .with_note(
+                format!("the format has {}", count(wanted, "specifier", "specifiers")),
+                Some(at),
+            ));
+        }
+
+        let mut values = values.into_iter();
+        let mut parts = Vec::new();
+        for piece in pieces {
+            match piece {
+                Piece::Text(text) => parts.push(PrintPart::Text(text)),
+                Piece::Spec(spec, at) => match values.next() {
+                    Some(expr) => parts.push(PrintPart::Spec { spec, span: at, expr }),
+                    None => {
+                        return Err(Diagnostic::new("too few values for this format", at)
+                            .with_label("nothing was given for this one")
+                            .with_note(
+                                format!(
+                                    "the format asks for {}",
+                                    count(wanted, "value", "values")
+                                ),
+                                None,
+                            ));
+                    }
+                },
+            }
+        }
+        Ok(parts)
     }
 
     /// `push(xs, value);`
@@ -924,7 +1031,7 @@ impl<'a> Parser<'a> {
         let span = token.span;
         let kind = match &token.kind {
             TokenKind::Int(v) => ExprKind::Int(*v),
-            TokenKind::Str(chars) => ExprKind::Str(chars.clone()),
+            TokenKind::Str(lit) => ExprKind::Str(lit.chars.clone()),
             TokenKind::Char(c) => ExprKind::Char(*c),
             TokenKind::Bool(v) => ExprKind::Bool(*v),
             // `int(c)` — a conversion, written as the type it produces. A type
@@ -1116,6 +1223,79 @@ fn opening_of(closing: &TokenKind) -> &'static str {
         TokenKind::RBrace => "{",
         TokenKind::RBracket => "[",
         other => unreachable!("`{}` closes nothing", other.text()),
+    }
+}
+
+/// A format string's pieces, before the values are attached to them.
+enum Piece {
+    Text(Vec<char>),
+    Spec(Spec, Span),
+}
+
+/// Split a format string into the text and the specifiers it is made of.
+///
+/// Every span cut here points into the *source*, not into the decoded
+/// characters — which is why a literal keeps the offset of each of its
+/// characters. An escape earlier in the string has already turned two
+/// characters of source into one by the time a `%d` later in it is reached, so
+/// counting from the opening quote would land in the wrong column.
+fn split_format(lit: &StrLit) -> PResult<Vec<Piece>> {
+    let mut pieces = Vec::new();
+    let mut text: Vec<char> = Vec::new();
+    let mut at = 0;
+    while at < lit.chars.len() {
+        if lit.chars[at] != '%' {
+            text.push(lit.chars[at]);
+            at += 1;
+            continue;
+        }
+        let Some(&letter) = lit.chars.get(at + 1) else {
+            return Err(Diagnostic::new("unfinished specifier", lit.span(at, at + 1))
+                .with_label("a `%` at the end of a format writes nothing")
+                .with_note("write `%%` for a percent sign", None));
+        };
+        let span = lit.span(at, at + 2);
+        at += 2;
+        // `%%` is how a format says a percent sign, and it is the reason a `%`
+        // on its own has to be refused rather than written out: a format that
+        // quietly printed `%d` when the value was forgotten would be exactly
+        // the kind of silence this language does not keep.
+        if letter == '%' {
+            text.push('%');
+            continue;
+        }
+        let Some(spec) = Spec::from_letter(letter) else {
+            return Err(Diagnostic::new(
+                format!("unknown specifier `%{}`", letter.escape_debug()),
+                span,
+            )
+            .with_label("this writes nothing")
+            .with_note(spec_list(), None));
+        };
+        if !text.is_empty() {
+            pieces.push(Piece::Text(std::mem::take(&mut text)));
+        }
+        pieces.push(Piece::Spec(spec, span));
+    }
+    if !text.is_empty() {
+        pieces.push(Piece::Text(text));
+    }
+    Ok(pieces)
+}
+
+/// The specifiers a format may use, built from the list itself so that adding
+/// one cannot leave this note behind.
+fn spec_list() -> String {
+    let each: Vec<String> =
+        ast::SPECS.iter().map(|s| format!("`%{}` for {}", s.letter(), s.writes())).collect();
+    format!("the specifiers are {}, and `%%` for a percent sign", each.join(", "))
+}
+
+/// `1 specifier` but `2 specifiers` — a count a message can read out loud.
+fn count(n: usize, one: &str, many: &str) -> String {
+    match n {
+        1 => format!("1 {one}"),
+        _ => format!("{n} {many}"),
     }
 }
 
@@ -1908,5 +2088,125 @@ mod tests {
     fn rejects_a_trailing_comma_in_an_argument_list() {
         let errors = errors_in_main("f(1,);");
         assert!(errors[0].message.contains("expected an expression"), "{}", errors[0].message);
+    }
+
+    // -- format strings ----------------------------------------------------
+
+    /// The one message per mistake, and the column each lands in.
+    fn format_error(body: &str) -> (String, usize) {
+        let errors = errors_in_main(body);
+        assert_eq!(errors.len(), 1, "one message per mistake: {errors:?}");
+        // The body starts on line 2 at column 1, so the offset into the whole
+        // source is the column, less the newline that opened the body.
+        (errors[0].message.clone(), errors[0].span.offset as usize - "fn main() {\n".len())
+    }
+
+    #[test]
+    fn a_format_splits_into_the_text_and_the_specifiers_around_it() {
+        assert_eq!(
+            dump_main("int n = 1;\nprintln(\"a %d b\", n);"),
+            "decl int n\n  int 1\nprintln\n  text \"a \"\n  %d\n    var n\n  text \" b\"\n"
+        );
+    }
+
+    /// A format needs no text around its specifiers, and no specifiers in its
+    /// text. Both ends of the range parse.
+    #[test]
+    fn a_format_may_be_all_text_or_all_specifier() {
+        assert_eq!(dump_main("println(\"hi\");"), "println\n  text \"hi\"\n");
+        assert_eq!(
+            dump_main("int n = 1;\nprintln(\"%d\", n);"),
+            "decl int n\n  int 1\nprintln\n  %d\n    var n\n"
+        );
+    }
+
+    /// `%%` is one `%` in the text, and the text around it is not split in two:
+    /// what a piece of text *is* is a run with no specifier in it.
+    #[test]
+    fn a_doubled_percent_is_one_character_of_text() {
+        assert_eq!(dump_main("println(\"100%% sure\");"), "println\n  text \"100% sure\"\n");
+    }
+
+    /// Every specifier the language has, checked here rather than one test per
+    /// letter: a new one that the splitter forgot would show up as a parse
+    /// error rather than as a wrong tree.
+    #[test]
+    fn every_specifier_is_recognised() {
+        for spec in ast::SPECS {
+            let body = format!("println(\"%{}\", 1);", spec.letter());
+            let parsed = parse_src(&format!("fn main() {{\n{body}\n}}\n"));
+            assert!(parsed.is_ok(), "`%{}` did not parse", spec.letter());
+        }
+    }
+
+    #[test]
+    fn a_letter_that_is_not_a_specifier_is_refused() {
+        let (message, at) = format_error("println(\"a %q b\", 1);");
+        assert_eq!(message, "unknown specifier `%q`");
+        assert_eq!(at, "println(\"a ".len(), "the caret is on the `%q`");
+    }
+
+    #[test]
+    fn a_percent_with_nothing_after_it_is_refused() {
+        let (message, _) = format_error("println(\"100%\");");
+        assert_eq!(message, "unfinished specifier");
+    }
+
+    /// The point of keeping a byte offset per character rather than counting
+    /// them: `\n` is two characters of source and one of text, so by the `%d`
+    /// the two have drifted apart. Counting would land the caret one column
+    /// early.
+    #[test]
+    fn an_escape_before_a_specifier_does_not_shift_the_caret() {
+        let (_, at) = format_error("println(\"a\\nb %q\", 1);");
+        assert_eq!(at, "println(\"a\\nb ".len());
+    }
+
+    #[test]
+    fn a_format_with_more_specifiers_than_values_is_refused() {
+        let (message, at) = format_error("println(\"%d and %d\", 1);");
+        assert_eq!(message, "too few values for this format");
+        assert_eq!(at, "println(\"%d and ".len(), "the caret is on the one left over");
+    }
+
+    #[test]
+    fn a_format_with_more_values_than_specifiers_is_refused() {
+        let (message, at) = format_error("println(\"%d\", 1, 2);");
+        assert_eq!(message, "too many values for this format");
+        assert_eq!(at, "println(\"%d\", 1, ".len(), "the caret is on the spare value");
+    }
+
+    /// A literal is the only thing that can be a format, because it is the only
+    /// thing whose `%`s are known while the program is being compiled.
+    #[test]
+    fn only_a_literal_may_be_a_format() {
+        let (message, _) = format_error("string f = \"%d\";\nprintln(f, 1);");
+        assert_eq!(message, "a format has to be written out here");
+    }
+
+    /// A literal *joined to something* is an expression, not a format — so it
+    /// is written as one value and its `%` is just a character.
+    #[test]
+    fn a_literal_that_is_not_the_whole_argument_is_an_expression() {
+        assert_eq!(
+            dump_main("string s = \"b\";\nprintln(\"a%\" + s);"),
+            "decl string s\n  string \"b\"\nprintln\n  +\n    string \"a%\"\n    var s\n"
+        );
+    }
+
+    /// `print` and `println` are one statement with one difference, and the
+    /// tree says which was written. Nothing else about them differs here.
+    #[test]
+    fn the_two_spellings_parse_to_the_same_shape() {
+        assert_eq!(dump_main("print(1);"), "print\n  int 1\n");
+        assert_eq!(dump_main("println(1);"), "println\n  int 1\n");
+    }
+
+    /// Writing nothing is allowed, and is how a blank line is written. `print()`
+    /// is the same rule reaching its uninteresting end rather than a second one.
+    #[test]
+    fn writing_nothing_is_a_statement() {
+        assert_eq!(dump_main("println();"), "println\n");
+        assert_eq!(dump_main("print();"), "print\n");
     }
 }

@@ -4,7 +4,7 @@
 //! and stops at the first malformed token.
 
 use crate::diag::{Diagnostic, Result, Span};
-use crate::token::{Token, TokenKind};
+use crate::token::{StrLit, Token, TokenKind};
 
 pub fn lex(src: &str) -> Result<Vec<Token>> {
     Lexer::new(src).run().map_err(|d| vec![d])
@@ -174,6 +174,7 @@ impl<'a> Lexer<'a> {
             "char" => TokenKind::KwChar,
             "bool" => TokenKind::KwBool,
             "print" => TokenKind::KwPrint,
+            "println" => TokenKind::KwPrintln,
             "if" => TokenKind::KwIf,
             "else" => TokenKind::KwElse,
             "while" => TokenKind::KwWhile,
@@ -239,22 +240,27 @@ impl<'a> Lexer<'a> {
     fn string(&mut self) -> std::result::Result<TokenKind, Diagnostic> {
         let open = self.offset();
         self.bump(); // opening quote
-        let mut chars = Vec::new();
+        let mut lit = StrLit::default();
         loop {
+            // Read before consuming: this is where the character about to be
+            // pushed was written, whether it takes one character of source or
+            // the two an escape does.
+            let at = self.offset();
             match self.peek() {
                 Some('"') => {
+                    lit.close(at);
                     self.bump();
-                    return Ok(TokenKind::Str(chars));
+                    return Ok(TokenKind::Str(lit));
                 }
                 Some('\\') => match self.escape()? {
-                    Some(c) => chars.push(c),
+                    Some(c) => lit.push(c, at),
                     None => break,
                 },
                 // A string literal may not span lines.
                 Some('\n') | None => break,
                 Some(c) => {
                     self.bump();
-                    chars.push(c);
+                    lit.push(c, at);
                 }
             }
         }
@@ -374,8 +380,8 @@ mod tests {
     }
 
     /// The characters a literal is expected to have produced.
-    fn chars(text: &str) -> Vec<char> {
-        text.chars().collect()
+    fn chars(text: &str) -> StrLit {
+        StrLit::from(text)
     }
 
     /// The single diagnostic a malformed source produces.
@@ -774,7 +780,7 @@ mod tests {
 
     #[test]
     fn an_empty_string_is_valid() {
-        assert_eq!(kinds(r#""""#), vec![TokenKind::Str(Vec::new()), TokenKind::Eof]);
+        assert_eq!(kinds(r#""""#), vec![TokenKind::Str(StrLit::default()), TokenKind::Eof]);
     }
 
     #[test]
@@ -784,7 +790,7 @@ mod tests {
         let token = kinds(r#""héllo""#);
         assert_eq!(token, vec![TokenKind::Str(chars("héllo")), TokenKind::Eof]);
         let TokenKind::Str(decoded) = &token[0] else { panic!("a string literal") };
-        assert_eq!(decoded.len(), 5, "five characters, six bytes");
+        assert_eq!(decoded.chars.len(), 5, "five characters, six bytes");
     }
 
     // -- character literals ------------------------------------------------

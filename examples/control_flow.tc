@@ -5,17 +5,17 @@
 fn main() {
   int n = 7;
   if (n < 5) {
-    print("small");
+    println("small");
   } else if (n < 10) {
-    print("medium");
+    println("medium");
   } else {
-    print("large");
+    println("large");
   }
 
   // while: the condition is re-tested at the top of every iteration.
   int i = 3;
   while (i > 0) {
-    print(i);
+    println(i);
     i = i - 1;
   }
 
@@ -24,16 +24,16 @@ fn main() {
   for (int j = 1; j <= 5; j = j + 1) {
     total = total + j;
   }
-  print(total);        // 15
+  println(total);        // 15
 
   bool big = total > 10;
-  print(big);          // true
+  println(big);          // true
 
   // Nested loops, with an `if` inside.
   for (int a = 1; a <= 3; a = a + 1) {
     for (int b = 1; b <= 3; b = b + 1) {
       if (a == b) {
-        print(a * 10 + b);   // 11, 22, 33
+        println(a * 10 + b);   // 11, 22, 33
       }
     }
   }
@@ -47,7 +47,7 @@ fn main() {
     if (c == 4) {
       break;               // and nothing past 3 is
     }
-    print(c);              // 1, 3
+    println(c);              // 1, 3
   }
 
   // && and || are short-circuiting: the right operand runs only when the left
@@ -55,24 +55,24 @@ fn main() {
   // work — `total / zero` is never evaluated.
   int zero = 0;
   if (zero != 0 && total / zero > 1) {
-    print("unreachable");
+    println("unreachable");
   }
-  print(zero == 0 || total / zero > 1);   // true, without dividing
+  println(zero == 0 || total / zero > 1);   // true, without dividing
 
   // && binds tighter than ||, and both bind looser than a comparison.
-  print(1 < 2 && 2 < 3);   // true
-  print(false || 5 > 9);   // false
+  println(1 < 2 && 2 < 3);   // true
+  println(false || 5 > 9);   // false
 
   // `!` binds tighter than any binary operator, so `!ok && big` negates `ok`
   // alone. Negating a comparison inverts it rather than its result: `!(a < b)`
   // is compiled as `a >= b`, at no cost at all.
   bool ok = false;
-  print(!ok);              // true
-  print(!(total < 10));    // true
+  println(!ok);              // true
+  println(!(total < 10));    // true
   for (int n = 1; n <= 6; n = n + 1) {
     if (!(n % 2 == 0)) {
       continue;            // odd numbers are skipped
     }
-    print(n);              // 2, 4, 6
+    println(n);              // 2, 4, 6
   }
 }

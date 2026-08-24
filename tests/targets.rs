@@ -218,7 +218,7 @@ fn the_parameter_limit_is_the_targets_own() {
         let parameters =
             |n: usize| (0..n).map(|i| format!("int p{i}")).collect::<Vec<_>>().join(", ");
         let program = |n: usize| {
-            format!("fn f({}) -> int {{\n  return p0;\n}}\nfn main() {{\n  print(1);\n}}\n", parameters(n))
+            format!("fn f({}) -> int {{\n  return p0;\n}}\nfn main() {{\n  println(1);\n}}\n", parameters(n))
         };
 
         assert!(

@@ -46,7 +46,7 @@ fn main() {
 
     // An empty line is a line: it has a length, and it is not the end.
     if (len(line) == 0) {
-      print("(blank)");
+      println("(blank)");
       continue;
     }
 
@@ -61,20 +61,20 @@ fn main() {
     // by performing the overflow, which is why the language answers it.
     if (is_int(line)) {
       push(numbers, int(line));
-      print("number " + line);
+      println("number " + line);
     } else {
       push(words, line);
-      print("word " + line + " (" + string(len(line)) + " characters)");
+      println("word " + line + " (" + string(len(line)) + " characters)");
     }
   }
 
-  print("");
-  print("numbers: " + string(len(numbers)));
+  println("");
+  println("numbers: " + string(len(numbers)));
   if (len(numbers) > 0) {
-    print("sum: " + string(sum_of(numbers)));
-    print("largest: " + string(max_of(numbers)));
+    println("sum: " + string(sum_of(numbers)));
+    println("largest: " + string(max_of(numbers)));
   }
-  print("words: " + string(len(words)));
+  println("words: " + string(len(words)));
 
   // The longest word, found without knowing how many there were.
   if (len(words) > 0) {
@@ -84,6 +84,6 @@ fn main() {
         longest = words[i];
       }
     }
-    print("longest: " + longest);
+    println("longest: " + longest);
   }
 }

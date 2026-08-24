@@ -1,0 +1,53 @@
+// Writing things out: `print` puts text on the line, `println` ends it.
+//
+// A string literal in first position is a *format*. Its `%`s say what goes
+// where, and the compiler checks every one of them against the value beside it
+// before the program is built — so nothing at run time ever reads a `%`.
+enum Suit { Hearts, Spades }
+
+fn beats(int rank, int other) -> bool {
+  return rank > other;
+}
+
+fn main() {
+  // One specifier per printable type. `%%` writes a percent sign, which is why
+  // a lone `%` is refused rather than guessed at.
+  int score = 92;
+  println("score: %d%%", score);
+
+  char grade = 'A';
+  string student = "Toto";
+  println("Grade: %c for student %s", grade, student);
+
+  bool passed = score > 50;
+  println("passed: %b", passed);
+
+  Suit suit = Suit::Spades;
+  println("suit: %e", suit);
+
+  // `print` does not end the line, so a loop can build one. Without it, each of
+  // these would be a line of its own.
+  print("ranks:");
+  for (int i = 1; i <= 5; i = i + 1) {
+    print(" %d", i);
+  }
+  println();
+
+  // The values are ordinary expressions: anything of the type the specifier
+  // asked for, a call included. All of them are evaluated before any of this
+  // line is written, exactly as the arguments of a call would be.
+  println("%d beats %d: %b", 12, 3, beats(12, 3));
+
+  // A number still does not become text by itself. `%d` *writes* one; joining
+  // one to a string is `string(n)`, spelled out as always.
+  string line = "total: " + string(score + 8);
+  println("%s", line);
+
+  // A value on its own needs no format, which is the one-argument form this
+  // statement has always had.
+  println(score);
+
+  // A blank line is `println` with nothing to write.
+  println();
+  println("done");
+}

@@ -49,8 +49,8 @@ class Sealed {
 // itself rather than by address — see `composition.tc`. So it cannot outlive
 // the object it points at.
 fn report(Shape s) {
-  print(s.name());
-  print(s.area());
+  println(s.name());
+  println(s.area());
 }
 
 // Returning one is safe for the same reason passing one is: nothing is handed
@@ -71,13 +71,13 @@ fn main() {
 
   // The same call written on the exact type, which needs no table.
   Sealed s = Sealed { n: 21 };
-  print(s.twice());      // 42
+  println(s.twice());      // 42
 
   // Fields are read and written through the object, and a field the base
   // declared does not collide with one the subclass did.
   r.w = 10;
-  print(r.area());       // 60
-  print(r.w + r.h);      // 16
+  println(r.area());       // 60
+  println(r.w + r.h);      // 16
 
   // A subclass may stand for its base wherever one is wanted. The other
   // direction is a type error: no `Shape` is known to be a `Circle`.
@@ -87,22 +87,22 @@ fn main() {
   // included. Nothing is sliced, and this is a copy rather than an alias.
   Shape held = c;
   c.r = 100;
-  print(held.area());    // 75, not 30000
+  println(held.area());    // 75, not 30000
 
   // An object may be returned: the caller reserves the room and passes its
   // address in, so the callee fills what the caller already owns.
-  print(shaped(0).area());   // 75
-  print(shaped(1).area());   // 24
+  println(shaped(0).area());   // 75
+  println(shaped(1).area());   // 24
 
   // ... and it outlives the call that made it, because the room was never the
   // callee's to begin with.
   Shape kept = shaped(0);
-  print(kept.area());        // 75
+  println(kept.area());        // 75
 
   // A collection of different classes: every slot is the hierarchy's size, and
   // each holds a whole object rather than a reference to one.
   Shape[3] all = [Circle { r: 1 }, Rect { w: 2, h: 3 }, Circle { r: 2 }];
   for (int i = 0; i < len(all); i = i + 1) {
-    print(all[i].area());    // 3, 6, 12
+    println(all[i].area());    // 3, 6, 12
   }
 }

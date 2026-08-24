@@ -1,0 +1,4 @@
+fn main() {
+  string f = "%d";
+  println(f, 1);
+}

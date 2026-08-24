@@ -33,6 +33,11 @@ rather than answering wrongly.
 * No implicit conversions at all — `string(n)`, `int(c)` and `char(n)` are
   written out, so a message with a number in it says where the number became
   text.
+* `print` writes, `println` ends the line, and a string literal in first
+  position is a **format**: `println("Grade: %c for %s", g, name)`. The `%`s are
+  split and checked while the program is compiled, so a wrong letter, a missing
+  value or one of the wrong type is a diagnostic with a column — and nothing at
+  run time ever reads a `%`.
 * Three built-ins for input: `read_line()`, `eof()` and `is_int(s)`.
 
 **Safety**
@@ -71,8 +76,10 @@ cargo run -- examples/hello.tc -o out/hello.asm
 
 That needs `nasm` (`winget install nasm`) and a Visual Studio installation with
 the "Desktop development with C++" workload, for `link.exe` and the CRT import
-libraries — `print` compiles into a call to the C runtime's `printf`, which is
-why the CRT is linked in.
+libraries — writing anything out compiles into a call to the C runtime's
+`printf`, which is why the CRT is linked in. A TinyC format never reaches it:
+the compiler splits one into its pieces, so `printf` is only ever handed `%lld`
+or `%s` and one value to go with it.
 
 Every stage can be printed on its own:
 
@@ -107,6 +114,7 @@ Each arrow is a module, and each stage can be inspected with `--emit`:
 | Programs | What they show |
 |----------|----------------|
 | [`hello.tc`](examples/hello.tc), [`arith.tc`](examples/arith.tc), [`bool.tc`](examples/bool.tc), [`reassign.tc`](examples/reassign.tc) | variables, arithmetic, printing |
+| [`format.tc`](examples/format.tc) | `print` and `println`, and every specifier a format takes |
 | [`control_flow.tc`](examples/control_flow.tc), [`functions.tc`](examples/functions.tc) | branches, loops, calls, recursion |
 | [`classes.tc`](examples/classes.tc), [`composition.tc`](examples/composition.tc), [`enums.tc`](examples/enums.tc) | objects, dispatch, matching |
 | [`arrays.tc`](examples/arrays.tc), [`lists.tc`](examples/lists.tc), [`strings.tc`](examples/strings.tc) | values that do not fit in a register |
@@ -220,7 +228,7 @@ fn readings() -> Reading[] {
 
 // No return type means no value: this can only be called as a statement.
 fn banner(string title) {
-  print("== " + shout(title) + " ==");
+  println("== " + shout(title) + " ==");
 }
 
 fn main() {
@@ -231,12 +239,12 @@ fn main() {
   int alerts = 0;
   for (int i = 0; i < len(rs); i = i + 1) {
     Level l = rs[i].level();
-    print(rs[i].label() + " -> " + tag(l));
+    println(rs[i].label() + " -> " + tag(l));
     if (l == Level::Error) {
       alerts = alerts + 1;
     }
   }
-  print("alerts: " + string(alerts));
+  println("alerts: " + string(alerts));
 
   // An object literal, a field written through, and a method on a field.
   Station s = Station {
@@ -244,18 +252,18 @@ fn main() {
     samples: [3, 1, 4],
     peak: Frost { place: "Oslo", degrees: -12, wind: 40 }
   };
-  print(s.name + ": " + string(s.total()));   // Alpha: 8
+  println(s.name + ": " + string(s.total()));   // Alpha: 8
   s.samples[0] = 30;
-  print(s.name + ": " + string(s.total()));   // Alpha: 35
-  print(tag(s.peak.level()));                 // alert — the vtable travelled with the copy
+  println(s.name + ": " + string(s.total()));   // Alpha: 35
+  println(tag(s.peak.level()));                 // alert — the vtable travelled with the copy
 
   // if / else if / else, and a `!` that inverts a comparison rather than a value.
   if (alerts > 2) {
-    print("storm");
+    println("storm");
   } else if (!(alerts == 0)) {
-    print("watch");
+    println("watch");
   } else {
-    print("clear");
+    println("clear");
   }
 
   // while, continue and break; `%` takes its sign from the dividend.
@@ -268,18 +276,18 @@ fn main() {
     if (n > 5) {
       break;
     }
-    print(n);            // 1, 3, 5
+    println(n);            // 1, 3, 5
   }
 
   // Recursion, and arithmetic that stops the program rather than wrapping.
-  print(fib(10));        // 55
-  print(6 * 7 % 10);     // 2
+  println(fib(10));        // 55
+  println(6 * 7 % 10);     // 2
 
   // A match written as a statement runs its arms for effect.
   match (rs[2].level()) {
-    Level::Info => { print("quiet"); }
-    Level::Warn => { print("cold"); }
-    Level::Error => { print("freezing"); }
+    Level::Info => { println("quiet"); }
+    Level::Warn => { println("cold"); }
+    Level::Error => { println("freezing"); }
   }
 
   // Input, when there is any: `eof()` looks without consuming, `read_line()`
@@ -291,7 +299,7 @@ fn main() {
       extra = extra + int(line);
     }
   }
-  print("piped in: " + string(extra));
+  println("piped in: " + string(extra));
 }
 ```
 

@@ -26,7 +26,7 @@ fn temperature(Colour c) -> string {
 fn wait(Signal s) -> bool {
   return match (s) {
     Signal::Red => true,
-    Signal::Amber => { print("slow down"); return true; }
+    Signal::Amber => { println("slow down"); return true; }
     Signal::Green => false,
   };
 }
@@ -43,14 +43,14 @@ fn urgency(Signal s) -> int {
 
 fn main() {
   Colour c = Colour::Blue;
-  print(c);                  // Blue — printing names the variant
-  print(temperature(c));     // cold
+  println(c);                  // Blue — printing names the variant
+  println(temperature(c));     // cold
 
   // Enums answer `==` and `!=`, because that is a question about which variant
   // it is. They deliberately answer nothing about order: the declaration puts
   // them in a sequence, but the program never said that sequence meant anything.
-  print(c == Colour::Blue);  // true
-  print(c != Colour::Red);   // true
+  println(c == Colour::Blue);  // true
+  println(c != Colour::Red);   // true
 
   // Used as a value anywhere one is wanted, not just after `return`.
   string word = match (c) {
@@ -58,18 +58,18 @@ fn main() {
     Colour::Green => "mild",
     Colour::Blue => "chilly",
   };
-  print(word);               // chilly
+  println(word);               // chilly
 
   // Written as a statement, its arms run for effect and must all be blocks.
   Signal s = Signal::Amber;
   match (s) {
-    Signal::Red => { print("stop"); }
+    Signal::Red => { println("stop"); }
     Signal::Amber => {
-      print("slow");
-      print(wait(s));        // slow down, then true
-      print(urgency(s));     // 1
+      println("slow");
+      println(wait(s));        // slow down, then true
+      println(urgency(s));     // 1
     }
-    Signal::Green => { print("go"); }
+    Signal::Green => { println("go"); }
   }
 
   // Matching in a loop, with the loop jumps working inside an arm.
@@ -81,7 +81,7 @@ fn main() {
     match (current) {
       Signal::Red => { continue; }
       Signal::Amber => { break; }
-      Signal::Green => { print(i); }   // 0, 2
+      Signal::Green => { println(i); }   // 0, 2
     }
   }
 }

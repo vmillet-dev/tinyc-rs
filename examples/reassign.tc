@@ -2,12 +2,12 @@
 fn main() {
   int n = 1;
   string label = "counting up:";
-  print(label);
-  print(n);
+  println(label);
+  println(n);
   n = n + 41;      // reads the old value, then becomes the new one
-  print(n);        // 42
+  println(n);        // 42
   n = n * n;
-  print(n);        // 1764
+  println(n);        // 1764
   label = "done";
-  print(label);
+  println(label);
 }

@@ -2,16 +2,80 @@
 
 use crate::diag::Span;
 
+/// The characters of a string literal, and where each one was written.
+///
+/// The characters are what the literal *means*: the surrounding quotes are
+/// gone, every escape is resolved, and the source's UTF-8 has been decoded, so
+/// `"h\u{e9}llo"` is five characters here and everywhere after. Nothing
+/// downstream ever counts the bytes it took to write one.
+///
+/// The offsets are what an ordinary literal never needs and a **format string**
+/// cannot do without. A diagnostic about the `%d` in `"n = %d"` has to point at
+/// those two characters, and by then an escape earlier in the literal may
+/// already have turned two characters of source into one — so the character
+/// count is no longer the distance from the opening quote. Keeping each
+/// character's own offset is what lets [`Self::span`] cut a span for any run of
+/// them; the extra entry for the closing quote is what lets it cut an empty one
+/// at the end.
+#[derive(Clone, Debug, Default)]
+pub struct StrLit {
+    pub chars: Vec<char>,
+    /// One entry per character, then one for the closing quote.
+    pub offsets: Vec<u32>,
+}
+
+impl StrLit {
+    pub fn push(&mut self, c: char, offset: usize) {
+        self.chars.push(c);
+        self.offsets.push(offset as u32);
+    }
+
+    /// Note where the closing quote is, which is what gives a span an end when
+    /// it runs to the last character.
+    pub fn close(&mut self, offset: usize) {
+        self.offsets.push(offset as u32);
+    }
+
+    /// The span of the characters `from..to`, in the source they were written
+    /// in rather than in the text they decoded to.
+    pub fn span(&self, from: usize, to: usize) -> Span {
+        let start = self.offsets[from];
+        let end = self.offsets[to];
+        Span::new(start as usize, (end - start) as usize)
+    }
+}
+
+/// Two literals are equal when they say the same thing.
+///
+/// *Where* one was written is not part of what it is, and comparing tokens for
+/// equality is something only the lexer's own tests do — so the offsets, which
+/// differ for every copy of the same literal, are deliberately left out.
+impl PartialEq for StrLit {
+    fn eq(&self, other: &StrLit) -> bool {
+        self.chars == other.chars
+    }
+}
+
+impl Eq for StrLit {}
+
+impl From<&str> for StrLit {
+    fn from(text: &str) -> StrLit {
+        let chars: Vec<char> = text.chars().collect();
+        // No source to point into: a literal built from a Rust string was not
+        // written in a TinyC file. Every offset is zero, and so every span cut
+        // from it is empty — which is what a test that never renders one wants.
+        let offsets = vec![0; chars.len() + 1];
+        StrLit { chars, offsets }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     // Literals and names.
     Int(i64),
-    /// The characters of a string literal, without the surrounding quotes and
-    /// with every escape already resolved.
-    ///
-    /// Characters rather than bytes: this is the point where the source's UTF-8
-    /// is decoded, and after it nothing in the compiler counts bytes again.
-    Str(Vec<char>),
+    /// A string literal: the characters it stands for, and where each was
+    /// written. See [`StrLit`].
+    Str(StrLit),
     /// A character literal, `'a'` — exactly one character.
     Char(char),
     Bool(bool),
@@ -23,6 +87,7 @@ pub enum TokenKind {
     KwChar,
     KwBool,
     KwPrint,
+    KwPrintln,
     KwIf,
     KwElse,
     KwWhile,
@@ -107,6 +172,7 @@ impl TokenKind {
             TokenKind::KwChar => "char",
             TokenKind::KwBool => "bool",
             TokenKind::KwPrint => "print",
+            TokenKind::KwPrintln => "println",
             TokenKind::KwIf => "if",
             TokenKind::KwElse => "else",
             TokenKind::KwWhile => "while",
@@ -188,6 +254,7 @@ mod tests {
             TokenKind::KwChar,
             TokenKind::KwBool,
             TokenKind::KwPrint,
+            TokenKind::KwPrintln,
             TokenKind::KwIf,
             TokenKind::KwElse,
             TokenKind::KwWhile,
@@ -284,8 +351,8 @@ mod tests {
 
         // A string's contents could be any length and are not worth quoting
         // back at the reader, so this is the one that stays generic in both.
-        assert_eq!(TokenKind::Str(vec!['h', 'i']).describe(), "string literal");
-        assert_eq!(TokenKind::Str(vec!['h', 'i']).text(), "string literal");
+        assert_eq!(TokenKind::Str(StrLit::from("hi")).describe(), "string literal");
+        assert_eq!(TokenKind::Str(StrLit::from("hi")).text(), "string literal");
     }
 
     #[test]

@@ -377,3 +377,61 @@ fn a_bare_return_in_a_returning_function_points_at_the_keyword() {
     assert_error_at("return_without_value.tc", "2:3");
 }
 
+
+// -- format strings -------------------------------------------------------
+//
+// Every one of these points *inside* a string literal, which is the only place
+// in the compiler a span has to be worked out rather than read off a token. An
+// escape earlier in the literal turns two characters of source into one, so the
+// character count is not the distance from the opening quote — the offset each
+// character came from is kept with it, and these tests are what say so.
+
+#[test]
+fn an_unknown_specifier_points_at_the_two_characters_of_it() {
+    assert_error_at("unknown_specifier.tc", "2:19");
+}
+
+#[test]
+fn a_percent_at_the_end_of_a_format_points_at_the_percent() {
+    assert_error_at("unfinished_specifier.tc", "2:21");
+}
+
+/// The caret goes on the specifier with nothing to write, not on the format as
+/// a whole: which one ran out is the useful half of the answer.
+#[test]
+fn a_format_short_of_values_points_at_the_specifier_that_has_none() {
+    assert_error_at("format_wants_more_values.tc", "3:19");
+}
+
+#[test]
+fn a_spare_value_points_at_the_value_rather_than_the_format() {
+    assert_error_at("format_has_a_spare_value.tc", "3:20");
+}
+
+/// And a mismatch points at the *value*, since that is the half a reader would
+/// change. The specifier it has to match is where the note points.
+#[test]
+fn a_value_of_the_wrong_type_points_at_the_value() {
+    assert_error_at("format_type_mismatch.tc", "3:21");
+}
+
+#[test]
+fn a_format_that_is_not_a_literal_points_at_what_was_written_instead() {
+    assert_error_at("format_is_not_a_literal.tc", "3:11");
+}
+
+/// The note of a mismatch points back at the specifier that asked, so both
+/// halves of the disagreement are on screen.
+#[test]
+fn a_mismatch_notes_the_specifier_it_came_from() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/errors/format_type_mismatch.tc");
+    let source = SourceFile::new("format_type_mismatch.tc", std::fs::read_to_string(&path).unwrap());
+    let Err(errors) = tinyc::compile(source.text(), TARGET) else {
+        panic!("the file was expected to fail");
+    };
+    let (_, note_span) = errors[0].note.clone().expect("a note pointing at the specifier");
+    let span = note_span.expect("the note carries a span");
+    assert_eq!(source.line_col(span.offset), (3, 16), "the `%d` itself");
+    assert_eq!(span.len, 2, "just the two characters of it");
+}

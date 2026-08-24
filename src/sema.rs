@@ -24,8 +24,8 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{
     ArmBody, ArrayId, ArrayInfo, BinOp, Block, Builtin, ClassId, ClassInfo, EnumId, EnumInfo, Expr,
     ListId, Shape,
-    ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Prim, Program,
-    Stmt, Ty, TypeRef, TypeTable, is_scalar_value,
+    ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Prim, PrintPart,
+    Program, Spec, Stmt, Ty, TypeRef, TypeTable, is_scalar_value,
 };
 use crate::diag::{Diagnostic, Result, Span};
 
@@ -1442,32 +1442,16 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             }
             Stmt::Assign { target, value } => self.assign(target, value),
             Stmt::Push { span, target, value } => self.push_stmt(*span, target, value),
-            Stmt::Print { value, .. } => {
-                let ty = self.expr(value);
-                // A run of values has no rendering, and printing its address
-                // would answer a question nobody asked.
-                if !ty.is_printable() {
-                    // A run of values and an object are refused for the same
-                    // reason but answered differently: one has elements to loop
-                    // over, the other has fields to name.
-                    let (label, note) = match ty {
-                        Ty::Class(_) => (
-                            "`print` takes one value, and an object is several",
-                            "print the fields you meant, one at a time",
-                        ),
-                        _ => (
-                            "`print` takes one value, and this is many",
-                            "print the elements in a loop instead",
-                        ),
-                    };
-                    self.error(
-                        Diagnostic::new(
-                            format!("cannot print {}", self.ty_article(ty)),
-                            value.span,
-                        )
-                        .with_label(label)
-                        .with_note(note, None),
-                    );
+            Stmt::Print { parts, .. } => {
+                for part in parts {
+                    match part {
+                        // Fixed at compile time: there is nothing to check.
+                        PrintPart::Text(_) => {}
+                        PrintPart::Value(value) => self.print_value(value),
+                        PrintPart::Spec { spec, span, expr } => {
+                            self.print_spec(*spec, *span, expr)
+                        }
+                    }
                 }
             }
             Stmt::If { cond, then_block, else_block } => {
@@ -1868,6 +1852,63 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     }
 
     /// Check `push(xs, value);`.
+    /// A value written on its own: the `x` in `print(x)`.
+    ///
+    /// Nothing claimed what it would be, so the only question is whether it has
+    /// a rendering at all.
+    fn print_value(&mut self, value: &Expr) {
+        let ty = self.expr(value);
+        // A run of values has no rendering, and printing its address would
+        // answer a question nobody asked.
+        if ty.is_printable() {
+            return;
+        }
+        // A run of values and an object are refused for the same reason but
+        // answered differently: one has elements to loop over, the other has
+        // fields to name.
+        let (label, note) = match ty {
+            Ty::Class(_) => (
+                "`print` writes one value, and an object is several",
+                "write the fields you meant, one at a time",
+            ),
+            _ => (
+                "`print` writes one value, and this is many",
+                "write the elements in a loop instead",
+            ),
+        };
+        self.error(
+            Diagnostic::new(format!("cannot print {}", self.ty_article(ty)), value.span)
+                .with_label(label)
+                .with_note(note, None),
+        );
+    }
+
+    /// A value a specifier claimed the type of: the `%d` and the `x` in
+    /// `print("n = %d", x)`.
+    ///
+    /// The claim is checked exactly, and no conversion is offered to rescue it:
+    /// `%d` on a `string` is the same mistake as `int n = s;` and gets the same
+    /// answer, because a format string is the one place a number most wants to
+    /// become text by itself. `string(n)` is still written out.
+    ///
+    /// The caret goes on the *value*, since that is the half a reader would
+    /// change; the note points back at the specifier that asked for something
+    /// else.
+    fn print_spec(&mut self, spec: Spec, at: Span, value: &Expr) {
+        let ty = self.expr(value);
+        if spec.accepts(ty) {
+            return;
+        }
+        self.error(
+            Diagnostic::new(
+                format!("cannot write {} with `%{}`", self.ty_article(ty), spec.letter()),
+                value.span,
+            )
+            .with_label(format!("`%{}` writes {}", spec.letter(), spec.writes()))
+            .with_note("this is the specifier it has to match", Some(at)),
+        );
+    }
+
     fn push_stmt(&mut self, span: Span, target: &Place, value: &Expr) {
         let Some(ty) = self.place_type(target) else {
             self.expr(value);
@@ -4594,5 +4635,84 @@ print(len(n));")[0].message.contains("`len` needs"));
         assert!(
             check_src("fn f() -> int {\n  return 1;\n}\nfn main() {\n  f();\n}").is_ok()
         );
+    }
+
+    // -- format strings ----------------------------------------------------
+
+    /// Each specifier accepts exactly the type it names, and refuses the other
+    /// four. Written as a matrix rather than as one test per pair, so a
+    /// specifier that quietly accepted the wrong type could not hide.
+    #[test]
+    fn a_specifier_accepts_its_own_type_and_no_other() {
+        let value_of = [
+            (Spec::Int, "1"),
+            (Spec::Char, "'a'"),
+            (Spec::Str, "\"s\""),
+            (Spec::Bool, "true"),
+            (Spec::Enum, "Colour::Red"),
+        ];
+        for spec in crate::ast::SPECS {
+            for (of, value) in value_of {
+                let src = format!(
+                    "enum Colour {{ Red, Green }}\n\
+                     fn main() {{\n  println(\"%{}\", {value});\n}}\n",
+                    spec.letter()
+                );
+                let checked = check_src(&src);
+                assert_eq!(
+                    checked.is_ok(),
+                    spec == of,
+                    "`%{}` against {value}",
+                    spec.letter()
+                );
+            }
+        }
+    }
+
+    /// The message names both halves of the disagreement, and the note points
+    /// back at the specifier that asked.
+    #[test]
+    fn a_mismatch_says_what_was_asked_for_and_what_arrived() {
+        let errors = errors_in_main("println(\"n = %d\", \"hi\");");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "cannot write a `string` with `%d`");
+        assert_eq!(errors[0].label.as_deref(), Some("`%d` writes an int"));
+        assert!(errors[0].note.as_ref().expect("a note").1.is_some(), "the note has a span");
+    }
+
+    /// No conversion is offered to rescue a mismatch. A format string is the
+    /// one place a number most wants to become text on its own, and it does not
+    /// — which is the same answer `int n = s;` gets.
+    #[test]
+    fn a_format_offers_no_conversion() {
+        assert!(!errors_in_main("println(\"%s\", 1);").is_empty());
+        assert!(check_main("println(\"%s\", string(1));").is_ok());
+    }
+
+    /// A value with no rendering is refused under a specifier too, and the
+    /// message is the mismatch rather than the older "cannot print" — nothing
+    /// promised a list, so nothing has to explain that a list has no rendering.
+    #[test]
+    fn a_list_is_refused_under_a_specifier() {
+        let errors = errors_in_main("int[] xs = [1];\nprintln(\"%s\", xs);");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "cannot write an `int[]` with `%s`");
+    }
+
+    /// And on its own it still gets the older answer, which explains what to do
+    /// instead.
+    #[test]
+    fn a_list_on_its_own_is_still_told_to_loop() {
+        let errors = errors_in_main("int[] xs = [1];\nprintln(xs);");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].message, "cannot print an `int[]`");
+    }
+
+    /// Every value in a format is checked, not just the first: one message per
+    /// mistake here as everywhere.
+    #[test]
+    fn every_value_in_a_format_is_checked() {
+        let errors = errors_in_main("println(\"%d %d %d\", \"a\", 1, true);");
+        assert_eq!(errors.len(), 2, "{errors:?}");
     }
 }

@@ -39,8 +39,7 @@ use std::collections::HashMap;
 
 use crate::ast::{
     ArmBody, BinOp, Block as AstBlock, Builtin, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
-    MatchArm,
-    Place, Prim, Program as Ast, Stmt, Ty, TypeTable, is_scalar_value,
+    MatchArm, Place, Prim, PrintPart, Program as Ast, Stmt, Ty, TypeTable, is_scalar_value,
 };
 use crate::sema::Types;
 
@@ -63,6 +62,10 @@ pub const STR_HEADER: u32 = 8;
 /// Index into [`Program::strings`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StrId(pub u32);
+
+/// Index into [`Program::texts`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextId(pub u32);
 
 /// Index into [`Function::blocks`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -176,7 +179,17 @@ pub enum Instr {
     /// which routines exist stays here, in the target-independent half, and
     /// only their *spelling* belongs to a backend.
     RtCall { dst: Option<VReg>, callee: Runtime, args: Vec<Value> },
+    /// Write one value out, rendered according to its type.
     Print { ty: Ty, val: Value },
+    /// Write out a run of text the program settled at compile time: the words
+    /// around the specifiers in a format string, and the line ending a
+    /// `println` adds.
+    ///
+    /// Separate from [`Instr::Print`] of a `Ty::Str` because the two are not
+    /// the same job. A string is a run of characters somewhere in memory whose
+    /// UTF-8 has to be built before anything can be written; this is bytes the
+    /// backend already has, so it costs one call and no memory at all.
+    PrintText { id: TextId },
 }
 
 /// The compiler's own routines, called like functions but declared by nobody.
@@ -393,6 +406,7 @@ impl Instr {
             | Instr::StrAddr { .. }
             | Instr::Param { .. }
             | Instr::Frame { .. }
+            | Instr::PrintText { .. }
             | Instr::VTable { .. } => {}
             Instr::Copy { src, .. }
             | Instr::Load { addr: src, .. }
@@ -444,7 +458,10 @@ impl Instr {
             Instr::Call { dst, .. } | Instr::CallVirtual { dst, .. } | Instr::RtCall { dst, .. } => {
                 *dst
             }
-            Instr::Print { .. } | Instr::Store { .. } | Instr::CopyBytes { .. } => None,
+            Instr::Print { .. }
+            | Instr::PrintText { .. }
+            | Instr::Store { .. }
+            | Instr::CopyBytes { .. } => None,
         }
     }
 
@@ -454,6 +471,7 @@ impl Instr {
         matches!(
             self,
             Instr::Print { .. }
+                | Instr::PrintText { .. }
                 | Instr::Call { .. }
                 | Instr::CallVirtual { .. }
                 | Instr::RtCall { .. }
@@ -513,6 +531,9 @@ pub struct Program {
     pub functions: Vec<Function>,
     /// Interned string literals, each as the characters it holds.
     pub strings: Vec<Vec<char>>,
+    /// Interned runs of literal text, each already the UTF-8 it will be written
+    /// as. See [`Instr::PrintText`].
+    pub texts: Vec<String>,
     /// One method table per class, in `ClassId` order.
     pub vtables: Vec<Vec<FuncId>>,
     /// Every type the program has, carried through so that a type can still be named
@@ -665,6 +686,9 @@ impl Program {
                 }
             }
             Instr::Print { ty, val } => format!("print {} {}", ty.name(&self.table), value(val)),
+            Instr::PrintText { id } => {
+                format!("print text{} {:?}", id.0, self.texts[id.0 as usize])
+            }
         }
     }
 }
@@ -733,7 +757,13 @@ pub fn lower(ast: &Ast, types: &Types) -> Program {
 
     let (functions, vtables) =
         prune_unreachable_functions(functions, vtables, ids.get(crate::sema::ENTRY_POINT));
-    Program { functions, strings: strings.chars, table: types.table().clone(), vtables }
+    Program {
+        functions,
+        strings: strings.chars,
+        texts: strings.texts,
+        table: types.table().clone(),
+        vtables,
+    }
 }
 
 /// The name each of the program's functions is known by once methods and free
@@ -755,6 +785,8 @@ fn qualified_names(ast: &Ast) -> Vec<String> {
 struct Strings {
     chars: Vec<Vec<char>>,
     ids: HashMap<Vec<char>, StrId>,
+    texts: Vec<String>,
+    text_ids: HashMap<String, TextId>,
 }
 
 /// Drop the functions nothing can call, and renumber the survivors.
@@ -1171,11 +1203,7 @@ impl Lowering<'_> {
                     }
                 }
             }
-            Stmt::Print { value, .. } => {
-                let ty = self.types.of(value.id);
-                let val = self.expr(value);
-                self.emit(Instr::Print { ty, val });
-            }
+            Stmt::Print { newline, parts, .. } => self.print_stmt(*newline, parts),
             Stmt::If { cond, then_block, else_block } => self.if_stmt(cond, then_block, else_block),
             Stmt::While { cond, body } => self.while_stmt(cond, body),
             // `for (init; cond; step) body` is exactly `init; while (cond) { body; step; }`
@@ -2175,6 +2203,72 @@ impl Lowering<'_> {
                 Value::Reg(dst)
             }
         }
+    }
+
+    /// `print(...)` and `println(...)`: one write per thing written.
+    ///
+    /// The parts were settled by the parser, so nothing here reads a `%`. What
+    /// this stage adds is the line ending, and that is where the two spellings
+    /// stop being two statements: a `println` is a `print` with one more piece
+    /// of text at the end. The same desugaring `for` gets, one stage after the
+    /// tree has been dumped.
+    ///
+    /// **Every value is evaluated before anything is written.** A `print` is
+    /// written like a call and is read like one, so its arguments go first —
+    /// otherwise `println("n: %d", noisy())` would put whatever `noisy` writes
+    /// in the middle of this line rather than before it. The values stay live
+    /// across the writes, which is the register allocator's business.
+    fn print_stmt(&mut self, newline: bool, parts: &[PrintPart]) {
+        let mut written: Vec<Instr> = Vec::new();
+        for part in parts {
+            if let PrintPart::Value(expr) | PrintPart::Spec { expr, .. } = part {
+                let ty = self.types.of(expr.id);
+                let val = self.expr(expr);
+                written.push(Instr::Print { ty, val });
+            }
+        }
+
+        let mut written = written.into_iter();
+        let mut text: Vec<char> = Vec::new();
+        for part in parts {
+            match part {
+                PrintPart::Text(chars) => text.extend(chars),
+                _ => {
+                    self.flush_text(&mut text);
+                    self.emit(written.next().expect("one per value part"));
+                }
+            }
+        }
+        if newline {
+            text.push('\n');
+        }
+        self.flush_text(&mut text);
+    }
+
+    /// Write out the literal text collected so far, if there is any.
+    ///
+    /// Collected rather than written piece by piece, so that the newline of
+    /// `println("done")` joins the word in front of it and the whole line
+    /// leaves in one call.
+    fn flush_text(&mut self, text: &mut Vec<char>) {
+        if text.is_empty() {
+            return;
+        }
+        let id = self.intern_text(std::mem::take(text).into_iter().collect());
+        self.emit(Instr::PrintText { id });
+    }
+
+    /// The same for a run of literal text, kept in its own table because it is
+    /// laid out differently: a string literal is characters four bytes each
+    /// with a count in front, and this is the UTF-8 `printf` will be handed.
+    fn intern_text(&mut self, text: String) -> TextId {
+        if let Some(&id) = self.strings.text_ids.get(&text) {
+            return id;
+        }
+        let id = TextId(self.strings.texts.len() as u32);
+        self.strings.texts.push(text.clone());
+        self.strings.text_ids.insert(text, id);
+        id
     }
 
     fn intern(&mut self, chars: &[char]) -> StrId {
@@ -3251,8 +3345,22 @@ mod tests {
 
     #[test]
     fn a_literal_is_interned_as_characters() {
-        let ir = lower_main("print(\"é\");");
+        let ir = lower_main("string s = \"é\";\nprint(s);");
         assert_eq!(ir.strings[0], vec!['é']);
+    }
+
+    /// A literal that is only ever *written* never becomes a string at all.
+    ///
+    /// The two tables answer different questions: `strings` holds values the
+    /// program can index and join, laid out as characters four bytes each;
+    /// `texts` holds bytes `printf` is handed. A literal that goes straight out
+    /// needs no run-time form, and so is not given one — which is what makes
+    /// `print("hi")` cost one call and no memory.
+    #[test]
+    fn a_literal_that_is_only_printed_becomes_text_rather_than_a_string() {
+        let ir = lower_main("print(\"é\");");
+        assert!(ir.strings.is_empty(), "{:?}", ir.strings);
+        assert_eq!(ir.texts, vec!["é".to_string()]);
     }
 
     /// Every instruction a function lowered to, flattened.
@@ -3599,9 +3707,19 @@ mod tests {
     #[test]
     fn strings_are_shared_across_functions() {
         let ir = lower_src(
-            "fn a() {\n  print(\"hi\");\n}\nfn main() {\n  print(\"hi\");\n  a();\n}",
+            "fn a() {\n  string s = \"hi\";\n  print(s);\n}\n\
+             fn main() {\n  string s = \"hi\";\n  print(s);\n  a();\n}",
         );
         assert_eq!(ir.strings.len(), 1);
+    }
+
+    /// And so is literal text, which has a table of its own for the same reason.
+    #[test]
+    fn text_is_shared_across_functions() {
+        let ir = lower_src(
+            "fn a() {\n  print(\"hi\");\n}\nfn main() {\n  print(\"hi\");\n  a();\n}",
+        );
+        assert_eq!(ir.texts.len(), 1);
     }
 
     #[test]
@@ -3616,5 +3734,84 @@ mod tests {
         let main = ir.functions.last().unwrap();
         let calls = main.blocks[0].instrs.iter().filter(|i| i.is_call()).count();
         assert_eq!(calls, 4); // g, h, f, and the print
+    }
+
+    // -- writing things out -------------------------------------------------
+
+    /// A format lowers to one write per piece, in the order they were written.
+    #[test]
+    fn a_format_lowers_to_one_write_per_piece() {
+        let ir = lower_main("int n = 7;\nprintln(\"a %d b\", n);");
+        assert_eq!(
+            body_dump(&ir),
+            concat!(
+                "entry0:\n",
+                "  0  %n = const 7\n",
+                "  1  print text0 \"a \"\n",
+                "  2  print int %n\n",
+                "  3  print text1 \" b\\n\"\n",
+                "  4  return\n",
+            )
+        );
+    }
+
+    /// `println` is `print` with a newline, and this is where the two become
+    /// one statement. The newline joins the text in front of it rather than
+    /// costing a write of its own.
+    #[test]
+    fn a_trailing_newline_joins_the_text_before_it() {
+        assert_eq!(lower_main("println(\"done\");").texts, vec!["done\n".to_string()]);
+        assert_eq!(lower_main("print(\"done\");").texts, vec!["done".to_string()]);
+    }
+
+    /// When a format ends in a specifier there is no text to join it to, so the
+    /// newline is a piece of its own — and every `println` in the program that
+    /// ends in a value shares that one piece.
+    #[test]
+    fn a_newline_after_a_value_is_its_own_piece_and_is_shared() {
+        let ir = lower_main("int n = 1;\nprintln(n);\nprintln(n);");
+        assert_eq!(ir.texts, vec!["\n".to_string()]);
+    }
+
+    /// Every value is evaluated before anything is written.
+    ///
+    /// A `print` is written like a call and read like one, so its arguments go
+    /// first — otherwise a call that writes something itself would land in the
+    /// middle of this line rather than before it.
+    #[test]
+    fn the_values_are_evaluated_before_the_first_write() {
+        let ir = lower_src(
+            "fn f() -> int {\n  return 1;\n}\n\
+             fn main() {\n  println(\"a %d b %d\", f(), f());\n}",
+        );
+        let main = ir.functions.iter().find(|f| f.name == "main").expect("main");
+        let kinds: Vec<&str> = main.blocks[0]
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Call { .. } => Some("call"),
+                Instr::Print { .. } => Some("print"),
+                Instr::PrintText { .. } => Some("text"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["call", "call", "text", "print", "text", "print", "text"]);
+    }
+
+    /// A `print` with nothing to write lowers to nothing at all; a `println`
+    /// with nothing to write lowers to the line ending alone.
+    #[test]
+    fn writing_nothing_costs_nothing() {
+        assert!(lower_main("print();").functions[0].blocks[0].instrs.is_empty());
+        assert_eq!(lower_main("println();").texts, vec!["\n".to_string()]);
+    }
+
+    /// Text and strings are interned in separate tables because they are laid
+    /// out differently — and the same words in both roles land in both.
+    #[test]
+    fn the_same_words_can_be_text_in_one_place_and_a_string_in_another() {
+        let ir = lower_main("string s = \"hi\";\nprint(\"hi\");\nprint(s);");
+        assert_eq!(ir.texts, vec!["hi".to_string()]);
+        assert_eq!(ir.strings, vec![vec!['h', 'i']]);
     }
 }

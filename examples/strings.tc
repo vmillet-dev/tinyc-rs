@@ -37,50 +37,50 @@ fn main() {
 
   // A length is a number of characters. Both of these have five, although one
   // of them takes six bytes to write down.
-  print(len(a));                 // 5
-  print(len(b));                 // 5
+  println(len(a));                 // 5
+  println(len(b));                 // 5
 
   // `+` joins two strings, and produces a third: neither operand changes.
   string both = a + " " + b;
-  print(both);                   // héllo wörld
-  print(len(both));              // 11
-  print(a);                      // héllo — still itself
+  println(both);                   // héllo wörld
+  println(len(both));              // 11
+  println(a);                      // héllo — still itself
 
   // `==` compares what two strings *hold*. Comparing their addresses would
   // answer a different question, and would say `false` here.
-  print(both == "héllo wörld");  // true
-  print(both == "héllo world");  // false
-  print(a != b);                 // true
+  println(both == "héllo wörld");  // true
+  println(both == "héllo world");  // false
+  println(a != b);                 // true
 
   // Indexing gives one character. A string's length is not known until the
   // program runs, so every index is checked — even one written as a literal.
-  print(both[1]);                // é
-  print(both[len(both) - 1]);    // d
+  println(both[1]);                // é
+  println(both[len(both) - 1]);    // d
 
   // Characters have their own type. They compare, including for order, because
   // the order of code points is a fact about the encoding. Two *strings* do
   // not: where `é` sorts is a question about a language, not about characters.
   char first = both[0];
-  print(first == 'h');           // true
-  print('a' < 'z');              // true
+  println(first == 'h');           // true
+  println('a' < 'z');              // true
 
   // The four conversions, which are the whole list. Nothing converts on its
   // own, so a message with a number in it says where the number became text.
-  print(int('A'));               // 65
-  print(char(9731));             // ☃
-  print(string('x'));            // x
-  print("count = " + string(len(both)));   // count = 11
+  println(int('A'));               // 65
+  println(char(9731));             // ☃
+  println(string('x'));            // x
+  println("count = " + string(len(both)));   // count = 11
 
-  print(greet("world"));         // hello, world
-  print(shout("héllo wörld"));   // HéLLO WöRLD
+  println(greet("world"));         // hello, world
+  println(shout("héllo wörld"));   // HéLLO WöRLD
 
   // A string is read-only, which is what makes it safe to share: `kept` and
   // `both` may well be the same characters in memory, and neither can change
   // them under the other. `s[i] = c` is a compile error.
   string kept = both;
   both = both + "!";
-  print(kept);                   // héllo wörld
-  print(both);                   // héllo wörld!
+  println(kept);                   // héllo wörld
+  println(both);                   // héllo wörld!
 
   // Strings live in arrays like anything else.
   string[3] words = ["un", "deux", "trois"];
@@ -88,11 +88,11 @@ fn main() {
   for (int i = 0; i < len(words); i = i + 1) {
     total = total + len(words[i]);
   }
-  print(total);                  // 11
+  println(total);                  // 11
 
   // The empty string is a string like any other.
   string nothing = "";
-  print(len(nothing));           // 0
-  print(nothing == "");          // true
-  print("a" + nothing == "a");   // true
+  println(len(nothing));           // 0
+  println(nothing == "");          // true
+  println("a" + nothing == "a");   // true
 }

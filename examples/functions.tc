@@ -8,8 +8,8 @@ fn add(int a, int b) -> int {
 // A function with no return type returns nothing. It can only be called as a
 // statement, never used as a value.
 fn banner(string title) {
-  print("--------");
-  print(title);
+  println("--------");
+  println(title);
 }
 
 // Recursion works because signatures are collected before any body is checked,
@@ -44,22 +44,22 @@ fn is_even(int n) -> bool {
 
 fn main() {
   banner("arithmetic");
-  print(add(20, 22));           // 42
-  print(sum4(1, 2, 3, 4));      // 10
-  print(add(add(1, 2), 3));     // 6
+  println(add(20, 22));           // 42
+  println(sum4(1, 2, 3, 4));      // 10
+  println(add(add(1, 2), 3));     // 6
 
   banner("recursion");
-  print(fib(10));               // 55
-  print(factorial(10));         // 3628800
+  println(fib(10));               // 55
+  println(factorial(10));         // 3628800
 
   banner("booleans");
-  print(is_even(10));           // true
-  print(is_even(7));            // false
+  println(is_even(10));           // true
+  println(is_even(7));            // false
 
   // A function may be called from inside a loop, and its frame is rebuilt each
   // time round.
   banner("the first fibonacci numbers");
   for (int i = 0; i < 8; i = i + 1) {
-    print(fib(i));              // 0 1 1 2 3 5 8 13
+    println(fib(i));              // 0 1 1 2 3 5 8 13
   }
 }

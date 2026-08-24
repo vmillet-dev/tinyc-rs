@@ -1,0 +1,10 @@
+score: 92%
+Grade: A for student Toto
+passed: true
+suit: Spades
+ranks: 1 2 3 4 5
+12 beats 3: true
+total: 100
+92
+
+done

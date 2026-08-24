@@ -80,13 +80,13 @@ fn main() {
   // A list starts from a literal — possibly an empty one, which is the only
   // way to write a run of values with nothing in it.
   int[] xs = [3, 1, 4];
-  print(len(xs));            // 3
-  print(xs[2]);              // 4
+  println(len(xs));            // 3
+  println(xs[2]);              // 4
 
   push(xs, 1);
   push(xs, 5);
-  print(len(xs));            // 5
-  print(total(xs));          // 14
+  println(len(xs));            // 5
+  println(total(xs));          // 14
 
   // Assignment copies the elements, so growing one list cannot be seen through
   // the other. A list is the one thing in the language that can be written to
@@ -94,22 +94,22 @@ fn main() {
   // never aliases" true.
   int[] ys = xs;
   push(ys, 100);
-  print(len(xs));            // 5
-  print(len(ys));            // 6
+  println(len(xs));            // 5
+  println(len(ys));            // 6
 
   // Passing does not copy: the callee writes through the caller's own.
   double_each(xs);
-  print(xs[0]);              // 6
-  print(total(xs));          // 28
+  println(xs[0]);              // 6
+  println(total(xs));          // 28
 
   // Writing an element, as in an array.
   xs[0] = 30;
-  print(xs[0]);              // 30
+  println(xs[0]);              // 30
 
   // A thousand elements, none of them known when the program was compiled.
   int[] big = squares(1000);
-  print(len(big));           // 1000
-  print(big[999]);           // 1000000
+  println(len(big));           // 1000
+  println(big[999]);           // 1000000
 
   // As many objects as the data turns out to need — the thing neither an
   // array nor a list could do on its own before.
@@ -117,26 +117,26 @@ fn main() {
   push(readings, Reading { place: "Oslo", degrees: -3 });
   push(readings, Reading { place: "Nice", degrees: 21 });
   push(readings, Reading { place: "Lima", degrees: 18 });
-  print(len(readings));      // 3
-  print(warmest(readings));  // Nice
+  println(len(readings));      // 3
+  println(warmest(readings));  // Nice
 
   // An element is the object itself, so writing through one is writing into
   // the list.
   readings[0].degrees = 40;
-  print(warmest(readings));  // Oslo
+  println(warmest(readings));  // Oslo
 
   // Lists of the other things that fit in a register.
   string[] words = ["un", "deux"];
   push(words, "trois");
-  print(words[2]);           // trois
-  print(len(words));         // 3
+  println(words[2]);           // trois
+  println(len(words));         // 3
 
   bool[] flags = [];
   push(flags, true);
   push(flags, false);
-  print(flags[0]);           // true
-  print(len(flags));         // 2
+  println(flags[0]);           // true
+  println(len(flags));         // 2
 
   // And the one that pays for the rest.
-  print(shout("héllo wörld"));   // HéLLO WöRLD
+  println(shout("héllo wörld"));   // HéLLO WöRLD
 }

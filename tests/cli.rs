@@ -55,7 +55,7 @@ fn tinyc<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Ran {
     }
 }
 
-const HELLO: &str = "fn main() {\n  print(\"hi\");\n}\n";
+const HELLO: &str = "fn main() {\n  println(\"hi\");\n}\n";
 
 // -- what it writes --------------------------------------------------------
 
@@ -128,7 +128,7 @@ fn a_bare_output_name_is_written_where_it_was_asked_for() {
 #[test]
 fn each_emit_prints_its_stage_and_writes_no_assembly() {
     let dir = scratch("emit");
-    let source = source_in(&dir, "hello.tc", "fn main() {\n  print(1 + 2);\n}\n");
+    let source = source_in(&dir, "hello.tc", "fn main() {\n  println(1 + 2);\n}\n");
 
     // Each stage, with something *only* that stage's output could contain — so
     // that printing the wrong one is caught rather than passing on a substring
@@ -168,7 +168,7 @@ fn each_emit_prints_its_stage_and_writes_no_assembly() {
 fn an_early_emit_does_not_wait_for_a_later_stage_to_fail() {
     let dir = scratch("emit_early");
     // Lexes and parses; `main` may not take a parameter, so `sema` refuses it.
-    let source = source_in(&dir, "bad.tc", "fn main(int a) {\n  print(a);\n}\n");
+    let source = source_in(&dir, "bad.tc", "fn main(int a) {\n  println(a);\n}\n");
 
     let ran = tinyc(&[source.as_os_str(), "--emit".as_ref(), "tokens".as_ref()]);
     assert!(ran.succeeded(), "the tokens are there to print: {}", ran.stderr);
@@ -183,7 +183,7 @@ fn an_early_emit_does_not_wait_for_a_later_stage_to_fail() {
 #[test]
 fn dump_regalloc_names_registers_and_still_writes_the_assembly() {
     let dir = scratch("regalloc");
-    let source = source_in(&dir, "hello.tc", "fn main() {\n  int x = 1;\n  print(x + 1);\n}\n");
+    let source = source_in(&dir, "hello.tc", "fn main() {\n  int x = 1;\n  println(x + 1);\n}\n");
 
     let ran = tinyc(&[source.as_os_str(), "--dump-regalloc".as_ref()]);
     assert!(ran.succeeded(), "{}{}", ran.stdout, ran.stderr);
@@ -250,7 +250,7 @@ fn a_missing_input_file_is_reported_by_name() {
 #[test]
 fn a_program_that_does_not_compile_reports_and_writes_nothing() {
     let dir = scratch("refused");
-    let source = source_in(&dir, "bad.tc", "fn main() {\n  print(nope);\n}\n");
+    let source = source_in(&dir, "bad.tc", "fn main() {\n  println(nope);\n}\n");
 
     let ran = tinyc(&[source.as_os_str()]);
     assert!(!ran.succeeded(), "it should not have succeeded");
@@ -268,12 +268,12 @@ fn a_program_that_does_not_compile_reports_and_writes_nothing() {
 #[test]
 fn a_diagnostic_names_the_file_and_points_into_it() {
     let dir = scratch("rendered");
-    let source = source_in(&dir, "typo.tc", "fn main() {\n  int x = 1;\n  print(y);\n}\n");
+    let source = source_in(&dir, "typo.tc", "fn main() {\n  int x = 1;\n  println(y);\n}\n");
 
     let ran = tinyc(&[source.as_os_str()]);
     assert!(!ran.succeeded());
-    assert!(ran.stderr.contains("typo.tc:3:9"), "line and column: {}", ran.stderr);
-    assert!(ran.stderr.contains("print(y);"), "the source line is echoed: {}", ran.stderr);
+    assert!(ran.stderr.contains("typo.tc:3:11"), "line and column: {}", ran.stderr);
+    assert!(ran.stderr.contains("println(y);"), "the source line is echoed: {}", ran.stderr);
     assert!(ran.stderr.contains('^'), "a caret marks the spot: {}", ran.stderr);
 }
 
@@ -283,8 +283,8 @@ fn a_diagnostic_names_the_file_and_points_into_it() {
 fn each_stage_reports_through_the_same_path() {
     let dir = scratch("stages");
     let cases = [
-        ("lex.tc", "fn main() {\n  print(@);\n}\n"),
-        ("parse.tc", "fn main() {\n  print(1\n}\n"),
+        ("lex.tc", "fn main() {\n  println(@);\n}\n"),
+        ("parse.tc", "fn main() {\n  println(1\n}\n"),
         ("check.tc", "fn main() {\n  int x = \"text\";\n}\n"),
     ];
     for (name, text) in cases {
@@ -307,7 +307,7 @@ fn each_stage_reports_through_the_same_path() {
 fn deep_nesting_is_a_diagnostic_from_the_binary_too() {
     let dir = scratch("deep");
     let depth = 20_000;
-    let text = format!("fn main() {{ print(1{}); }}\n", " + 1".repeat(depth));
+    let text = format!("fn main() {{ println(1{}); }}\n", " + 1".repeat(depth));
     let source = source_in(&dir, "deep.tc", &text);
 
     let ran = tinyc(&[source.as_os_str()]);
@@ -325,7 +325,7 @@ fn deep_nesting_is_a_diagnostic_from_the_binary_too() {
 fn nesting_just_under_the_limit_still_builds_from_the_binary() {
     let dir = scratch("deep_ok");
     let depth = tinyc::parser::MAX_NESTING as usize - 8;
-    let text = format!("fn main() {{ print(1{}); }}\n", " + 1".repeat(depth));
+    let text = format!("fn main() {{ println(1{}); }}\n", " + 1".repeat(depth));
     let source = source_in(&dir, "deep_ok.tc", &text);
 
     let ran = tinyc(&[source.as_os_str()]);

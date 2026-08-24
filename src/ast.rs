@@ -747,6 +747,100 @@ pub struct Block {
     pub span: Span,
 }
 
+/// What a `%` in a format string writes, and so what the argument beside it
+/// must be.
+///
+/// One letter per printable type, and deliberately **no letter meaning
+/// "whatever this happens to be"**. A specifier is a claim the program makes
+/// about its own argument, and the type checker holds it to that claim — the
+/// same bargain as `string(n)`, which is written out rather than inferred.
+///
+/// A run of values has no letter because it has no rendering: printing a list
+/// would show where its elements are rather than what they are. See
+/// [`Ty::is_printable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spec {
+    Int,
+    Char,
+    Str,
+    Bool,
+    /// Writes the *name* of the variant, which is the only rendering an enum
+    /// has — its value is an index and would say nothing.
+    Enum,
+}
+
+/// Every specifier, in the order the "unknown specifier" note lists them.
+pub const SPECS: [Spec; 5] = [Spec::Int, Spec::Char, Spec::Str, Spec::Bool, Spec::Enum];
+
+impl Spec {
+    pub fn from_letter(letter: char) -> Option<Spec> {
+        SPECS.into_iter().find(|spec| spec.letter() == letter)
+    }
+
+    pub fn letter(self) -> char {
+        match self {
+            Spec::Int => 'd',
+            Spec::Char => 'c',
+            Spec::Str => 's',
+            Spec::Bool => 'b',
+            Spec::Enum => 'e',
+        }
+    }
+
+    /// Whether a value of this type is what the specifier promised.
+    ///
+    /// `Spec::Enum` accepts any enum: which one is a question about the
+    /// argument, and a format string that had to name it would have to be
+    /// rewritten every time the argument's type did.
+    pub fn accepts(self, ty: Ty) -> bool {
+        matches!(
+            (self, ty),
+            (Spec::Int, Ty::Int)
+                | (Spec::Char, Ty::Char)
+                | (Spec::Str, Ty::Str)
+                | (Spec::Bool, Ty::Bool)
+                | (Spec::Enum, Ty::Enum(_))
+        )
+    }
+
+    /// What it writes, named the way a diagnostic wants to say it.
+    pub fn writes(self) -> &'static str {
+        match self {
+            Spec::Int => "an int",
+            Spec::Char => "a char",
+            Spec::Str => "a string",
+            Spec::Bool => "a bool",
+            Spec::Enum => "a variant of an enum",
+        }
+    }
+}
+
+/// One thing a `print` writes, in the order it writes them.
+///
+/// A format string is split into these once, by the parser, and never looked at
+/// again: nothing at run time reads a `%`. That is what lets every mistake in
+/// one be a compile error, and it is also why the C `printf` underneath is never
+/// handed a format string the program wrote — see [`crate::ir`].
+#[derive(Clone, Debug)]
+pub enum PrintPart {
+    /// Literal text from the format string, with escapes resolved and `%%`
+    /// already reduced to one `%`. Fixed at compile time, so the backend writes
+    /// out its bytes rather than building the text again on every pass.
+    Text(Vec<char>),
+    /// A value written on its own: the `x` in `print(x)`. Any printable type
+    /// will do, because nothing claimed which it would be.
+    Value(Expr),
+    /// A value a specifier claimed the type of: the `%d` and the `x` in
+    /// `print("n = %d", x)`.
+    Spec {
+        spec: Spec,
+        /// Span of the `%d` itself, so a mismatch can point at the claim as
+        /// well as at the argument.
+        span: Span,
+        expr: Expr,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Decl {
@@ -764,10 +858,21 @@ pub enum Stmt {
         target: Place,
         value: Expr,
     },
+    /// `print(...)` or `println(...)`, already split into what it writes.
     Print {
-        /// Span of the `print` keyword, for diagnostics about the statement.
+        /// Span of the `print` or `println` keyword, for diagnostics about the
+        /// statement.
         span: Span,
-        value: Expr,
+        /// Whether the line ends after the last part — the only difference
+        /// between the two spellings.
+        ///
+        /// Kept as written rather than folded into `parts` here, so that
+        /// `--emit ast` still shows the program the way it was typed. The
+        /// newline becomes an ordinary piece of text one stage later, which is
+        /// where `for` becomes a `while` too.
+        newline: bool,
+        /// Empty for `println()`, which writes nothing but the line ending.
+        parts: Vec<PrintPart>,
     },
     /// `push(xs, value);` — one more element on the end of a list.
     ///
@@ -1113,9 +1218,24 @@ fn dump_stmt(out: &mut String, stmt: &Stmt, depth: usize) {
             dump_place_indices(out, target, depth + 1);
             dump_expr(out, value, depth + 1);
         }
-        Stmt::Print { value, .. } => {
-            out.push_str(&format!("{pad}print\n"));
-            dump_expr(out, value, depth + 1);
+        Stmt::Print { newline, parts, .. } => {
+            out.push_str(&format!("{pad}{}\n", if *newline { "println" } else { "print" }));
+            let inner = "  ".repeat(depth + 1);
+            for part in parts {
+                match part {
+                    PrintPart::Text(chars) => out.push_str(&format!(
+                        "{inner}text {:?}\n",
+                        chars.iter().collect::<String>()
+                    )),
+                    // A lone value is shown exactly as it was before there were
+                    // parts at all: it is the whole of what the statement writes.
+                    PrintPart::Value(expr) => dump_expr(out, expr, depth + 1),
+                    PrintPart::Spec { spec, expr, .. } => {
+                        out.push_str(&format!("{inner}%{}\n", spec.letter()));
+                        dump_expr(out, expr, depth + 2);
+                    }
+                }
+            }
         }
         Stmt::If { cond, then_block, else_block } => {
             out.push_str(&format!("{pad}if\n"));
@@ -1382,6 +1502,46 @@ mod tests {
         for ty in [Ty::Array(ArrayId(0)), Ty::Class(ClassId(0))] {
             assert!(!ty.fits_in_a_register(), "{ty:?} should not fit in a register");
             assert!(!ty.is_printable(), "{ty:?} should not print");
+        }
+    }
+
+    /// Every printable type has exactly one specifier, and every specifier has
+    /// a type.
+    ///
+    /// The two lists are written down apart — [`Ty::is_printable`] decides one,
+    /// [`SPECS`] the other — so only a test can keep them in step. A printable
+    /// type with no letter would be writable on its own and not inside a
+    /// format, which is a gap nobody would notice until they hit it; a letter
+    /// that accepted two types would be a claim that checks nothing.
+    #[test]
+    fn every_printable_type_has_exactly_one_specifier() {
+        let printable = [Ty::Int, Ty::Str, Ty::Char, Ty::Bool, Ty::Enum(EnumId(0))];
+        for ty in printable {
+            let accepting = SPECS.iter().filter(|spec| spec.accepts(ty)).count();
+            assert_eq!(accepting, 1, "{ty:?} should have exactly one specifier");
+        }
+        for spec in SPECS {
+            assert!(
+                printable.iter().any(|&ty| spec.accepts(ty)),
+                "`%{}` accepts nothing printable",
+                spec.letter()
+            );
+        }
+        // And nothing unprintable slips in under one.
+        for ty in [Ty::List(ListId(0)), Ty::Array(ArrayId(0)), Ty::Class(ClassId(0))] {
+            assert!(!SPECS.iter().any(|spec| spec.accepts(ty)), "{ty:?} should have none");
+        }
+    }
+
+    /// A letter is one specifier or none: the two directions of the mapping
+    /// agree, so a diagnostic cannot name a letter the splitter would refuse.
+    #[test]
+    fn a_letter_and_a_specifier_name_each_other() {
+        for spec in SPECS {
+            assert_eq!(Spec::from_letter(spec.letter()), Some(spec));
+        }
+        for letter in ['%', 'q', 'x', ' ', 'D'] {
+            assert_eq!(Spec::from_letter(letter), None, "`%{letter}` is not a specifier");
         }
     }
 
@@ -1653,9 +1813,37 @@ mod tests {
     #[test]
     fn the_dump_names_every_kind_of_literal() {
         assert_eq!(dumped_main("print(1);"), "  print\n    int 1\n");
-        assert_eq!(dumped_main("print(\"a\\nb\");"), "  print\n    string \"a\\nb\"\n");
         assert_eq!(dumped_main("print('x');"), "  print\n    char 'x'\n");
         assert_eq!(dumped_main("print(true);"), "  print\n    bool true\n");
+        // A string *literal* in that position is a format, and by the time the
+        // tree is dumped it is the text it stands for rather than an expression.
+        assert_eq!(dumped_main("print(\"a\\nb\");"), "  print\n    text \"a\\nb\"\n");
+        // It is still an expression anywhere else, and still dumps as one.
+        assert_eq!(
+            dumped_main("string s = \"a\\nb\";"),
+            "  decl string s\n    string \"a\\nb\"\n"
+        );
+    }
+
+    /// `println` is not `print`, and the tree says which was written.
+    ///
+    /// The newline it adds is not here: it becomes a piece of text one stage
+    /// later, so that `--emit ast` shows the program rather than the
+    /// desugaring — the same bargain `for` gets.
+    #[test]
+    fn the_dump_tells_the_two_spellings_apart() {
+        assert_eq!(dumped_main("println(1);"), "  println\n    int 1\n");
+        assert_eq!(dumped_main("println();"), "  println\n");
+    }
+
+    /// A format's pieces are shown in the order they are written, each
+    /// specifier over the value that fills it.
+    #[test]
+    fn the_dump_shows_a_formats_pieces_in_order() {
+        assert_eq!(
+            dumped_main("int n = 1;\nprintln(\"a %d b\", n);"),
+            "  decl int n\n    int 1\n  println\n    text \"a \"\n    %d\n      var n\n    text \" b\"\n"
+        );
     }
 
     #[test]
