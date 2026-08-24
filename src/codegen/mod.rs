@@ -8,9 +8,15 @@
 //!
 //! Adding a target means writing one new module implementing [`Backend`] and
 //! adding a variant to [`Target`]; nothing else in the compiler changes.
+//!
+//! Both targets that exist are x86-64, and they share one code generator: see
+//! [`x64`], where the handful of facts the two platforms disagree about are
+//! gathered into [`x64::Abi`] and [`x64::Platform`]. A third x86-64 platform
+//! would be one more implementation of that trait; a different *machine* would
+//! be a new module beside `x64`.
 
 pub mod regalloc;
-pub mod x64_win;
+pub mod x64;
 
 use crate::ir::Program;
 pub use regalloc::{Allocation, Location, PhysReg, RegisterFile};
@@ -30,10 +36,14 @@ pub trait Backend {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     X86_64Windows,
+    X86_64Linux,
 }
 
 /// Every target the compiler can emit, as accepted by `--target`.
-pub const TARGETS: &[(&str, Target)] = &[("x86_64-windows", Target::X86_64Windows)];
+pub const TARGETS: &[(&str, Target)] = &[
+    ("x86_64-windows", Target::X86_64Windows),
+    ("x86_64-linux", Target::X86_64Linux),
+];
 
 impl Target {
     pub fn from_name(name: &str) -> Option<Target> {
@@ -43,11 +53,31 @@ impl Target {
     pub fn names() -> Vec<&'static str> {
         TARGETS.iter().map(|(name, _)| *name).collect()
     }
+
+    /// What the machine running the compiler would want, which is what
+    /// `--target` defaults to.
+    ///
+    /// A default that was always Windows would mean every Linux user typed the
+    /// same flag every time; a compiler that refused to guess at all would mean
+    /// *both* did. Guessing the host is the one guess that is right by default
+    /// and wrong only when someone is deliberately cross-compiling — and they
+    /// have said so by typing `--target`.
+    ///
+    /// `None` on a machine that is neither, where there is nothing to guess and
+    /// the CLI says so rather than picking one.
+    pub fn host() -> Option<Target> {
+        match std::env::consts::OS {
+            "windows" => Some(Target::X86_64Windows),
+            "linux" => Some(Target::X86_64Linux),
+            _ => None,
+        }
+    }
 }
 
 pub fn backend_for(target: Target) -> Box<dyn Backend> {
     match target {
-        Target::X86_64Windows => Box::new(x64_win::X64Windows::new()),
+        Target::X86_64Windows => Box::new(x64::X64::windows()),
+        Target::X86_64Linux => Box::new(x64::X64::linux()),
     }
 }
 
@@ -104,8 +134,19 @@ mod tests {
         // A default would silently compile for something other than what was
         // asked for.
         assert_eq!(Target::from_name(""), None);
-        assert_eq!(Target::from_name("x86_64-linux"), None);
+        assert_eq!(Target::from_name("x86_64-freebsd"), None);
         assert_eq!(Target::from_name("X86_64-WINDOWS"), None, "the match is exact");
+    }
+
+    #[test]
+    fn the_host_resolves_to_a_target_this_compiler_has() {
+        // `--target` defaults to this, so a host answering a target the
+        // compiler cannot build would be a default that never works. A machine
+        // that is neither answers `None`, which the CLI reports rather than
+        // guessing past.
+        if let Some(host) = Target::host() {
+            assert!(TARGETS.iter().any(|(_, listed)| *listed == host), "{host:?} is not listed");
+        }
     }
 
     #[test]

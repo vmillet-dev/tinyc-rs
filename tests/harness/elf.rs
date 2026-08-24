@@ -1,16 +1,13 @@
 //! Building on a Unix: `nasm -f elf64`, then the system C compiler as linker.
 //!
-//! The counterpart of `msvc.rs`, and the half of a Linux port that does not
-//! need a compiler backend to exist. It is written now so that the port is one
-//! job rather than two: when `codegen` grows an `x86_64-linux` target, the
-//! whole execution suite starts running against it with no further edits here.
+//! The counterpart of `msvc.rs`. This file was written before the backend it
+//! builds for existed, so that the port would be one job rather than two — and
+//! it worked: when `codegen` grew its `x86_64-linux` target the whole execution
+//! suite started running against it, and the only thing that needed saying here
+//! was this paragraph.
 //!
-//! Until then [`find`] answers the same way it would on a machine with no
-//! assembler — the tests say what is missing and pass.
-//!
-//! **Not exercised yet**, for exactly that reason: there is no backend for it
-//! to build. Expect the first port to adjust the flags below, `-no-pie` above
-//! all, which is what hand-written NASM that names absolute addresses needs.
+//! When the machine has no assembler [`find`] says so and the tests pass, the
+//! same way they do on a Windows box without Visual Studio.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -19,9 +16,7 @@ use tinyc::codegen::Target;
 
 use super::{Toolchain, step};
 
-/// The target this toolchain builds for, by the name `--target` would know it
-/// under. Nothing resolves it today; adding the variant to `codegen::TARGETS`
-/// is what turns this file on.
+/// The target this toolchain builds for, by the name `--target` knows it under.
 const TARGET: &str = "x86_64-linux";
 
 pub struct Elf {
@@ -59,13 +54,12 @@ impl Toolchain for Elf {
 
         step("nasm", Command::new(&self.nasm).args(["-f", "elf64", "-o"]).arg(&obj).arg(asm))?;
 
-        // `-no-pie`: a position-independent executable needs every address to
-        // be reached relative to `rip`, which hand-written assembly naming
-        // symbols outright does not do.
-        step(
-            "cc",
-            Command::new(&self.cc).arg("-no-pie").arg(&obj).arg("-o").arg(exe),
-        )
+        // `-no-pie`: a position-independent executable reaches every symbol
+        // through the GOT or the PLT, and assembly that names them outright
+        // does not. Most distributions link PIE by default, so this is the one
+        // flag a TinyC program cannot be built without — `scripts/build.sh`
+        // passes it too.
+        step("cc", Command::new(&self.cc).arg("-no-pie").arg(&obj).arg("-o").arg(exe))
     }
 }
 
@@ -73,7 +67,7 @@ impl Toolchain for Elf {
 ///
 /// Unix has no `where.exe`, and shelling out to `which` is one more program
 /// that may not be there — walking `PATH` is both shorter and surer.
-fn on_path(program: &str) -> Option<PathBuf> {
+pub(super) fn on_path(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).map(|dir| dir.join(program)).find(|candidate| candidate.is_file())
 }

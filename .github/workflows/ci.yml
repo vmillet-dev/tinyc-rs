@@ -1,0 +1,116 @@
+name: CI
+
+# A compiler with two targets needs two machines. Not because the *compiler*
+# differs — it cross-compiles, and `tests/assembles.rs` puts both targets
+# through the assembler on either host — but because only the machine a program
+# was built for can run it, and running it is the only test that can catch a
+# miscompilation. So each job builds everything for both targets and *runs* the
+# one it is.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # On a developer's machine a missing assembler means "skipped, and that is
+  # fine". On a build server it means the server is broken, and a suite that
+  # quietly passed would be the worst possible way to find out. See
+  # `tests/harness/mod.rs`.
+  TINYC_REQUIRE_TOOLCHAIN: 1
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    strategy:
+      # One target failing is a fact worth knowing about the other, so let both
+      # jobs finish.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows (nasm + MSVC link)
+            os: windows-latest
+          - name: Linux (nasm + cc)
+            os: ubuntu-latest
+
+    defaults:
+      run:
+        # Available on both runners, so every step below is written once.
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          rustc --version
+          cargo --version
+
+      # The assembler. Both hosts need it: for their own target, and for the
+      # other one, which `tests/assembles.rs` cross-assembles.
+      - name: Install nasm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nasm
+          nasm -v
+
+      # Chocolatey puts it in `C:\Program Files\NASM`, which is one of the
+      # places `tests/harness/msvc.rs` looks — `winget install nasm` does not
+      # put it on PATH either, and that is why the harness searches at all.
+      - name: Install nasm (Windows)
+        if: runner.os == 'Windows'
+        run: choco install nasm --no-progress -y
+
+      # The linker on Windows is `link.exe` from the Visual Studio C++ tools,
+      # which the runner image already has; the harness finds it through
+      # `vswhere` exactly as it does on a developer's machine. On Linux `cc` is
+      # already there.
+
+      - name: Cache the registry and the build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build --all-targets --verbose
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The suites that need nothing but the compiler: they run in under a
+      # second and fail closest to whatever broke.
+      - name: Test the compiler
+        run: >
+          cargo test --lib
+          --test cli --test pipeline --test targets --test error_positions
+
+      # The two that need a toolchain. `--nocapture` so the log says which
+      # assembler and linker were found, which is the first thing to look at
+      # when one of these fails on a runner and not on a desk.
+      - name: Assemble every target, run this one
+        run: cargo test --test assembles --test execution -- --nocapture
+
+      # The path the README tells a newcomer to type. It is documentation, so
+      # it can rot; this is what stops it.
+      - name: Build an example the documented way (Linux)
+        if: runner.os == 'Linux'
+        run: bash scripts/build.sh examples/hello.tc
+
+      - name: Build an example the documented way (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build.ps1 examples/hello.tc

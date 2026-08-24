@@ -72,7 +72,7 @@ impl Toolchain for Msvc {
 }
 
 /// `winget install nasm` does not put it on `PATH`, so look where it lands.
-fn find_nasm() -> Option<PathBuf> {
+pub(super) fn find_nasm() -> Option<PathBuf> {
     let mut candidates = vec![PathBuf::from("nasm.exe")];
     for variable in ["LOCALAPPDATA", "ProgramFiles", "ProgramFiles(x86)"] {
         if let Ok(root) = std::env::var(variable) {

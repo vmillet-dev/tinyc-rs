@@ -59,8 +59,10 @@ rather than answering wrongly.
   dataflow pass on the control flow graph, run once per function.
 * Target-independent up to and including register allocation: a backend
   describes its own register file and emits its own text.
-* Tested end to end — the integration suite assembles, links and **runs** the
-  compiled programs, comparing what they print.
+* Two targets, **Windows and Linux**, from one x86-64 code generator — and
+  either can be emitted from either machine.
+* Tested end to end — the integration suite assembles both targets and **runs**
+  the host's, comparing what the programs print. CI does it on both machines.
 
 ## Quick start
 
@@ -68,18 +70,51 @@ rather than answering wrongly.
 cargo run -- examples/hello.tc -o out/hello.asm
 ```
 
-`tinyc` emits NASM assembly and stops there. To get an executable on Windows:
+`tinyc` emits NASM assembly and stops there. To get an executable, on Windows:
 
 ```powershell
 .\scripts\build.ps1 examples\hello.tc
 ```
 
-That needs `nasm` (`winget install nasm`) and a Visual Studio installation with
-the "Desktop development with C++" workload, for `link.exe` and the CRT import
-libraries — writing anything out compiles into a call to the C runtime's
-`printf`, which is why the CRT is linked in. A TinyC format never reaches it:
-the compiler splits one into its pieces, so `printf` is only ever handed `%lld`
-or `%s` and one value to go with it.
+or on Linux:
+
+```bash
+./scripts/build.sh examples/hello.tc
+```
+
+Both need `nasm` — `winget install nasm`, or `apt install nasm`. Windows also
+needs a Visual Studio installation with the "Desktop development with C++"
+workload, for `link.exe` and the CRT import libraries; Linux needs a C compiler
+(`apt install build-essential`), used only as the linker, because it is what
+knows where the C library is and which startup object calls `main`.
+
+The C library is linked in either case because writing anything out compiles
+into a call to `printf`. A TinyC format never reaches it: the compiler splits
+one into its pieces, so `printf` is only ever handed `%lld` or `%s` and one
+value to go with it.
+
+### Two targets
+
+`--target` picks the machine to generate code for, and defaults to the one you
+are on:
+
+| `--target` | Assembled with | Linked with |
+|------------|----------------|-------------|
+| `x86_64-windows` | `nasm -f win64` | `link.exe`, against `msvcrt` |
+| `x86_64-linux` | `nasm -f elf64` | `cc -no-pie` |
+
+Either can be emitted from either machine — the compiler cross-compiles, and
+only *running* the result needs the matching one. `-no-pie` is not optional on
+Linux: the assembly names its symbols outright, and a position-independent
+executable reaches them through the GOT instead.
+
+A TinyC program means the same thing on both. The two backends share one code
+generator, and the handful of facts they disagree about — argument registers,
+shadow space, two C library spellings, and what a console needs told — are
+gathered in [`src/codegen/x64/mod.rs`](src/codegen/x64/mod.rs). Even the
+four-parameter limit is deliberately the same, though System V could pass six:
+a program that compiled on one machine and was refused on the other would be a
+portability trap the compiler could see and did not mention.
 
 Every stage can be printed on its own:
 
@@ -91,7 +126,7 @@ cargo run -- examples/hello.tc --emit ir
 |------|---------|
 | `-o, --output <FILE>` | where to write the assembly (default: input path with `.asm`) |
 | `--emit tokens\|ast\|ir\|asm` | stop after a stage and print its result |
-| `--target <NAME>` | target to generate code for (default `x86_64-windows`) |
+| `--target <NAME>` | `x86_64-windows` or `x86_64-linux` (default: this machine's) |
 | `--dump-regalloc` | print live intervals and register assignments |
 
 ## How it works
@@ -105,7 +140,7 @@ Each arrow is a module, and each stage can be inspected with `--emit`:
 | type checking | [`src/sema.rs`](src/sema.rs) | the type of every expression |
 | lowering | [`src/ir.rs`](src/ir.rs) | a control flow graph of three-address code |
 | register allocation | [`src/codegen/regalloc.rs`](src/codegen/regalloc.rs) | a machine register or stack slot per value |
-| emission | [`src/codegen/x64_win.rs`](src/codegen/x64_win.rs) | NASM assembly |
+| emission | [`src/codegen/x64/`](src/codegen/x64/) | NASM assembly, for either platform |
 
 ## Examples
 

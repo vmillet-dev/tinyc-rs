@@ -1,0 +1,8 @@
+# Shell scripts have to reach a Linux shell with LF endings, whatever the
+# checkout platform does with everything else: `bash` reads a stray carriage
+# return as part of the command and fails with `$'\r': command not found`,
+# which is a confusing way to learn that a file was checked out on Windows.
+*.sh text eol=lf
+
+# Same reasoning, for the file a Linux runner reads before anything else.
+*.yml text eol=lf

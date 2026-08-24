@@ -41,6 +41,26 @@ mod elf;
 #[cfg(windows)]
 mod msvc;
 
+/// Set this — to anything — to turn "no toolchain, so skipped" into a failure.
+///
+/// The whole point of a build server is that it *has* the toolchain, so a skip
+/// there means something is wrong with the server and the suite is measuring
+/// nothing. See [`Harness::find`].
+pub const REQUIRE: &str = "TINYC_REQUIRE_TOOLCHAIN";
+
+/// The assembler, wherever this machine keeps it, or `None`.
+///
+/// Both toolchains need it, and so does `tests/assembles.rs`, which uses it on
+/// targets this machine could never *run*.
+pub fn nasm() -> Option<PathBuf> {
+    #[cfg(windows)]
+    return msvc::find_nasm();
+    #[cfg(unix)]
+    return elf::on_path("nasm");
+    #[cfg(not(any(windows, unix)))]
+    return None;
+}
+
 /// Turning assembly text into something the machine will run.
 ///
 /// Deliberately one step rather than "assemble" then "link": how many programs
@@ -94,6 +114,11 @@ impl Harness {
     ///
     /// Looking a toolchain up costs a second or two and every test wants the
     /// same answer, so it is found once for the whole run.
+    ///
+    /// Skipping is right on a developer's machine and wrong on a build server:
+    /// there, a toolchain that cannot be found is a broken *server*, and every
+    /// test in this file quietly passing is the worst possible way to learn it.
+    /// So CI sets [`REQUIRE`] and gets a failure instead of a skip.
     pub fn find() -> Option<&'static Harness> {
         static HARNESS: std::sync::OnceLock<Option<Harness>> = std::sync::OnceLock::new();
         HARNESS
@@ -105,6 +130,10 @@ impl Harness {
                     Some(Harness { toolchain, scratch })
                 }
                 Err(why) => {
+                    assert!(
+                        std::env::var_os(REQUIRE).is_none(),
+                        "{REQUIRE} is set, so a missing toolchain is a failure: {why}"
+                    );
                     println!("skipped: {why}");
                     None
                 }

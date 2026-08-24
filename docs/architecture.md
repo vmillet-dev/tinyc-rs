@@ -36,7 +36,7 @@ Each arrow is a module, and each stage can be inspected on its own with
 | type checking | [`src/sema.rs`](../src/sema.rs) | the type of every expression |
 | lowering | [`src/ir.rs`](../src/ir.rs) | a control flow graph of three-address code |
 | register allocation | [`src/codegen/regalloc.rs`](../src/codegen/regalloc.rs) | a machine register or stack slot per value |
-| emission | [`src/codegen/x64_win.rs`](../src/codegen/x64_win.rs) | NASM assembly |
+| emission | [`src/codegen/x64/`](../src/codegen/x64/) | NASM assembly |
 
 ```bash
 cargo run -- examples/hello.tc --emit tokens
@@ -76,7 +76,7 @@ Options:
 |------|---------|
 | `-o, --output <FILE>` | where to write the assembly (default: input path with `.asm`) |
 | `--emit tokens\|ast\|ir\|asm` | stop after a stage and print its result |
-| `--target <NAME>` | target to generate code for (default `x86_64-windows`) |
+| `--target <NAME>` | `x86_64-windows` or `x86_64-linux` (default: this machine's) |
 | `--dump-regalloc` | print live intervals and register assignments |
 
 ## Building an executable
@@ -215,7 +215,9 @@ fn fib(int n) -> int {
   passes in registers. A fifth would need stack arguments. The number is the
   target's to state, not the language's: it comes from
   `RegisterFile::max_args`, and `sema::check` enforces whatever the backend
-  reports rather than a constant of its own.
+  reports rather than a constant of its own. The Linux backend could report
+  six, and deliberately does not — see
+  [Two platforms, one code generator](#two-platforms-one-code-generator).
 
 ### What functions changed underneath
 
@@ -1520,8 +1522,8 @@ that can fail to keep a frame a call could be made from — nearly all of them,
 now that any addition can fail — the routine builds one out of thin air:
 
 ```nasm
-tc$rt$abort:
-    and  rsp, -16      ; force the alignment a call needs
+tc$rt$abort:                 ; as emitted for Windows; on Linux the reservation
+    and  rsp, -16            ; is nothing, the register is rdi, and it is `write`
     sub  rsp, 32       ; shadow space
     mov  rcx, 2
     call _write
@@ -1564,17 +1566,69 @@ target needs:
 1. a module implementing `Backend` (`name`, `register_file`, `emit`);
 2. a variant in `codegen::Target` and an entry in `codegen::TARGETS`.
 
-The x64 Windows backend keeps the ABI-critical registers (`rcx`, `rdx`, `r8`,
-`r9` for arguments, `rax` for `idiv` and return values, `r10`/`r11` as scratch)
-out of the allocator's hands, so the allocator only ever reasons about
-"caller-saved" and "callee-saved" pools — never about x86.
+The backend keeps the ABI-critical registers out of the allocator's hands —
+the argument registers, `rax` for `idiv` and return values, `r10`/`r11` as
+scratch — so the allocator only ever reasons about "caller-saved" and
+"callee-saved" pools, never about x86.
 
 **Nothing in the test suite needs to change either.** `tests/targets.rs` walks
 `Target::names()`, so step 2 alone puts the new backend under every contract
-every other target already keeps; `tests/cli.rs` will ask for it by name; and
-`tests/execution.rs` will assemble, link and *run* its output as soon as
-`tests/harness/elf.rs` reports a target that resolves. Adding a target is one
-job, not two — see [The execution harness](#the-execution-harness).
+every other target already keeps; `tests/cli.rs` will ask for it by name;
+`tests/assembles.rs` will put its output through the assembler; and
+`tests/execution.rs` will assemble, link and *run* it on a machine that can.
+Adding a target is one job, not two — see
+[The execution harness](#the-execution-harness).
+
+### Two platforms, one code generator
+
+That claim was tested the day Linux was added, and it held: `codegen` grew a
+variant, `tests/harness/elf.rs` had been waiting for a target name that
+resolved, and every suite above picked the new target up without an edit.
+
+What it did *not* predict is where the work actually was. A second x86-64
+platform is not a second backend — instruction selection, the register
+allocator's view of the machine, the arena, and every routine a string or a list
+becomes are facts about the **machine**, not the operating system, and writing
+them twice would have been writing the same 2,500 lines twice. So `codegen/x64/`
+is one code generator with the disagreements factored out:
+
+| | Windows (Microsoft x64) | Linux (System V AMD64) |
+|---|---|---|
+| argument registers | `rcx`, `rdx`, `r8`, `r9` | `rdi`, `rsi`, `rdx`, `rcx` |
+| shadow space | 32 bytes, reserved by the caller | none |
+| allocatable | `rbx`, `rsi`, `rdi`, `r12`-`r15` | `rbx`, `r12`-`r15` |
+| a variadic call | says nothing | sets `al` to the vector registers used |
+| write, read | `_write`, `_read` | `write`, `read` |
+| the console | has a code page, and it is not UTF-8 | is a byte stream already |
+
+The first five rows are *data*, and live in one `Abi` value per platform. Only
+the last is code, and it is the one genuine difference: a Windows console cannot
+be read as bytes at all — what a person types is characters, and every byte
+encoding it will hand over loses some of them — so it is read as UTF-16 through
+`ReadConsoleW` and converted. A Linux terminal is a file. `tc$rt$refill` owns
+the shape shared by both (flush what was printed, read, strip a byte order
+mark), and asks the platform only to fill the buffer.
+
+Two smaller things fell out of doing it this way, and both are improvements to
+the Windows side as well:
+
+* **Frame sizes are derived, not written down.** Every `sub rsp, 40` in the
+  runtime used to be a hand-computed "shadow space plus alignment". Those
+  numbers *are* the shadow space, so `StubFrame` now takes what a routine wants
+  and works the rest out. A platform with no shadow space reserves nothing, and
+  neither version of the arithmetic can drift from the other.
+* **The runtime's register policy became a rule instead of a habit.** A routine
+  may only keep a value across a call in `rbx` or `r12`-`r15` — callee-saved in
+  both conventions, an argument register in neither — which is what lets one
+  body be emitted for both. `StubFrame` refuses to push anything else, and
+  `RUNTIME_LOCALS` says why.
+
+The one thing deliberately *not* taken from the ABI is the parameter limit.
+System V passes six arguments in registers and `sema` asks the target rather
+than deciding for itself, so the backend could honestly say six. It says four,
+like Windows: TinyC is one language, and a five-parameter function that compiled
+on one machine and was refused on the other would be a portability trap the
+compiler could see and did not mention.
 
 ## Tests
 
@@ -1584,8 +1638,8 @@ cargo test
 
 Unit tests live beside each stage — including the ones about the *text* a
 backend emits, which belong to that backend and no other: a prologue, a symbol
-prefix and a mnemonic are facts about `x64_win`, so they are checked in
-`x64_win`. Five integration suites sit on top:
+prefix and a mnemonic are facts about `codegen::x64`, so they are checked in
+that module. Six integration suites sit on top:
 
 * `tests/error_positions.rs` asserts the exact line and column reported for
   every program in `examples/errors/`. Only about where the caret lands.
@@ -1595,6 +1649,14 @@ prefix and a mnemonic are facts about `x64_win`, so they are checked in
   is the target's own, the front end builds the same tree for all of them, and
   every error example is refused by all of them. Nothing in it names a target,
   so a new backend arrives already covered.
+* `tests/assembles.rs` puts **every target's** output through NASM, on whichever
+  machine is running. It exists to close a gap exactly the shape of a
+  cross-compiler: the assembly for the target you are *not* on is never looked
+  at by anything that could object to it, so a misspelled mnemonic or an
+  addressing mode x86 does not have would sail through every other suite and be
+  found by whoever first built on the other machine. A warning counts as a
+  failure here — NASM warns rather than refuses on a truncated immediate or a
+  size it had to guess, and each of those is a wrong instruction waiting.
 * `tests/cli.rs` drives the built binary: where the assembly is written, what
   `--emit` prints and does not write, what an unknown target says, and that a
   program refused at any stage exits non-zero with a rendered diagnostic on
@@ -1628,8 +1690,9 @@ tests/harness/elf.rs   nasm -f elf64, then cc         (#[cfg(unix)])
 
 `Toolchain` is one method — assembly text in, an executable out — plus the
 `Target` to ask the compiler for. `host_toolchain()` picks one, and is the only
-`cfg` in the whole harness. So adding the Linux backend means giving `elf.rs`
-a target that resolves; every case table comes along unchanged.
+`cfg` in the whole harness. `elf.rs` was written before the backend it builds
+for existed, precisely so that adding Linux would be one job; when the target
+name started resolving, every case table came along unchanged.
 
 Both failure modes are ordinary answers rather than panics: a machine may have
 no assembler, and the compiler may have no backend for a machine that does. In
@@ -1640,6 +1703,28 @@ works without a toolchain:
 cargo test --test execution -- --nocapture
 ```
 
+Except on a build server, where "no assembler, so skipped" means the *server* is
+broken and a suite that quietly passed would be the worst way to find out. So
+setting `TINYC_REQUIRE_TOOLCHAIN` turns every skip into a failure, and CI sets
+it.
+
 `link.exe` only knows where the C runtime is if `vcvars64.bat` has told it, so
 the suite runs that once, keeps the `LIB` it sets, and calls the linker directly
 from then on.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs the whole suite on `windows-latest` and
+`ubuntu-latest`. Two machines, not because the compiler differs — it
+cross-compiles, and `tests/assembles.rs` checks both targets from either host —
+but because **only the machine a program was built for can run it**, and running
+it is the only test that can catch a miscompilation. Each job therefore builds
+for both targets and runs the one it is.
+
+Each job also builds `examples/hello.tc` through `scripts/build.ps1` or
+`scripts/build.sh`, which is the path the README tells a newcomer to type: it is
+documentation, so it can rot, and this is what stops it.
+
+`cargo clippy -- -D warnings` is a gate; `cargo fmt --check` is not, because the
+repository has no committed `rustfmt.toml` and the default profile disagrees
+with the style the code is written in.

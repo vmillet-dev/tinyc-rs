@@ -29,9 +29,9 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = Emit::Asm)]
     emit: Emit,
 
-    /// Target to generate code for.
-    #[arg(long, default_value = "x86_64-windows")]
-    target: String,
+    /// Target to generate code for [default: this machine's].
+    #[arg(long, value_name = "TARGET")]
+    target: Option<String>,
 
     /// Print live intervals and register assignments.
     #[arg(long)]
@@ -60,12 +60,23 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: &Cli) -> Result<(), String> {
-    let Some(target) = Target::from_name(&cli.target) else {
-        return Err(format!(
-            "error: unknown target `{}`\n  known targets: {}\n",
-            cli.target,
-            Target::names().join(", ")
-        ));
+    // Naming a target is the way to cross-compile; not naming one means this
+    // machine, which is what all but one invocation wants.
+    let target = match &cli.target {
+        Some(name) => Target::from_name(name).ok_or_else(|| {
+            format!(
+                "error: unknown target `{name}`\n  known targets: {}\n",
+                Target::names().join(", ")
+            )
+        })?,
+        None => Target::host().ok_or_else(|| {
+            format!(
+                "error: there is no backend for {}, so --target has to say what to build for\n  \
+                 known targets: {}\n",
+                std::env::consts::OS,
+                Target::names().join(", ")
+            )
+        })?,
     };
 
     let text = std::fs::read_to_string(&cli.input)
