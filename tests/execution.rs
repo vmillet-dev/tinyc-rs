@@ -330,7 +330,7 @@ fn reading_the_input_sees_characters_and_knows_when_to_stop() {
     // `(input, body, expected)`. The inputs are written as raw bytes on
     // purpose: what arrives is UTF-8, and turning it into characters is the
     // very thing under test.
-    let cases: [(&[u8], &str, &str); 12] = [
+    let cases: [(&[u8], &str, &str); 15] = [
         // Nothing at all: the end of the input is where the program starts.
         (b"", "print(eof());", "true"),
         (b"x\n", "print(eof());", "false"),
@@ -369,6 +369,20 @@ fn reading_the_input_sees_characters_and_knows_when_to_stop() {
             "print(string(int(read_line())) == \"-9223372036854775808\");",
             "true",
         ),
+        // A byte order mark is how several Windows editors spell "this file is
+        // UTF-8". It is not a character of the text, and a program that counted
+        // it would read `42` as a three-character word rather than as a number.
+        (b"\xEF\xBB\xBF42\n", "print(int(read_line()) + 1);", "43"),
+        // Only the first bytes can carry one: the same three bytes later in the
+        // input are the character they spell, and stay.
+        (
+            b"\xEF\xBB\xBFa\n\xEF\xBB\xBFb\n",
+            "print(read_line());\nprint(len(read_line()));",
+            "a\n2",
+        ),
+        // A mark and nothing else is a file with no lines in it, not a file
+        // whose first line failed to arrive.
+        (b"\xEF\xBB\xBF", "print(eof());", "true"),
     ];
 
     harness.each_prints_given("input", &cases);

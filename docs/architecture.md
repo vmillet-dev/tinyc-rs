@@ -879,20 +879,48 @@ error: `eof` is built in and cannot be redefined
 The whole cost is one row per built-in and one arm in lowering, where the call
 becomes a `tc$rt$…` routine instead of a `FuncId`.
 
-**The compiler buffers the input itself**, with `_read` and 4 KB of `.bss`,
-rather than going through a `FILE*`. That is what makes `eof()` answerable
-without pushing a character back: "has the input run out" becomes a question
-about that buffer, and it costs nothing at all while the buffer is not empty.
+**The compiler buffers the input itself**, in 4 KB of `.bss`, rather than going
+through a `FILE*`. That is what makes `eof()` answerable without pushing a
+character back: "has the input run out" becomes a question about that buffer,
+and it costs nothing at all while the buffer is not empty.
 
 **`read_line` is built out of the two features before it.** Characters
 accumulate in a list, which grows by doubling, and `string(cs)` seals them —
 so a line of any length costs one pass and no quadratic anything. It is the
 clearest argument for having built the lists first.
 
-**And the console is told twice.** `SetConsoleOutputCP(65001)` was already there
-for printing; `SetConsoleCP(65001)` is its counterpart, so that what is *typed*
-arrives as UTF-8 too. Without it a console hands over its own code page, and the
-decoder would rightly refuse it.
+**But a console is not a file, and cannot be read as one.** A redirected stdin
+is bytes, and the program asked for UTF-8, so `_read` hands over exactly what is
+there. What a person *types* is characters, and the bytes are invented on the
+way out — so which bytes arrive is a property of the console, and every answer
+it can give is the wrong one. Left alone it uses its own code page, and `é`
+becomes a byte no character starts with. `SetConsoleCP(65001)` looks like the
+counterpart of the output call and is a trap: the conversion is done one byte
+per character, so a character needing two arrives as a **NUL**, which then
+truncates the line at the next `print`.
+
+So the console is read as what it is. `tc$rt$refill` asks `GetConsoleMode`
+whether stdin is one — the question only a console answers — and remembers the
+verdict. A console is read with `ReadConsoleW`, which is the only way it will
+part with every character, and `WideCharToMultiByte` turns the UTF-16 into the
+UTF-8 the decoder above already knows. Anything else is read with `_read`. The
+decoder never learns which of the two happened.
+
+Two smaller things live at the same edge. `Ctrl+Z` arrives from a console as a
+*character* rather than as a short read, so the refill looks for it and latches
+the input closed. And a leading byte order mark — how several Windows editors
+spell "this file is UTF-8" — is dropped, once, before anything else sees it:
+without that, `x.exe < numbers.txt` reads its first line as a word that happens
+to look like a number.
+
+**What has been printed is flushed before the program waits.** `print` goes
+through the C runtime, which holds what it is given whenever the output is a
+pipe rather than a console — an IDE's run window, say. Without a flush at the
+top of `tc$rt$refill`, a prompt sits in that buffer while the program blocks on
+the answer to it, and a person types into what looks like a program that has
+stopped responding. The abort report flushes for the same reason: `_write` goes
+straight to the descriptor, so without it the report overtakes everything the
+program had already printed.
 
 ### Enums and exhaustive matching
 

@@ -148,9 +148,34 @@ const NEXT_BYTE: &str = "tc$rt$next_byte";
 /// encoding becomes the language's.
 const UTF8_DECODE: &str = "tc$rt$utf8_decode";
 
-/// The code page that makes a Windows console *hand over* what is typed into it
-/// as UTF-8, which is [`UTF8_CODE_PAGE`]'s counterpart for input.
-const CONSOLE_INPUT_CP: &str = "SetConsoleCP";
+/// Fills [`INPUT`] from whatever stdin turns out to be. See [`input_stubs`] for
+/// why a console and a pipe cannot be read the same way.
+const REFILL: &str = "tc$rt$refill";
+/// What stdin turned out to be, worked out once and remembered:
+/// [`STDIN_CONSOLE`] or [`STDIN_BYTES`], and zero until the first read.
+const STDIN_KIND: &str = "tc$rt$stdin_kind";
+const STDIN_CONSOLE: u32 = 1;
+const STDIN_BYTES: u32 = 2;
+/// The console handle, and somewhere for the two console calls to answer into.
+const STDIN_HANDLE: &str = "tc$rt$stdin_handle";
+const CONSOLE_SCRATCH: &str = "tc$rt$console_scratch";
+/// Set once the input has been declared over — by a `Ctrl+Z`, which a console
+/// hands over as a character rather than as a short read.
+const INPUT_DONE: &str = "tc$rt$input_done";
+/// Set once the first bytes of the input have been looked at, which is the
+/// only moment a byte order mark could be among them.
+const FIRST_READ: &str = "tc$rt$first_read";
+/// What a console is read into: UTF-16, because that is the only encoding a
+/// Windows console will hand over without losing characters.
+const INPUT_WIDE: &str = "tc$rt$input_wide";
+/// Sized so that the worst case still fits [`INPUT`]: a UTF-16 unit becomes at
+/// most three UTF-8 bytes, and a surrogate pair — two units — becomes four.
+const INPUT_WCHARS: u32 = INPUT_BYTES / 3;
+/// The character a console sends for `Ctrl+Z`, which is how a person says that
+/// what they have typed is all there is.
+const CTRL_Z: u32 = 0x1A;
+/// `GetStdHandle(STD_INPUT_HANDLE)`.
+const STD_INPUT_HANDLE: i32 = -10;
 
 const ABORT_DIV_ZERO: &str = "tc$rt$div_by_zero";
 const ABORT_DIV_OVERFLOW: &str = "tc$rt$div_overflow";
@@ -697,10 +722,20 @@ fn header(asm: &mut Asm, target: &str, used: &Used) {
         asm.line("extern SetConsoleOutputCP");
     }
     if used.reads_text() {
-        // The input is buffered here rather than through a `FILE*`, so what is
-        // needed is the low-level read and nothing else.
+        // The input is buffered here rather than through a `FILE*`, so a
+        // redirected stdin needs the low-level read and nothing else. A console
+        // is not a file and cannot be read as one — see `input_stubs`.
         asm.line("extern _read");
-        asm.line(&format!("extern {CONSOLE_INPUT_CP}"));
+        asm.line("extern GetStdHandle");
+        asm.line("extern GetConsoleMode");
+        asm.line("extern ReadConsoleW");
+        asm.line("extern WideCharToMultiByte");
+    }
+    if used.aborts || used.reads_text() {
+        // `print` goes through the C runtime, which holds what it is given
+        // until the buffer fills. Anything that has to be *seen* before the
+        // program blocks or stops has to empty that buffer first.
+        asm.line("extern fflush");
     }
     asm.line(&format!("global {ENTRY_POINT}"));
     asm.blank();
@@ -803,6 +838,12 @@ fn data_section(asm: &mut Asm, program: &Program, used: &Used) {
             asm.asm(&format!("{INPUT}: resb {INPUT_BYTES}"));
             asm.asm(&format!("{INPUT_POS}: resq 1"));
             asm.asm(&format!("{INPUT_LEN}: resq 1"));
+            asm.asm(&format!("{INPUT_WIDE}: resw {INPUT_WCHARS}"));
+            asm.asm(&format!("{INPUT_DONE}: resq 1"));
+            asm.asm(&format!("{FIRST_READ}: resq 1"));
+            asm.asm(&format!("{STDIN_KIND}: resq 1"));
+            asm.asm(&format!("{STDIN_HANDLE}: resq 1"));
+            asm.asm(&format!("{CONSOLE_SCRATCH}: resq 1"));
         }
         asm.blank();
     }
@@ -841,6 +882,21 @@ fn abort_stubs(asm: &mut Asm) {
     // nothing at all: this routine never returns.
     asm.asm("and  rsp, -16");
     asm.asm(&format!("sub  rsp, {SHADOW_SPACE}"));
+    asm.comment("empty what `print` has left buffered, so this lands after it");
+    // `_write` goes straight to the descriptor while `print` goes through the C
+    // runtime's buffer. Without this the report is written first and whatever
+    // the program had already printed follows it out at `exit`, which reads as
+    // if the failure happened earlier than it did.
+    //
+    // The message and its length arrived in `rdx` and `r8`, which a call
+    // destroys, so they wait in registers a call does not. This routine never
+    // returns, so those registers are nobody's to get back.
+    asm.asm(&format!("mov  rbx, {RDX}    ; the message"));
+    asm.asm("mov  rsi, r8    ; its length");
+    asm.asm(&format!("xor  {RCX}, {RCX}    ; fflush(NULL) empties every stream"));
+    asm.asm("call fflush");
+    asm.asm(&format!("mov  {RDX}, rbx"));
+    asm.asm("mov  r8, rsi");
     asm.comment("_write(2, message, length), then exit(1)");
     asm.asm(&format!("mov  {RCX}, {STDERR}"));
     asm.asm("call _write");
@@ -1425,6 +1481,22 @@ fn text_stubs(asm: &mut Asm, used: &Used) {
 /// `FILE*`. That is what makes `eof` answerable at all without pushing a
 /// character back: "has the input run out" becomes a question about this
 /// buffer, and the answer costs nothing when the buffer is not empty.
+///
+/// ## Why a console is not read like a file
+///
+/// A redirected stdin is bytes, and the program asked for UTF-8, so `_read`
+/// hands over exactly what is there. A **console is not bytes**: what a person
+/// types is characters, and the byte encoding is invented on the way out. Which
+/// encoding that is, is a property of the console, and every answer it can give
+/// is wrong here — the OEM code page turns `é` into one byte no character
+/// starts with, and asking for UTF-8 with `SetConsoleCP` turns it into a *NUL*,
+/// because the conversion is done one byte per character into a buffer that has
+/// no room for a second.
+///
+/// So the console is read as what it is. `ReadConsoleW` gives UTF-16, which is
+/// the only encoding it will part with losing nothing, and `WideCharToMultiByte`
+/// turns that into the UTF-8 the rest of this file already knows how to decode.
+/// The decoder below never learns which of the two happened.
 fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.blank();
     asm.comment("is a byte waiting? refills the buffer when it has run dry");
@@ -1433,18 +1505,14 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.asm(&format!("mov  {RAX}, [{INPUT_POS}]"));
     asm.asm(&format!("cmp  {RAX}, [{INPUT_LEN}]"));
     asm.asm("jb   .waiting");
+    asm.comment("the input has been declared over once; it stays over");
+    asm.asm(&format!("cmp  qword [{INPUT_DONE}], 0"));
+    asm.asm("jne  .spent");
     asm.asm("sub  rsp, 40    ; shadow space + alignment");
-    asm.asm("mov  ecx, 0    ; the input");
-    asm.asm(&format!("lea  {RDX}, [{INPUT}]"));
-    asm.asm(&format!("mov  r8d, {INPUT_BYTES}"));
-    asm.asm("call _read");
+    asm.asm(&format!("call {REFILL}"));
     asm.asm("add  rsp, 40");
-    asm.comment("nothing left is an answer; a refusal is not");
-    asm.asm("test eax, eax");
-    asm.asm(&format!("js   {ABORT_INPUT_FAILED}"));
+    asm.asm(&format!("test {RAX}, {RAX}"));
     asm.asm("jz   .spent");
-    asm.comment("a 32-bit result leaves the top half undefined, so widen it");
-    asm.asm(&format!("movsxd {RAX}, eax"));
     asm.asm(&format!("mov  [{INPUT_LEN}], {RAX}"));
     asm.asm(&format!("mov  qword [{INPUT_POS}], 0"));
     asm.line(".waiting:");
@@ -1453,6 +1521,142 @@ fn input_stubs(asm: &mut Asm, used: &Used) {
     asm.line(".spent:");
     asm.asm("xor  eax, eax");
     asm.asm("ret");
+
+    asm.blank();
+    asm.comment("fill the input buffer, from a console or from a redirected stdin");
+    asm.line(&format!("{REFILL}:"));
+    asm.comment("-> rax = how many bytes are now in the buffer, 0 at the end of the input");
+    // Eight arguments is the widest call made here, so the frame carries the
+    // shadow space plus the four that travel on the stack.
+    let frame = StubFrame::enter(asm, &["rbx", "rsi", "rdi"], 64, "shadow space + stack arguments");
+
+    asm.comment("about to wait: anything printed so far has to be visible first,");
+    asm.comment("or a prompt sits in the C runtime's buffer while the program blocks");
+    asm.asm(&format!("xor  {RCX}, {RCX}    ; fflush(NULL) empties every stream"));
+    asm.asm("call fflush");
+
+    asm.comment("what stdin is cannot change, so it is worked out once");
+    asm.asm(&format!("mov  {RAX}, [{STDIN_KIND}]"));
+    asm.asm(&format!("test {RAX}, {RAX}"));
+    asm.asm("jnz  .known");
+    asm.asm(&format!("mov  ecx, {STD_INPUT_HANDLE}"));
+    asm.asm("call GetStdHandle");
+    asm.asm(&format!("mov  [{STDIN_HANDLE}], {RAX}"));
+    asm.comment("only a console answers this one, which is the question being asked");
+    asm.asm(&format!("mov  {RCX}, {RAX}"));
+    asm.asm(&format!("lea  {RDX}, [{CONSOLE_SCRATCH}]"));
+    asm.asm("call GetConsoleMode");
+    asm.asm(&format!("mov  ecx, {STDIN_BYTES}"));
+    asm.asm("test eax, eax");
+    asm.asm("jz   .settled");
+    asm.asm(&format!("mov  ecx, {STDIN_CONSOLE}"));
+    asm.line(".settled:");
+    asm.asm(&format!("mov  [{STDIN_KIND}], {RCX}"));
+    asm.asm(&format!("mov  {RAX}, {RCX}"));
+
+    asm.line(".known:");
+    asm.asm(&format!("cmp  {RAX}, {STDIN_CONSOLE}"));
+    asm.asm("je   .console");
+
+    asm.comment("a redirected stdin is bytes already");
+    asm.asm("mov  ecx, 0    ; the input");
+    asm.asm(&format!("lea  {RDX}, [{INPUT}]"));
+    asm.asm(&format!("mov  r8d, {INPUT_BYTES}"));
+    asm.asm("call _read");
+    asm.comment("nothing left is an answer; a refusal is not");
+    asm.asm("test eax, eax");
+    asm.asm(&format!("js   {ABORT_INPUT_FAILED}"));
+    asm.comment("a 32-bit result leaves the top half undefined, so widen it");
+    asm.asm(&format!("movsxd {RAX}, eax"));
+    asm.asm("jmp  .strip_bom");
+
+    asm.line(".console:");
+    asm.asm(&format!("mov  {RCX}, [{STDIN_HANDLE}]"));
+    asm.asm(&format!("lea  {RDX}, [{INPUT_WIDE}]"));
+    asm.asm(&format!("mov  r8d, {INPUT_WCHARS}"));
+    asm.asm(&format!("lea  r9, [{CONSOLE_SCRATCH}]"));
+    asm.asm("mov  qword [rsp+32], 0    ; no input control");
+    asm.asm("call ReadConsoleW");
+    asm.asm("test eax, eax");
+    asm.asm(&format!("jz   {ABORT_INPUT_FAILED}"));
+    asm.asm(&format!("mov  esi, dword [{CONSOLE_SCRATCH}]    ; characters read"));
+    asm.asm("test esi, esi");
+    asm.asm("jz   .over");
+
+    asm.comment("Ctrl+Z arrives as a character, not as a short read: everything");
+    asm.comment("before it is input, and there is nothing after it");
+    asm.asm(&format!("lea  rbx, [{INPUT_WIDE}]"));
+    asm.asm(&format!("xor  rdi, rdi"));
+    asm.line(".scan:");
+    asm.asm(&format!("cmp  rdi, rsi"));
+    asm.asm("jae  .encode");
+    asm.asm(&format!("movzx eax, word [rbx+rdi*2]"));
+    asm.asm(&format!("cmp  eax, {CTRL_Z:#x}"));
+    asm.asm("je   .ended");
+    asm.asm(&format!("inc  rdi"));
+    asm.asm("jmp  .scan");
+    asm.line(".ended:");
+    asm.asm(&format!("mov  qword [{INPUT_DONE}], 1"));
+    asm.asm(&format!("mov  rsi, rdi"));
+    asm.asm("test rsi, rsi");
+    asm.asm("jz   .over");
+
+    asm.line(".encode:");
+    asm.comment("WideCharToMultiByte(65001, 0, wide, count, input, capacity, 0, 0)");
+    asm.asm(&format!("mov  ecx, {UTF8_CODE_PAGE}"));
+    asm.asm(&format!("xor  {RDX}, {RDX}"));
+    asm.asm(&format!("lea  r8, [{INPUT_WIDE}]"));
+    asm.asm("mov  r9d, esi");
+    asm.asm(&format!("lea  {RAX}, [{INPUT}]"));
+    asm.asm(&format!("mov  [rsp+32], {RAX}"));
+    asm.asm(&format!("mov  qword [rsp+40], {INPUT_BYTES}"));
+    asm.asm("mov  qword [rsp+48], 0");
+    asm.asm("mov  qword [rsp+56], 0");
+    asm.asm("call WideCharToMultiByte");
+    asm.asm("test eax, eax");
+    asm.asm(&format!("jz   {ABORT_INPUT_FAILED}"));
+    asm.asm(&format!("movsxd {RAX}, eax"));
+
+    asm.line(".strip_bom:");
+    asm.comment("a byte order mark is how some editors spell `this file is UTF-8`.");
+    asm.comment("It is not a character of the text, and only the very first bytes of");
+    asm.comment("the input can carry one — so the question is asked exactly once");
+    asm.asm(&format!("cmp  qword [{FIRST_READ}], 0"));
+    asm.asm("jne  .done");
+    asm.asm(&format!("mov  qword [{FIRST_READ}], 1"));
+    asm.asm(&format!("cmp  {RAX}, 3"));
+    asm.asm("jb   .done");
+    asm.asm(&format!("lea  rbx, [{INPUT}]"));
+    // Two comparisons rather than one on a doubleword: a doubleword reads a
+    // fourth byte that a three-byte read never wrote, and whatever was left
+    // there would decide the answer.
+    asm.asm("cmp  word [rbx], 0xBBEF");
+    asm.asm("jne  .done");
+    asm.asm("cmp  byte [rbx+2], 0xBF");
+    asm.asm("jne  .done");
+    asm.asm(&format!("sub  {RAX}, 3"));
+    asm.comment("a mark can arrive on its own — some writers send it in a write of its");
+    asm.comment("own — and a read that held nothing else is not the end of anything");
+    asm.asm("jz   .again");
+    asm.comment("shuffle what is left down over the mark");
+    asm.asm("xor  rdi, rdi");
+    asm.line(".shift:");
+    asm.asm(&format!("cmp  rdi, {RAX}"));
+    asm.asm("jae  .done");
+    asm.asm("movzx edx, byte [rbx+rdi+3]");
+    asm.asm("mov  [rbx+rdi], dl");
+    asm.asm("inc  rdi");
+    asm.asm("jmp  .shift");
+
+    asm.line(".again:");
+    asm.comment("the kind of stdin is already settled; only the bytes are wanted");
+    asm.asm(&format!("mov  {RAX}, [{STDIN_KIND}]"));
+    asm.asm("jmp  .known");
+
+    asm.line(".over:");
+    asm.asm(&format!("xor  {RAX}, {RAX}"));
+    asm.line(".done:");
+    frame.ret(asm);
 
     asm.blank();
     asm.comment("take one byte");
@@ -1662,9 +1866,10 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         //
         // The entry point of a program that writes text is never a leaf: it
         // calls the console's code page into shape first, even when every
-        // print happens somewhere else.
+        // print happens somewhere else. Reading does not add a call here —
+        // whatever a console needs is settled inside `tc$rt$refill`.
         let entry = function.name == ENTRY_POINT;
-        let leaf = !(entry && (used.writes_text() || used.reads_text()))
+        let leaf = !(entry && used.writes_text())
             && !function
                 .blocks
                 .iter()
@@ -1692,11 +1897,9 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 self.asm.asm(&format!("mov  ecx, {UTF8_CODE_PAGE}"));
                 self.asm.asm("call SetConsoleOutputCP");
             }
-            if self.used.reads_text() {
-                self.asm.comment("and to hand over what is typed into it as UTF-8");
-                self.asm.asm(&format!("mov  ecx, {UTF8_CODE_PAGE}"));
-                self.asm.asm(&format!("call {CONSOLE_INPUT_CP}"));
-            }
+            // Nothing is said to the console about *input*: what it hands over
+            // is asked for as UTF-16 at the point of reading instead, which is
+            // the only way to get every character back. See `input_stubs`.
         }
 
         for (index, block) in self.function.blocks.iter().enumerate() {
@@ -2901,6 +3104,44 @@ mod tests {
         assert!(!asm.contains("extern _read"), "{asm}");
         assert!(!asm.contains(INPUT), "{asm}");
         assert!(!asm.contains("SetConsoleCP"), "{asm}");
+    }
+
+    #[test]
+    fn a_console_is_read_as_utf16_and_never_asked_to_change_code_page() {
+        // `SetConsoleCP(65001)` looks like the counterpart of the output one and
+        // is not: a console converts one byte per character on the way out, so
+        // asking it for UTF-8 turns every character that needs two bytes into a
+        // NUL. Reading UTF-16 and encoding here is the only lossless way.
+        let asm = compile("print(read_line());");
+        assert!(!asm.contains("SetConsoleCP"), "{asm}");
+        assert!(asm.contains("call ReadConsoleW"), "{asm}");
+        assert!(asm.contains("call WideCharToMultiByte"), "{asm}");
+        // and a redirected stdin is still read as the bytes it already is
+        assert!(asm.contains("call _read"), "{asm}");
+    }
+
+    #[test]
+    fn what_has_been_printed_is_flushed_before_the_program_waits_for_input() {
+        // `print` goes through the C runtime's buffer, which is not emptied
+        // when stdout is a pipe — an IDE's run window, say. Without this a
+        // prompt sits in that buffer while the program blocks, and a person
+        // types into what looks like a program that has stopped answering.
+        let asm = compile("print(\"name? \");\nprint(read_line());");
+        let refill = asm.split(&format!("{REFILL}:")).nth(1).expect("the routine is emitted");
+        let waiting = refill.split("call _read").next().expect("the read follows");
+        assert!(waiting.contains("call fflush"), "{refill}");
+    }
+
+    #[test]
+    fn a_failure_reports_itself_after_whatever_was_already_printed() {
+        // The report goes straight to the descriptor while `print` goes through
+        // a buffer, so without a flush the two come out in the wrong order.
+        // A zero the compiler can see is rejected outright, so it comes from
+        // somewhere the compiler cannot look.
+        let asm = compile_src("fn z() -> int {\n  return 0;\n}\nfn main() {\nprint(1 / z());\n}\n");
+        let report = asm.split(&format!("{ABORT_REPORT}:")).nth(1).expect("the routine is emitted");
+        let before = report.split("call _write").next().expect("the write follows");
+        assert!(before.contains("call fflush"), "{report}");
     }
 
     #[test]
