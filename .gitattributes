@@ -6,3 +6,13 @@
 
 # Same reasoning, for the file a Linux runner reads before anything else.
 *.yml text eol=lf
+
+# And for the Gradle wrapper, which is a shell script without the extension
+# that would have said so.
+gradlew text eol=lf
+*.jar binary
+
+# The compiler writes this file and a test compares what is here against what it
+# would write. Letting a checkout rewrite the line endings would make that test
+# fail on one platform and pass on the other.
+grammar/vocabulary.txt text eol=lf

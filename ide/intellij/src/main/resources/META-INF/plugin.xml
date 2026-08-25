@@ -1,0 +1,67 @@
+<idea-plugin>
+    <depends>com.intellij.modules.platform</depends>
+
+    <description><![CDATA[
+      Editing support for <b>TinyC</b>, the small typed language whose compiler
+      lives in the repository above this plugin.
+
+      <ul>
+        <li>Syntax highlighting, brace matching, commenting and a structure view.</li>
+        <li>Completion drawn from the file itself: functions, classes and their
+            fields and methods, enum variants after <code>::</code>, the fields an
+            object literal still needs, locals and parameters in scope.</li>
+        <li><b>The compiler's own diagnostics in the editor.</b> Nothing here
+            decides whether a program is correct — <code>tinyc</code> is run on
+            what is being typed, and what it refuses is marked where it says.</li>
+        <li>A run configuration that takes a <code>.tc</code> file all the way to
+            a running executable, through the repository's own build script.</li>
+      </ul>
+    ]]></description>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <!-- The language itself. -->
+        <fileType
+                name="TinyC"
+                implementationClass="dev.millet.tinyc.lang.TinyCFileType"
+                fieldName="INSTANCE"
+                language="TinyC"
+                extensions="tc"/>
+        <lang.parserDefinition
+                language="TinyC"
+                implementationClass="dev.millet.tinyc.lang.TinyCParserDefinition"/>
+        <lang.syntaxHighlighterFactory
+                language="TinyC"
+                implementationClass="dev.millet.tinyc.lang.TinyCSyntaxHighlighterFactory"/>
+        <colorSettingsPage implementation="dev.millet.tinyc.lang.TinyCColorSettingsPage"/>
+        <lang.commenter language="TinyC" implementationClass="dev.millet.tinyc.lang.TinyCCommenter"/>
+        <lang.braceMatcher language="TinyC" implementationClass="dev.millet.tinyc.lang.TinyCBraceMatcher"/>
+        <lang.psiStructureViewFactory
+                language="TinyC"
+                implementationClass="dev.millet.tinyc.lang.TinyCStructureViewFactory"/>
+
+        <!-- What the tree is for. -->
+        <completion.contributor
+                language="TinyC"
+                implementationClass="dev.millet.tinyc.completion.TinyCCompletionContributor"/>
+        <annotator language="TinyC" implementationClass="dev.millet.tinyc.annotator.TinyCHighlightAnnotator"/>
+
+        <!-- What the compiler is for. -->
+        <externalAnnotator
+                language="TinyC"
+                implementationClass="dev.millet.tinyc.annotator.TinyCExternalAnnotator"/>
+
+        <!-- Building and running. -->
+        <configurationType implementation="dev.millet.tinyc.run.TinyCRunConfigurationType"/>
+        <runConfigurationProducer implementation="dev.millet.tinyc.run.TinyCRunConfigurationProducer"/>
+        <runLineMarkerContributor
+                language="TinyC"
+                implementationClass="dev.millet.tinyc.run.TinyCRunLineMarkerContributor"/>
+        <consoleFilterProvider implementation="dev.millet.tinyc.run.TinyCConsoleFilterProvider"/>
+
+        <projectConfigurable
+                id="dev.millet.tinyc.settings"
+                parentId="tools"
+                displayName="TinyC"
+                instance="dev.millet.tinyc.settings.TinyCConfigurable"/>
+    </extensions>
+</idea-plugin>

@@ -456,6 +456,25 @@ freezing
 piped in: 19
 ```
 
+## Editing TinyC
+
+[`ide/intellij/`](ide/intellij) is a plugin for RustRover and every other
+IntelliJ-based IDE: highlighting, completion drawn from the file itself, a run
+configuration that drives `tinyc`, `nasm` and the linker itself — each found, or
+named in the settings — and **the compiler's own diagnostics in the editor**,
+because `tinyc` is run on what is being typed and nothing in the plugin has a
+second opinion about whether a program is correct. It needs no project: a `.tc`
+file anywhere builds, as long as the plugin knows where the three tools are.
+
+```bash
+cd ide/intellij && ./gradlew buildPlugin
+```
+
+then *Settings | Plugins | ⚙ | Install Plugin from Disk…*. See
+[its README](ide/intellij/README.md) for what it does, and for the two things it
+has to repeat — the word list and the link line, each kept equal to its original
+(`src/lexer.rs`, `scripts/build.*`) by a test that reads it.
+
 ## Documentation
 
 [**docs/architecture.md**](docs/architecture.md) is the long form: the whole

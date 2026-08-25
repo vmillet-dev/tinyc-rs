@@ -25,6 +25,7 @@ pub mod opt;
 pub mod parser;
 pub mod sema;
 pub mod token;
+pub mod vocabulary;
 
 use codegen::{Allocation, RegisterFile, Target};
 

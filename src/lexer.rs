@@ -206,30 +206,11 @@ impl<'a> Lexer<'a> {
         while self.peek().is_some_and(is_ident_continue) {
             self.bump();
         }
-        match &self.src[start..self.offset()] {
-            "int" => TokenKind::KwInt,
-            "string" => TokenKind::KwString,
-            "char" => TokenKind::KwChar,
-            "bool" => TokenKind::KwBool,
-            "print" => TokenKind::KwPrint,
-            "println" => TokenKind::KwPrintln,
-            "if" => TokenKind::KwIf,
-            "else" => TokenKind::KwElse,
-            "while" => TokenKind::KwWhile,
-            "for" => TokenKind::KwFor,
-            "true" => TokenKind::Bool(true),
-            "false" => TokenKind::Bool(false),
-            "fn" => TokenKind::KwFn,
-            "return" => TokenKind::KwReturn,
-            "break" => TokenKind::KwBreak,
-            "continue" => TokenKind::KwContinue,
-            "enum" => TokenKind::KwEnum,
-            "match" => TokenKind::KwMatch,
-            "len" => TokenKind::KwLen,
-            "push" => TokenKind::KwPush,
-            "class" => TokenKind::KwClass,
-            name => TokenKind::Ident(name.to_string()),
-        }
+        // The words are not written out here: `vocabulary::SPELLED` is the one
+        // place they are, so that the editor plugin can be generated from the
+        // same list the lexer reads rather than repeating it.
+        let word = &self.src[start..self.offset()];
+        crate::vocabulary::keyword(word).unwrap_or_else(|| TokenKind::Ident(word.to_string()))
     }
 
     fn number(&mut self) -> std::result::Result<TokenKind, Diagnostic> {

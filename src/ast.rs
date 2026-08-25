@@ -573,17 +573,25 @@ impl Builtin {
     }
 
     /// What it takes.
-    pub fn params(self) -> &'static [Ty] {
+    ///
+    /// In [`Prim`]s rather than [`Ty`]s, and that is a promise rather than a
+    /// convenience. A built-in is a name in the signature table *before any
+    /// program exists*, so it cannot mention a class or an enum; and an array
+    /// or a list is an interned id that means nothing without a [`TypeTable`].
+    /// Saying so in the type makes a signature nobody could write down
+    /// impossible to write down here — which is what lets [`crate::vocabulary`]
+    /// export these with no table to hand and no way to fail.
+    pub fn params(self) -> &'static [Prim] {
         match self {
             Builtin::ReadLine | Builtin::Eof => &[],
-            Builtin::IsInt => &[Ty::Str],
+            Builtin::IsInt => &[Prim::Str],
         }
     }
 
-    pub fn ret(self) -> Option<Ty> {
+    pub fn ret(self) -> Option<Prim> {
         match self {
-            Builtin::ReadLine => Some(Ty::Str),
-            Builtin::Eof | Builtin::IsInt => Some(Ty::Bool),
+            Builtin::ReadLine => Some(Prim::Str),
+            Builtin::Eof | Builtin::IsInt => Some(Prim::Bool),
         }
     }
 
@@ -1974,10 +1982,12 @@ mod tests {
             // would have nothing to distinguish it from a statement.
             assert!(builtin.ret().is_some());
         }
-        assert_eq!(Builtin::ReadLine.ret(), Some(Ty::Str));
-        assert_eq!(Builtin::Eof.ret(), Some(Ty::Bool));
-        assert_eq!(Builtin::IsInt.params(), &[Ty::Str]);
-        assert_eq!(Builtin::IsInt.ret(), Some(Ty::Bool));
+        assert_eq!(Builtin::ReadLine.ret(), Some(Prim::Str));
+        assert_eq!(Builtin::Eof.ret(), Some(Prim::Bool));
+        assert_eq!(Builtin::IsInt.params(), &[Prim::Str]);
+        assert_eq!(Builtin::IsInt.ret(), Some(Prim::Bool));
+        // The signature reaches `sema` as types, and this is that widening.
+        assert_eq!(Builtin::IsInt.ret().map(Prim::ty), Some(Ty::Bool));
         assert_eq!(Builtin::from_name("print"), None);
         assert_eq!(Builtin::from_name(""), None);
     }

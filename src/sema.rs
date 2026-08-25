@@ -1044,8 +1044,11 @@ fn collect_signatures(
         .into_iter()
         .map(|builtin| {
             let signature = Signature {
-                params: builtin.params().to_vec(),
-                ret: builtin.ret(),
+                // A built-in states its signature in primitives, since it is a
+                // name in this table before any program exists; the widening to
+                // `Ty` happens here, where the program's types begin.
+                params: builtin.params().iter().map(|prim| prim.ty()).collect(),
+                ret: builtin.ret().map(Prim::ty),
                 name_span: None,
             };
             (builtin.name().to_string(), signature)
