@@ -23,13 +23,29 @@ rather than answering wrongly.
 * Fixed arrays whose length is part of the type (`int[3]`), and growable lists
   whose length is a fact about the data (`int[]`).
 * Classes with fields, methods, single inheritance and virtual dispatch — plus
-  composition: an object holds whole arrays and whole objects *inside* itself.
-* Enums, and a `match` that must cover every variant, usable as an expression or
-  as a statement.
+  composition: an object holds whole arrays and whole objects *inside* itself,
+  and a **list** beside itself. That last one is what lets a class reach itself:
+  `Node next` would make the object bigger than itself, `Node[] kids` does not —
+  so TinyC has **trees**, with value semantics and still no reference type, no
+  `null` and no lifetimes ([`examples/tree.tc`](examples/tree.tc)).
+* Enums whose variants may **carry values** — `Parsed::Ok(int)`,
+  `Parsed::Bad(string)` — taken apart by the pattern that matched them. That is
+  how TinyC says "an answer, or the reason there is none" in a language with no
+  `null` ([`examples/payloads.tc`](examples/payloads.tc)).
+* A `match` usable as an expression or as a statement — on an enum, where every
+  variant must be covered and there is no catch-all, or on an `int`, `char`,
+  `string` or `bool`, where `_` is not a way of hiding a case but the only way
+  to be complete, and is required.
 * `if` / `else if` / `else`, `while`, `for`, `break`, `continue`, and
   short-circuiting `&&`, `||` and `!`.
-* Value semantics throughout: no references, no globals, no null. Assignment
-  copies; nothing aliases anything else.
+* No references, no globals, no null. **Assignment copies** — giving a name to
+  an array, an object or a list duplicates it, so writing through one name is
+  never visible through the other. **A parameter borrows**: an argument too big
+  for a register travels as an address, so a function that writes an element or
+  a field of one is writing the caller's own. Growing is the exception, because
+  it may *move* what it grows: `push` onto a parameter is refused, with the
+  copy to make instead. See [Assignment copies, a parameter
+  borrows](docs/architecture.md#assignment-copies-a-parameter-borrows).
 * No implicit conversions at all — `string(n)`, `int(c)` and `char(n)` are
   written out, so a message with a number in it says where the number became
   text.
@@ -66,6 +82,12 @@ rather than answering wrongly.
   A pass may change how long a program takes, never where it stops: an
   operation whose answer does not fit is not folded, and one that can fail is
   never dead.
+* **`s = s + x` in a loop is linear, not quadratic.** A string's length lives
+  with its characters, so growing one where it stands is only safe when nothing
+  else is holding it — and the compiler works out, per variable, where that is
+  true. The program that used to peak at **851 MB** to build an 80 KB string now
+  finishes in the low hundreds of kilobytes. Nothing about the language changed;
+  a variable the analysis cannot vouch for gets exactly the code it got before.
 * Linear-scan register allocation over live ranges computed by a backward
   dataflow pass on the control flow graph, run once per function.
 * Target-independent up to and including register allocation: a backend
@@ -225,7 +247,9 @@ The whole story, including why guessing was not good enough, is in
 | [`format.tc`](examples/format.tc) | `print` and `println`, and every specifier a format takes |
 | [`control_flow.tc`](examples/control_flow.tc), [`functions.tc`](examples/functions.tc) | branches, loops, calls, recursion |
 | [`classes.tc`](examples/classes.tc), [`composition.tc`](examples/composition.tc), [`enums.tc`](examples/enums.tc) | objects, dispatch, matching |
+| [`payloads.tc`](examples/payloads.tc) | variants that carry values, and the patterns that take them apart |
 | [`arrays.tc`](examples/arrays.tc), [`lists.tc`](examples/lists.tc), [`strings.tc`](examples/strings.tc) | values that do not fit in a register |
+| [`tree.tc`](examples/tree.tc) | a class that reaches itself, through a list field |
 | [`interactive.tc`](examples/interactive.tc) | reading input |
 | [`spill.tc`](examples/spill.tc) | more live values than registers |
 | [`errors/`](examples/errors) | one program per kind of diagnostic |

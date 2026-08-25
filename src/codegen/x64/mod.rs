@@ -257,6 +257,15 @@ pub trait Platform: Send + Sync {
     /// platform needs. Declared in the header, in the order given.
     fn externs(&self, used: &Used) -> Vec<&'static str>;
 
+    /// Leave the `FILE*` standard output goes to in `rax`.
+    ///
+    /// Writing by length means `fwrite`, and `fwrite` wants a stream. Every C
+    /// library has one called `stdout` and the two spell it differently enough
+    /// that it cannot be a name in a table: on one it is a variable to load,
+    /// on the other a function to call. Emitted inside a routine that already
+    /// owns a frame, so a `call` is fine here.
+    fn stdout_stream(&self, asm: &mut Asm);
+
     /// Whatever the entry point must do before the program's first statement.
     ///
     /// A Windows console has a code page and it is not UTF-8 unless it is told
@@ -385,6 +394,12 @@ impl Backend for X64 {
         if used.allocates() {
             runtime::arena(&mut asm, abi);
         }
+        if used.writes_text() {
+            runtime::output_stubs(&mut asm, self.platform, &used);
+        }
+        if used.fixup {
+            runtime::fixup_stubs(&mut asm, abi, &program.table, &used);
+        }
         runtime::string_stubs(&mut asm, abi, &used);
         runtime::list_stubs(&mut asm, abi, &used);
         if used.encodes_text() {
@@ -463,16 +478,33 @@ fn setcc(op: CmpOp) -> &'static str {
 
 /// Which format string a type is printed with.
 ///
-/// An enum shares the string one: printing a value of one means printing the
-/// name of its variant, which is a C string in `.data`. A `string` and a `char`
-/// share it too, one step further removed — they are encoded into a buffer
-/// first, and it is that buffer `printf` is given.
+/// An enum goes out through `%s`: printing a value of one means printing the
+/// name of its variant, which is a run of bytes the *compiler* wrote and can
+/// therefore promise holds no NUL.
+///
+/// A `string` and a `char` are the ones that cannot promise that, and so the
+/// ones that no longer go through `printf` at all — they are written by
+/// length, through [`runtime::WRITE_TEXT`]. They keep a slot here so that
+/// [`Used::ends_a_line`] can still be asked about them; nothing reads a format
+/// out of it.
 fn format_index(ty: Ty) -> usize {
     match ty {
         Ty::Int => 0,
+        Ty::Enum(_) => 1,
         Ty::Bool => 2,
         // Listed rather than left to a wildcard, so that a new type has to be
         // thought about here instead of quietly getting `%s` applied to it.
-        Ty::Str | Ty::Char | Ty::Enum(_) | Ty::Array(_) | Ty::List(_) | Ty::Class(_) => 1,
+        Ty::Str | Ty::Char | Ty::Array(_) | Ty::List(_) | Ty::Class(_) => 3,
     }
+}
+
+/// The slot an enum's format lives in, for the questions asked about it by
+/// name rather than about a value in hand.
+fn enum_slot() -> usize {
+    format_index(Ty::Enum(crate::ast::EnumId(0)))
+}
+
+/// The slot a string and a character share — the two written by length.
+fn text_slot() -> usize {
+    format_index(Ty::Str)
 }

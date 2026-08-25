@@ -10,6 +10,27 @@ enum Colour { Red, Green, Blue }
 // qualified, so `Colour::Red` and `Signal::Red` never have to be told apart.
 enum Signal { Red, Amber, Green }
 
+// The same form, on a value with no variants to count: `_` is what says what
+// is left over, and it is required rather than optional. An enum is the one
+// type that refuses it — writing every variant out is the whole point there.
+fn ordinal(int n) -> string {
+  return match (n) {
+    0 => "zeroth",
+    1 => "first",
+    2 => "second",
+    _ => "nth",
+  };
+}
+
+// Strings are compared by their characters, exactly as `==` compares them.
+fn method(string verb) -> int {
+  return match (verb) {
+    "get" => 1,
+    "put" => 2,
+    _ => 0,
+  };
+}
+
 // A match is an expression, so mapping a variant to a value takes no `return`
 // per arm and the whole thing is typed at once.
 fn temperature(Colour c) -> string {
@@ -84,4 +105,20 @@ fn main() {
       Signal::Green => { println(i); }   // 0, 2
     }
   }
+
+  // A match is not only for enums. An `int`, a `char`, a `string` and a `bool`
+  // may all be matched on; the first three need a `_`, because they have no
+  // list of values a program could write out.
+  for (int n = 0; n < 4; n = n + 1) {
+    println(ordinal(n));       // zeroth, first, second, nth
+  }
+  println(method("get"));      // 1
+  println(method("hm"));       // 0
+
+  // A `bool` is the one non-enum whose values *can* be written out, so this
+  // one needs no catch-all.
+  println(match (1 < 2) {
+    true => "yes",
+    false => "no",
+  });
 }

@@ -1,0 +1,5 @@
+project weighs 19
+and is 4 deep
+docs is now 106, the tree is still 19
+src has 2, its copy 3
+src weighs 14, its copy 64

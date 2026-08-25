@@ -312,7 +312,7 @@ pub fn examples() -> PathBuf {
 /// live beside this one: it is a scratch file for trying things out by hand.
 /// Here it is included, because what it prints is checked against a file that
 /// is edited with it.
-pub const EXAMPLES: [&str; 15] = [
+pub const EXAMPLES: [&str; 17] = [
     "hello.tc",
     "format.tc",
     "arith.tc",
@@ -322,11 +322,13 @@ pub const EXAMPLES: [&str; 15] = [
     "control_flow.tc",
     "functions.tc",
     "enums.tc",
+    "payloads.tc",
     "arrays.tc",
     "classes.tc",
     "composition.tc",
     "strings.tc",
     "lists.tc",
+    "tree.tc",
     "interactive.tc",
 ];
 

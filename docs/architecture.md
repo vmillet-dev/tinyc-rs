@@ -115,7 +115,8 @@ from the same library — see
 
 ```
 program := (enum_decl | class_decl | fn_decl)*
-enum    := "enum" IDENT "{" IDENT ("," IDENT)* "}"
+enum    := "enum" IDENT "{" variant ("," variant)* ","? "}"
+variant := IDENT ("(" type ("," type)* ")")?
 class   := "class" IDENT (":" IDENT)? "{" (field | fn_decl)* "}"
 field   := type IDENT ";"
 fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
@@ -148,14 +149,16 @@ primary := atom postfix*
 atom    := INT | STRING | CHAR | BOOL | IDENT | variant | call | match | array
          | object | len | convert | "(" expr ")"
 postfix := "[" expr "]" | "." IDENT | "." IDENT "(" args? ")"
-variant := IDENT "::" IDENT
+variant := IDENT "::" IDENT ("(" (expr ("," expr)*)? ")")?
 array   := "[" (expr ("," expr)*)? "]"
 object  := IDENT "{" (IDENT ":" expr ("," IDENT ":" expr)*)? "}"
 len     := "len" "(" expr ")"
 convert := ("int" | "char" | "string" | "bool") "(" expr ")"
 call    := IDENT "(" (expr ("," expr)*)? ")"
 match   := "match" "(" expr ")" "{" arm* "}"
-arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
+arm     := pattern "=>" (expr ","? | block ","?)
+pattern := IDENT "::" IDENT ("(" IDENT ("," IDENT)* ")")?
+         | "-"? INT | STRING | CHAR | BOOL | "_"
 ```
 
 `int` is a 64-bit signed integer, `string` is a run of characters, `char` is one
@@ -176,6 +179,49 @@ rather than a comparison against zero. `%` takes its sign from the dividend, as
 in C: `-7 % 2` is `-1`. Arithmetic that has no answer stops the program rather
 than wrapping — see
 [Arithmetic never answers wrongly](#arithmetic-never-answers-wrongly).
+
+### Assignment copies, a parameter borrows
+
+There is no reference type, no `null` and no lifetimes, and two rules take
+their place. They are **not** the same rule, and the difference is the one
+thing about TinyC a reader has to carry around:
+
+* **Assignment copies.** Giving a name to an array, an object or a list
+  duplicates the value — the bytes for the first two, the elements for a list.
+  Writing through one name is never visible through the other.
+* **A parameter borrows.** An argument too big for a register travels as an
+  *address*, so a function that writes an element or a field of one is writing
+  the caller's own.
+
+```c
+fn fill(int[] xs) { xs[0] = 99; }      // the caller's list
+
+fn main() {
+  int[] a = [1, 2, 3];
+  int[] b = a;                          // a copy
+  fill(a);
+  println("%d %d", a[0], b[0]);         // 99 1
+}
+```
+
+That is deliberate, and it is what makes a method able to do anything at all:
+`self` is a parameter, so `self.x = 1` changes the object the caller named.
+Copying every argument instead would mean an object could only ever be read.
+
+What it costs is that `p.x = 1` means two different things — "change my copy"
+and "change the caller's" — and nothing at the *call site* says which. The
+place to look is the signature: if `p` is a parameter, the write is the
+caller's.
+
+**Growing is the exception**, because it may move what it grows. A list's
+length lives with its elements, so a `push` that happened to fit would be
+visible to the caller and one that had to move would silently not be. Rather
+than have it be either, `push` onto a parameter is refused outright — see
+[Lists](#lists).
+
+Everything that *fits* in a register is copied on the way in like any other
+value, and a string is read-only, so neither can be written through at all.
+Arrays, objects and lists are the whole of the rule's subject.
 
 ### Functions
 
@@ -325,7 +371,10 @@ println(held.area());    // 75, not 30000 — a copy, not an alias
 
 The copy carries the vtable pointer, so the value keeps answering as a `Circle`.
 **There is no slicing**, unlike C++'s value semantics — and no reference type,
-no `null` and no lifetimes either, because nothing is shared in the first place.
+no `null` and no lifetimes either, because an address never outlives the frame
+that owns what it points at. It does still *travel*, to a callee and no further:
+see [Assignment copies, a parameter
+borrows](#assignment-copies-a-parameter-borrows).
 
 Giving every class in a hierarchy the *same* number matters as much as the
 number itself: a smaller one for `Circle` would mean copying `storage(Shape)`
@@ -437,10 +486,9 @@ error: `Grid` is too big
   which is what removes the question `null` would have answered.
 * **No printing and no comparing.** `print` writes one value, and comparing
   addresses would quietly answer a different question.
-* **A field may not be a list.** Everything else nests — see
-  [Composition](#composition) — because it lives inside the object and is
-  copied along with it. A list's elements live in the arena, so a field would
-  hold only their address and a copy would share them rather than copy them.
+* **A field may not be the class it is in, by value.** `Node next` would make
+  the object bigger than itself. `Node[] kids` is fine and is how a recursive
+  type is written — see [A field that is a list](#a-field-that-is-a-list).
 * **A class may not take an enum's name, or another class's.** A type name is
   resolved to one type and there is nowhere for a second to go, so the loser
   would be a declaration no program could ever name. The compiler says so
@@ -600,28 +648,83 @@ collector. What it costs is memory a long-running program stops using and never
 reclaims; TinyC programs run and finish, so the trade is a good one, and it is
 the whole reason a string can be a value here at all.
 
-**The sharp edge that buys: building a string in a loop.**
+The one thing a bump pointer *can* give back is the block it handed out last,
+and two places take it up on that: `list_room`, where a list grows into the
+room after itself rather than moving, and `append` — see [Building a string in
+a loop](#building-a-string-in-a-loop). Neither is a `free`; both are the same
+pointer walking back over ground nothing else can be standing on.
+
+### Building a string in a loop
 
 ```c
 string s = "";
-for (int i = 0; i < 4000; i = i + 1) {
-  s = s + "0123456789";   // 313 MB peak, for a 160 KB answer
+for (int i = 0; i < 20000; i = i + 1) {
+  s = s + "x";
 }
 ```
 
-Each turn allocates the whole of the new string and abandons the whole of the
-old one, so both the copying and the *memory* grow with the square of the loop
-count. Java, C# and Python have the same quadratic copying on `s += x`; what is
-different here is that their collectors reclaim the intermediates and this arena
-does not, so the trap that costs time elsewhere costs memory here.
+This used to be the sharp edge the arena bought its simplicity with. Each turn
+allocated the whole of the new string and abandoned the whole of the old one,
+so the copying *and* the memory grew with the square of the loop count: **851 MB
+of peak working set for an 80 KB answer**. Java, C# and Python have the same
+quadratic copying on `s += x`; what was different here is that their collectors
+reclaim the intermediates and this arena does not, so the trap that costs time
+elsewhere cost memory.
 
-It cannot be fixed inside `+`, and the reason is worth knowing: the length lives
-*with* the characters. `t = s` copies one pointer, so `t` and `s` share the
-count at `[p-8]`, and appending in place would bump a count `t` can see —
-breaking exactly the immutability that makes sharing safe in the first place.
-Fixing it needs either a two-word string value, which would stop a string
-fitting in a register, or knowing that nothing else points at `s`, which needs
-ownership. Both undo more than they buy.
+The same program now peaks in the low hundreds of kilobytes, and 200,000
+characters plus a 289,000-character line built as `csv = csv + string(i) + ","`
+fit together in **10 MB**. Nothing about the language changed and no program is
+refused that was not refused before.
+
+**Why it could not be fixed inside `+`.** The length lives *with* the
+characters. `t = s` copies one pointer, so `t` and `s` share the count at
+`[p-8]`, and appending in place would bump a count `t` can see — breaking
+exactly the immutability that makes sharing safe. It needs either a two-word
+string value, which would stop a string fitting in a register, or knowing that
+nothing else points at `s`.
+
+**So the compiler works out where nothing else does.** `owned_strings` in
+`ir.rs` asks one narrow question per function, and asks it the cautious way
+round — a name is owned only if it can be *proved* to be, and anything the
+analysis does not recognise means no. A string local is owned when:
+
+* it is a local rather than a parameter, and is declared once in the function,
+  so the name cannot mean two variables in two blocks;
+* every value it is ever given is **freshly built** — a concat, a `string(...)`,
+  a `read_line()`. A literal counts too, and is why the runtime keeps a check of
+  its own: a literal lives in `.data`, which is not the arena, so the in-place
+  path simply never fires for one;
+* it is never **kept** anywhere else — not assigned to another variable, not
+  passed to a function, not returned, not put in a list, an array or a field.
+  Reading it is not keeping it: its length, one of its characters, printing it,
+  comparing it, joining it to something.
+
+For such a variable, `s = s + a + b` lowers to a run of `tc$rt$append`s rather
+than a chain of `concat`s. The chain matters as much as the single step: `+`
+leans left, so `s = s + string(i) + ","` is `s = ((s + string(i)) + ",")` and
+its outermost operand is not the variable at all. Taking it apart is only sound
+because no piece may mention `s` — `s = s + string(len(s))` would otherwise let
+the second piece read what the first one wrote, so it is left alone.
+
+**What the routine does.** It grows the block where it stands when the arena can
+still give that room back, which is the same test `list_room` already makes: the
+block ends exactly at the bump pointer, and lies in the chunk that pointer is
+walking rather than in an older one that ends there by coincidence. There is one
+more case, and it is what keeps `s = s + string(i)` linear — the piece being
+added was built by this very statement and sits immediately after, so consuming
+it costs nobody anything. Otherwise the routine falls back to `concat` and the
+answer is identical either way. **Only how much memory the loop leaves behind
+changes, never what it computes.**
+
+The last piece is the arena itself. A block bigger than a chunk used to be given
+a chunk sized exactly to fit, so a string that had outgrown one asked for an
+exact fit again on every single character. A chunk is now asked for half again
+as much as the block that forced it, and that spare room is what the next bump —
+in particular an in-place growth — goes into.
+
+Two accumulators in one loop still leapfrog: whichever grew last is the last
+block, so the other one has to move. That is a limit of a bump pointer and not
+of the analysis, and it is the shape this does not help.
 
 What fixes it is a [list](#lists) of characters: `push` doubles the capacity, so
 n characters cost O(n) work and O(n) garbage instead of O(n²) of each. Building
@@ -742,11 +845,73 @@ the hierarchy's size, exactly as an array's is, so a `Shape[]` may hold a
 `Circle` and the call through it still reaches `Circle`'s `area`.
 
 The one thing a list cannot hold is another list, and it cannot be *written*
-either — a type carries at most one pair of brackets. The mirror of that rule
-is that a field of a class cannot be a list: an object is copied outright, so
-the copy would share the elements rather than copy them. Everything that is not
-a list does nest in an object — see [Composition](#composition) — precisely
-because it lives *inside* the object rather than in the arena.
+either — a type carries at most one pair of brackets.
+
+### A field that is a list
+
+A class may hold one, and it is the only field that does not live inside the
+object: what the object holds is the address of the elements, eight bytes like
+any other field that fits in a register.
+
+```c
+class Bag { string name; int[] items; }
+```
+
+That address is why it costs something. Everything else a class holds is
+*inside* the bytes that a copy copies — see [Composition](#composition) — so
+copying the bytes was the whole of copying the object. A list's elements are
+not, so a byte copy alone would leave two objects naming one list and
+[assignment would stop copying](#assignment-copies-a-parameter-borrows). Every
+copy of such an object is therefore followed by a **fix-up**, which gives the
+copy a list of its own.
+
+What has to be fixed up cannot be read off the type of the *hole*:
+
+```c
+class Base { int tag; }
+class Sub : Base { int[] extra; }
+
+Base r = s;        // `s` is a Sub, and a Sub has a list a Base does not
+```
+
+so it is read off the **object**. Every class that holds a list gets a routine
+of its own, and the address of it goes in the word immediately in front of its
+vtable's method slots — reached as `[vptr-8]`, the same trick a string and a
+list use for their length, and for the same reason: it changed no slot number
+and cost no dispatch. `tc$rt$fixup` walks a run of objects, reads that word out
+of each, and calls it if it is not zero. A hierarchy where nothing holds a list
+has zero in every one of them and no routine at all is emitted.
+
+The clone goes as deep as the types do. A list *of* objects that themselves
+hold lists is cloned element by element, and `push` of such an object fixes up
+what it copied in — the flag that says so is a compile-time constant at every
+call site, so a program whose classes hold no list carries neither the argument
+nor the branch that reads it.
+
+**And this is what makes a class recursive.** `Node next` is still refused, and
+has to be — a field lives inside the object, so the object would have to be
+bigger than itself. `Node[] kids` is not, because the elements are not in the
+object at all:
+
+```c
+class Node {
+  int v;
+  Node[] kids;
+  fn total(self) -> int {
+    int sum = self.v;
+    for (int i = 0; i < len(self.kids); i = i + 1) {
+      sum = sum + self.kids[i].total();
+    }
+    return sum;
+  }
+}
+```
+
+A tree, with value semantics throughout and no reference type, no `null` and no
+lifetimes — see [`examples/tree.tc`](../examples/tree.tc). Pushing a node into
+another's `kids` puts a *copy* in, so the tree is a snapshot of what was put
+there and cannot be cyclic; that is also why the fix-up, which recurses through
+the structure, always terminates.
 
 ### What lists changed underneath
 
@@ -1119,19 +1284,133 @@ error: this match does not cover every variant of `Colour`
   |
 4 |   match (c) {
   |   ^^^^^ `Green` and `Blue` are not handled
-  = note: every variant needs an arm; TinyC has no catch-all pattern, so that
-          adding a variant cannot be quietly ignored
+  = note: every variant needs an arm; a match on an enum has no catch-all, so
+          that adding a variant cannot be quietly ignored
 ```
 
-**There is deliberately no `_` pattern.** A catch-all is exactly what would
+**An enum deliberately has no `_` pattern.** A catch-all is exactly what would
 absorb a new variant in silence, and turning "I added a case and forgot
 somewhere" from a bug into a compile error is the entire point of the check.
 
+#### A variant that carries something
+
+A variant may be given types, written after its name and matched by position:
+
+```c
+enum Parsed {
+  Ok(int),
+  Bad(string),
+}
+
+fn describe(Parsed p) -> string {
+  return match (p) {
+    Parsed::Ok(n) => "got " + string(n),
+    Parsed::Bad(why) => "no: " + why,
+  };
+}
+```
+
+That is the shape TinyC had no way to write before. There is no `null` and no
+way to return "nothing", so an answer-or-a-reason had to be a sentinel and a
+convention; now it is a type, and the `match` that takes it apart is the same
+exhaustive one as ever.
+
+The names are the **arm's**, not the declaration's — `Parsed::Ok(n)` and
+`Parsed::Ok(value)` are the same pattern spelt for two different readers — and
+each lives exactly as long as its arm, so two arms may call quite different
+things by one name. A pattern names every value the variant carries, in order;
+there is no way to leave one out, for the same reason there is no `_`.
+
+**Underneath**, an enum has two representations and the enum picks one for all
+of its variants:
+
+* Every variant carries nothing — which is most enums, and every enum TinyC had
+  — and a value *is* its tag. Nothing changed for these: they move and compare
+  like an int, and the backend still needs only a table of names.
+* Some variant carries something, and a value is a **pointer** to its tag and
+  payload in the arena, laid out like every other run of values here: what tells
+  it apart in front, the values after it. A variant that carries nothing still
+  has to be a pointer, so its one value is written down once in `.data` rather
+  than allocated at every mention.
+
+It can be a pointer rather than something in the frame — the way an object is —
+because an enum is **read-only**. There is no syntax that writes into a payload,
+so two names for one of them cannot be told apart, which is exactly the bargain
+[a string strikes](#strings-and-characters). That is what keeps an enum fitting
+in a register however much it carries, and why none of the aggregate machinery —
+copying, returning into the caller's room, fix-ups — is involved at all.
+
+Two consequences fall out of it:
+
+* **A payload has to fit in a register.** An object or an array would have to
+  live inside the value, which would give an enum a size of its own and pull it
+  into the layout ordering classes need. A class is what holds one of those.
+* **A list payload is allowed**, and keeps value semantics by copying at both
+  edges: what goes into a variant is copied in, and what a pattern hands back is
+  the arm's own. There is no third way to reach it, which is what makes the two
+  copies sufficient.
+* **An enum that carries something cannot be compared with `==`.** Two `Ok`s are
+  the same value only if their numbers are, and comparing the two pointers would
+  answer whether they were built by the same expression. `match` is what asks
+  the real question. An enum whose variants carry nothing compares exactly as
+  before.
+
+Printing one writes what an enum has always written: the name of its variant.
+What it carries has a type of its own and a way of being written already.
+
+#### Matching something that is not an enum
+
+The same form works on an `int`, a `char`, a `string` and a `bool`:
+
+```c
+fn ordinal(int n) -> string {
+  return match (n) {
+    0 => "zeroth",
+    1 => "first",
+    2 => "second",
+    _ => "nth",
+  };
+}
+```
+
+Here `_` is not a catch-all that hides something — it is the only way to be
+complete, and so it is **required**:
+
+```
+error: this match does not cover every `int`
+  |
+  |   match (n) {
+  |   ^^^^^ add `_ => ...` for the rest
+  = note: an `int` has no list of values to write out, so a match on one is
+          only complete with a catch-all
+```
+
+That is the whole of the rule, and it falls out of one question: **can a program
+write every value of this type out?** An enum can, and must. A `bool` can, so
+`{ true => …, false => … }` needs no catch-all — though it may have one. An
+`int`, a `char` and a `string` cannot, so they need one. Nothing else can be
+matched at all: an array, a list and an object are exactly the types with no
+`==`, so there is nothing a pattern could ask of one.
+
+The rest is the same for every type. A pattern is held to the scrutinee's type
+exactly as an `==` would be — `match (n) { 'a' => … }` is the same mistake as
+`n == 'a'`, because nothing in TinyC converts on its own. Two arms selecting the
+same value is refused, whether they are two `Colour::Red`s or two `3`s. And a
+`_` has to come last, since anything after it could never run.
+
+Underneath, an arm is one comparison against a value the compiler settled — a
+variant's tag, a number, a character, a `bool` — so the shape of the emitted code
+did not change at all. A **string** is the one exception, and it is the exception
+`==` already makes: comparing addresses would answer a different question, so it
+costs a call to the same `str_eq` the operator uses.
+
 The decisions behind the rest of it:
 
-* **A variant carries no payload, so a value *is* its variant's index.** It
-  moves and compares like an int, and the backend needs nothing new for it —
-  only a table of names, and only for an enum something actually prints.
+* **A variant that carries nothing is its index**, so a value of such an enum
+  moves and compares like an int and the backend needs nothing new for it —
+  only a table of names, and only for an enum something actually prints. One
+  that carries something is a pointer; see [A variant that carries
+  something](#a-variant-that-carries-something).
 * **A variant is always written qualified**, `Colour::Red`. So two enums may
   both have a `Red`, no enum can shadow a variable, and telling a variant from a
   variable or a call needs one token of lookahead and no name table.

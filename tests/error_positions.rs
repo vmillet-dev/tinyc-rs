@@ -191,8 +191,9 @@ fn arms_that_disagree_point_at_the_second_one_and_note_the_first() {
 #[test]
 fn an_arm_with_no_value_points_at_its_pattern() {
     // The block itself is not wrong — it is wrong *for this match*, so the
-    // caret goes on the arm rather than inside it.
-    assert_error_at("match_arm_without_value.tc", "6:13");
+    // caret goes on the arm rather than inside it, and covers the whole
+    // pattern rather than the half of it that names a variant.
+    assert_error_at("match_arm_without_value.tc", "6:5");
 }
 
 // -- arrays ---------------------------------------------------------------
@@ -269,11 +270,6 @@ fn pushing_onto_a_parameter_points_at_the_parameter() {
 #[test]
 fn pushing_onto_an_array_points_at_the_keyword() {
     assert_error_at("push_onto_array.tc", "3:3");
-}
-
-#[test]
-fn a_list_in_a_field_points_at_the_field() {
-    assert_error_at("list_in_a_field.tc", "5:3");
 }
 
 #[test]

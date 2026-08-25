@@ -1,9 +1,0 @@
-// An array or another object nests, because it lives inside the object that
-// holds it. A list does not: its elements live in the arena and the field
-// would hold only their address, so copying the object would share them.
-class Bag {
-  int[] items;
-}
-
-fn main() {
-}

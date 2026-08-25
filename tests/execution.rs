@@ -1712,3 +1712,324 @@ fn an_aggregate_returned_is_built_where_the_caller_asked_for_it() {
         &cases,
     );
 }
+
+/// A list field makes an object's copy more than a copy of its bytes.
+///
+/// The field holds the *address* of its elements, so copying the bytes alone
+/// would leave two objects naming one list — and the language's one rule about
+/// assignment would stop being true the moment a class held one. What pays for
+/// it is a fix-up after the copy, and what decides *what* to fix up is the
+/// object's own vtable rather than the type of the hole it sits in.
+///
+/// Every case here is a wrong *number* when the copy is shallow, never a crash.
+#[test]
+fn copying_an_object_copies_the_lists_inside_it() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 7] = [
+        // The plainest shape: two variables, one of them a copy.
+        (
+            r#"Bag a = Bag { items: [1, 2] };
+               Bag b = a;
+               push(b.items, 3);
+               println(len(a.items) * 10 + len(b.items));"#,
+            "23",
+        ),
+        // The list the object was *built* from keeps its own elements too.
+        (
+            r#"int[] xs = [1, 2];
+               Bag a = Bag { items: xs };
+               push(a.items, 3);
+               println(len(xs) * 10 + len(a.items));"#,
+            "23",
+        ),
+        // A parameter borrows, so what the callee copies out of it is its own
+        // and the caller's list is untouched.
+        (
+            r#"Bag a = Bag { items: [1, 2] };
+               Bag c = grown(a);
+               println(len(a.items) * 10 + len(c.items));"#,
+            "23",
+        ),
+        // The elements themselves, not merely the count: a shallow copy would
+        // show 9 in both.
+        (
+            r#"Bag a = Bag { items: [1, 2] };
+               Bag b = a;
+               b.items[0] = 9;
+               println(a.items[0] * 10 + b.items[0]);"#,
+            "19",
+        ),
+        // Decided by the object: the list is a `Sub`'s, and the hole is a
+        // `Base`. Reading what to fix up off the hole would share it.
+        (
+            r#"Sub s = Sub { tag: 1, extra: [1, 2] };
+               Base r = s;
+               push(s.extra, 3);
+               println(s.count() * 10 + r.count());"#,
+            "32",
+        ),
+        // A list *of* objects that hold lists — two levels, so the clone has
+        // to go through the elements as well as the field.
+        (
+            r#"Bag[] bags = [];
+               push(bags, Bag { items: [1, 2] });
+               Bag[] copy = bags;
+               push(copy[0].items, 3);
+               println(len(bags[0].items) * 10 + len(copy[0].items));"#,
+            "23",
+        ),
+        // What a list field is really for: a class that reaches itself. The
+        // child that went into `kids` is a snapshot, so growing it afterwards
+        // does not change the tree it was put into.
+        (
+            r#"Node child = Node { v: 10, kids: [] };
+               push(child.kids, Node { v: 100, kids: [] });
+               Node root = Node { v: 1, kids: [] };
+               push(root.kids, child);
+               push(child.kids, Node { v: 1000, kids: [] });
+               println(root.total() * 10000 + child.total());"#,
+            "1111110",
+        ),
+    ];
+
+    harness.each_prints_after(
+        "listfield",
+        "class Bag { int[] items; }\n\
+         class Base {\n  int tag;\n  fn count(self) -> int { return 0; }\n}\n\
+         class Sub : Base {\n  int[] extra;\n  \
+         fn count(self) -> int { return len(self.extra); }\n}\n\
+         class Node {\n  int v;\n  Node[] kids;\n  \
+         fn total(self) -> int {\n    int sum = self.v;\n    \
+         for (int i = 0; i < len(self.kids); i = i + 1) {\n      \
+         sum = sum + self.kids[i].total();\n    }\n    return sum;\n  }\n}\n\
+         fn grown(Bag b) -> Bag {\n  Bag mine = b;\n  push(mine.items, 3);\n  \
+         return mine;\n}\n",
+        &cases,
+    );
+}
+
+/// A `match` on something that is not an enum.
+///
+/// The arms are still tried in order and the last one is still the fall-through
+/// — what changes is only what each test *is*: a comparison for everything a
+/// register holds, and a call for a string, which is the same exception `==`
+/// already makes.
+#[test]
+fn a_match_selects_the_right_arm_whatever_it_is_matching() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 8] = [
+        // An int, including the arm that is only reachable through `_`.
+        (r#"println(word(1));"#, "one"),
+        (r#"println(word(7));"#, "many"),
+        // A negative pattern, which is one literal rather than an operator.
+        (r#"println(word(0 - 1));"#, "less than none"),
+        // A string, compared by its characters and not by its address — the
+        // scrutinee here was built at run time and no literal equals it.
+        (r#"println(code("p" + "ut"));"#, "2"),
+        // The empty string is a pattern like any other.
+        (r#"println(code(""));"#, "3"),
+        (r#"println(code("nope"));"#, "0"),
+        // A char.
+        (r#"println(vowel('e'));"#, "true"),
+        // A bool, which needs no catch-all because both its values fit in the
+        // arms — so the second arm is the fall-through.
+        (r#"println(match (1 > 2) { true => "yes", false => "no" });"#, "no"),
+    ];
+
+    harness.each_prints_after(
+        "matching",
+        "fn word(int n) -> string {\n  return match (n) {\n    0 => \"none\",\n    \
+         1 => \"one\",\n    2 => \"two\",\n    -1 => \"less than none\",\n    \
+         _ => \"many\",\n  };\n}\n\
+         fn code(string s) -> int {\n  return match (s) {\n    \"get\" => 1,\n    \
+         \"put\" => 2,\n    \"\" => 3,\n    _ => 0,\n  };\n}\n\
+         fn vowel(char c) -> bool {\n  return match (c) {\n    'a' => true,\n    \
+         'e' => true,\n    _ => false,\n  };\n}\n",
+        &cases,
+    );
+}
+
+/// Growing a string where it stands, and every reason not to.
+///
+/// A string's length lives with its characters, so `s = s + e` may only be done
+/// in place when **nothing else can be holding `s`** — otherwise bumping the
+/// count would lengthen a string somebody else is still reading. Lowering
+/// proves that per variable, and every case below is one where the proof must
+/// fail: a wrong answer here is not a crash but a *longer string than was ever
+/// written*, which is exactly what these assertions catch.
+#[test]
+fn a_string_grows_in_place_only_where_nothing_else_holds_it() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 12] = [
+        // The shape this exists for.
+        (
+            r#"string s = "";
+               for (int i = 0; i < 5; i = i + 1) { s = s + "x"; }
+               println(s);"#,
+            "xxxxx",
+        ),
+        // The chain, which is how a line is really written. `+` leans left, so
+        // the outermost operand is not the variable.
+        (
+            r#"string s = "";
+               for (int i = 0; i < 3; i = i + 1) { s = s + string(i) + ","; }
+               println(s);"#,
+            "0,1,2,",
+        ),
+        // Another name for the same characters, taken before the growth. If
+        // `s` were grown in place, `t` would report the longer string.
+        (
+            r#"string s = "a";
+               string t = s;
+               s = s + "b";
+               println(t + "|" + s);"#,
+            "a|ab",
+        ),
+        // The same, where `s` really is an arena block rather than a literal.
+        (
+            r#"string s = "a" + "b";
+               string t = s;
+               s = s + "c";
+               println(t + "|" + s);"#,
+            "ab|abc",
+        ),
+        // Handed to a function, which may keep it.
+        (
+            r#"string s = "a" + "b";
+               println(kept(s) + "|" + grow(s));"#,
+            "ab|abc",
+        ),
+        // Put in a list.
+        (
+            r#"string s = "a" + "b";
+               string[] all = [];
+               push(all, s);
+               s = s + "c";
+               println(all[0] + "|" + s);"#,
+            "ab|abc",
+        ),
+        // Put in an object.
+        (
+            r#"string s = "a" + "b";
+               Box b = Box { text: s };
+               s = s + "c";
+               println(b.text + "|" + s);"#,
+            "ab|abc",
+        ),
+        // Given a value that is somebody else's to begin with.
+        (
+            r#"string other = "a" + "b";
+               string s = other;
+               s = s + "c";
+               println(other + "|" + s);"#,
+            "ab|abc",
+        ),
+        // A parameter is the caller's string, whatever the body does with it.
+        (r#"println(grow("a" + "b"));"#, "abc"),
+        // Added to itself: one name, and the copy reads what it wrote past.
+        (
+            r#"string s = "ab";
+               s = s + s;
+               s = s + s;
+               println(s);"#,
+            "abababab",
+        ),
+        // Two accumulators taking turns, so neither is the last block for long.
+        (
+            r#"string a = "";
+               string b = "";
+               for (int i = 0; i < 4; i = i + 1) { a = a + "a"; b = b + "b"; }
+               println(a + "|" + b);"#,
+            "aaaa|bbbb",
+        ),
+        // A piece that reads the variable itself: appending one at a time would
+        // let the second piece see what the first one wrote.
+        (
+            r#"string s = "a" + "b";
+               s = s + string(len(s)) + "!";
+               println(s);"#,
+            "ab2!",
+        ),
+    ];
+
+    harness.each_prints_after(
+        "growing",
+        "class Box { string text; }\n\
+         fn kept(string s) -> string {\n  return s;\n}\n\
+         fn grow(string s) -> string {\n  s = s + \"c\";\n  return s;\n}\n",
+        &cases,
+    );
+}
+
+/// A variant that carries something.
+///
+/// An enum whose variants all carry nothing *is* its tag, and still compiles to
+/// exactly what it always did. One that carries something is a pointer to its
+/// tag and payload in the arena — which it can be because an enum is read-only,
+/// so two names for one of them cannot be told apart. Every case here is about
+/// that being true.
+#[test]
+fn a_variant_carries_its_payload_and_a_pattern_takes_it_back_out() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 9] = [
+        // One value, two values, and none — through the same match.
+        (r#"println(area(Shape::Circle(2)));"#, "12"),
+        (r#"println(area(Shape::Rect(3, 4)));"#, "12"),
+        (r#"println(area(Shape::Empty));"#, "0"),
+        // Printing one writes what an enum has always written: its variant's
+        // name, read out of a value that is now a pointer.
+        (r#"println("%e", Shape::Rect(1, 2));"#, "Rect"),
+        // Stored, copied and passed on like any other value.
+        (
+            r#"Shape a = Shape::Rect(5, 6);
+               Shape b = a;
+               println(area(a) + area(b));"#,
+            "60",
+        ),
+        // In a list, which is where the answer-or-reason shape earns its keep.
+        (
+            r#"Shape[] all = [];
+               push(all, Shape::Circle(1));
+               push(all, Shape::Rect(2, 5));
+               int total = 0;
+               for (int i = 0; i < len(all); i = i + 1) { total = total + area(all[i]); }
+               println(total);"#,
+            "13",
+        ),
+        // A payload of a different type, and an arm that names it whatever it
+        // likes.
+        (r#"println(describe(parse("42")));"#, "got 42"),
+        (r#"println(describe(parse("nope")));"#, "no: nope"),
+        // A list payload: what goes in is copied in, what comes out of a
+        // pattern is copied out, and there is no third way to reach it. A
+        // shallow copy anywhere here shows up as a wrong length.
+        (
+            r#"int[] xs = [1, 2];
+               Bag b = Bag::Some(xs);
+               push(xs, 3);
+               println(len(xs) * 10 + held(b));"#,
+            "32",
+        ),
+    ];
+
+    harness.each_prints_after(
+        "payload",
+        "enum Shape {\n  Circle(int),\n  Rect(int, int),\n  Empty,\n}\n\
+         enum Parsed {\n  Ok(int),\n  Bad(string),\n}\n\
+         enum Bag {\n  Some(int[]),\n  None,\n}\n\
+         fn area(Shape s) -> int {\n  return match (s) {\n    \
+         Shape::Circle(r) => 3 * r * r,\n    Shape::Rect(w, h) => w * h,\n    \
+         Shape::Empty => 0,\n  };\n}\n\
+         fn parse(string text) -> Parsed {\n  if (is_int(text)) {\n    \
+         return Parsed::Ok(int(text));\n  }\n  return Parsed::Bad(text);\n}\n\
+         fn describe(Parsed p) -> string {\n  return match (p) {\n    \
+         Parsed::Ok(n) => \"got \" + string(n),\n    Parsed::Bad(why) => \"no: \" + why,\n  };\n}\n\
+         fn held(Bag b) -> int {\n  return match (b) {\n    \
+         Bag::Some(ys) => len(ys),\n    Bag::None => 0,\n  };\n}\n",
+        &cases,
+    );
+}

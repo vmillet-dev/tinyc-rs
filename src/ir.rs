@@ -35,12 +35,14 @@
 //!
 //! Temporaries are still written exactly once each.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     FieldInit,
-    ArmBody, BinOp, Block as AstBlock, Builtin, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
-    MatchArm, Place, Prim, PrintPart, Program as Ast, Stmt, Ty, TypeTable, is_scalar_value,
+    ArmBody, BinOp, Block as AstBlock, Builtin, ClassId, CmpOp, EnumId, Expr, ExprKind, FnDecl,
+    LogicOp,
+    MatchArm, Pattern, Place, Prim, PrintPart, Program as Ast, Stmt, Ty, TypeTable,
+    is_scalar_value,
 };
 use crate::diag::{Diagnostic, Result};
 use crate::sema::Types;
@@ -160,6 +162,21 @@ pub enum Instr {
     /// run of moves rather than one. The count is always a multiple of eight
     /// and known at compile time, so it unrolls.
     CopyBytes { dst: Value, src: Value, bytes: u32 },
+    /// The bytes of an aggregate have just been copied — now give the copy its
+    /// own elements.
+    ///
+    /// `count` objects of `stride` bytes each, starting at `at`. What has to be
+    /// done to one is decided by **the object**, not by the type of the hole it
+    /// sits in: the routine hangs off its vtable, so a `Reading`-shaped field
+    /// that turned out to hold a `Frost` fixes up a `Frost`.
+    ///
+    /// This is the whole price of a list field, and it is only ever emitted
+    /// where one is reachable — [`TypeTable::holds_a_list`] is the question
+    /// asked. Everything else a copy touches lives *inside* the bytes that were
+    /// copied; a list's elements do not, so without this the copy and the
+    /// original would name one run of them, and writing through either would be
+    /// visible through the other.
+    Fixup { at: Value, count: Value, stride: u32 },
     /// `dst = *addr`
     Load { dst: VReg, addr: Value },
     /// `*addr = value`
@@ -174,6 +191,13 @@ pub enum Instr {
     Param { dst: VReg, index: u32 },
     /// `dst = &vtable(class)`: the address of a class's method table.
     VTable { dst: VReg, class: ClassId },
+    /// `dst = &value(enum::variant)`: the one value a variant that carries
+    /// nothing has, written down once in `.data`.
+    ///
+    /// Only for an enum some *other* variant of which carries something, and so
+    /// which is a pointer rather than a tag. Where every variant carries
+    /// nothing the value is the tag itself and this never appears.
+    VariantAddr { dst: VReg, id: EnumId, tag: u32 },
     /// `dst = callee(args)`, with `dst` absent when the result is discarded.
     Call { dst: Option<VReg>, callee: FuncId, args: Vec<Value> },
     /// `dst = receiver.vtable[slot](args)` — a call whose target is decided by
@@ -229,6 +253,22 @@ pub enum Instr {
 pub enum Runtime {
     /// `(a, b) -> string`: a new string holding a's characters then b's.
     Concat,
+    /// `(a, b) -> string`: the same answer as [`Runtime::Concat`], made in
+    /// place where it can be.
+    ///
+    /// Emitted only for `s = s + e`, and only where lowering has established
+    /// that **nothing else can be holding `s`** — see [`owned_strings`]. That
+    /// is the whole of the difference: a string's length lives with its
+    /// characters, so growing one where it stands would bump a count every
+    /// other name for it can see. Where there is no other name, there is
+    /// nothing to see it.
+    ///
+    /// It still only grows in place when `s` is the *last* thing the arena
+    /// handed out, which is what a bump pointer can give back; otherwise it
+    /// allocates exactly as `Concat` does. So the answer never differs — only
+    /// how much memory a loop of them leaves behind, which goes from the square
+    /// of the loop count to a constant factor of the answer.
+    Append,
     /// `(a, b) -> bool`: same length, same characters. Comparing the two
     /// addresses would answer a question nobody asked.
     StrEq,
@@ -276,6 +316,13 @@ pub enum Runtime {
     /// `(list, bytes) -> list`: a new list holding the same elements. What
     /// makes assigning a list a copy rather than a second name for one.
     ListClone,
+    /// `(bytes) -> address`: room in the arena, uninitialised.
+    ///
+    /// The one routine lowering calls for its own sake rather than to stand
+    /// in for an operator. A variant that carries something needs room for a
+    /// tag and its payload, and what goes in it is stores the caller emits —
+    /// so there is nothing here worth a routine of its own.
+    Alloc,
 }
 
 impl Runtime {
@@ -283,6 +330,7 @@ impl Runtime {
     pub fn name(self) -> &'static str {
         match self {
             Runtime::Concat => "concat",
+            Runtime::Append => "append",
             Runtime::StrEq => "str_eq",
             Runtime::CheckChar => "check_char",
             Runtime::CharToStr => "char_str",
@@ -291,6 +339,7 @@ impl Runtime {
             Runtime::ListPush => "list_push",
             Runtime::ListPushBig => "list_push_big",
             Runtime::ListClone => "list_clone",
+            Runtime::Alloc => "alloc",
             Runtime::CharsToStr => "chars_str",
             Runtime::StrToInt => "str_int",
             Runtime::IsInt => "is_int",
@@ -434,6 +483,7 @@ impl Instr {
             | Instr::Param { .. }
             | Instr::Frame { .. }
             | Instr::PrintText { .. }
+            | Instr::VariantAddr { .. }
             | Instr::VTable { .. } => {}
             Instr::Copy { src, .. }
             | Instr::Load { addr: src, .. }
@@ -457,6 +507,10 @@ impl Instr {
                 reg(dst);
                 reg(src);
             }
+            Instr::Fixup { at, count, .. } => {
+                reg(at);
+                reg(count);
+            }
             Instr::Print { val, .. } => reg(val),
             Instr::Call { args, .. } | Instr::RtCall { args, .. } => args.iter().for_each(reg),
             Instr::CallVirtual { receiver, args, .. } => {
@@ -476,6 +530,7 @@ impl Instr {
             | Instr::Param { dst, .. }
             | Instr::Frame { dst, .. }
             | Instr::VTable { dst, .. }
+            | Instr::VariantAddr { dst, .. }
             | Instr::Elem { dst, .. }
             | Instr::Field { dst, .. }
             | Instr::Load { dst, .. }
@@ -488,7 +543,8 @@ impl Instr {
             Instr::Print { .. }
             | Instr::PrintText { .. }
             | Instr::Store { .. }
-            | Instr::CopyBytes { .. } => None,
+            | Instr::CopyBytes { .. }
+            | Instr::Fixup { .. } => None,
         }
     }
 
@@ -533,6 +589,7 @@ impl Instr {
             | Instr::Param { .. }
             | Instr::Frame { .. }
             | Instr::PrintText { .. }
+            | Instr::VariantAddr { .. }
             | Instr::VTable { .. } => {}
             Instr::Copy { src: value, .. }
             | Instr::Load { addr: value, .. }
@@ -557,6 +614,10 @@ impl Instr {
                 visit(dst);
                 visit(src);
             }
+            Instr::Fixup { at, count, .. } => {
+                visit(at);
+                visit(count);
+            }
             Instr::Call { args, .. } | Instr::RtCall { args, .. } => args.iter_mut().for_each(visit),
             Instr::CallVirtual { receiver, args, .. } => {
                 visit(receiver);
@@ -575,6 +636,7 @@ impl Instr {
                 | Instr::Call { .. }
                 | Instr::CallVirtual { .. }
                 | Instr::RtCall { .. }
+                | Instr::Fixup { .. }
         )
     }
 }
@@ -817,6 +879,9 @@ impl Program {
                     None => call,
                 }
             }
+            Instr::Fixup { at, count, stride } => {
+                format!("fixup {} of {} bytes at {}", value(count), stride, value(at))
+            }
             Instr::CopyBytes { dst, src, bytes } => {
                 format!("copy {} bytes to {}, from {}", bytes, value(dst), value(src))
             }
@@ -834,6 +899,12 @@ impl Program {
                     None => call,
                 }
             }
+            Instr::VariantAddr { dst, id, tag } => format!(
+                "%{} = value {}::{}",
+                function.name_of(*dst),
+                self.table.enum_info(*id).name,
+                self.table.enum_info(*id).variants[*tag as usize].name
+            ),
             Instr::VTable { dst, class } => format!(
                 "%{} = vtable {}",
                 function.name_of(*dst),
@@ -918,6 +989,7 @@ pub fn lower(ast: &Ast, types: &Types) -> Result<Program> {
             func_ids: &func_ids,
             strings: &mut strings,
             ids: &ids,
+            owned: owned_strings(decl, types),
         };
         let mut lowered =
             lowering.run(decl, types.ret_of(index), types.params_of(index));
@@ -1185,6 +1257,10 @@ struct Lowering<'a> {
     /// Shared with every other function: the strings all land in one section.
     strings: &'a mut Strings,
     ids: &'a HashMap<String, FuncId>,
+    /// The string variables of this function nothing else can be holding, and
+    /// so the ones `s = s + e` may grow where they stand. See
+    /// [`owned_strings`].
+    owned: HashSet<String>,
 }
 
 impl Lowering<'_> {
@@ -1382,14 +1458,42 @@ impl Lowering<'_> {
             Stmt::Assign { target, value } => match target {
                 Place::Var { name, .. } => {
                     let (dst, ty) = self.binding(name);
-                    match ty.fits_in_a_register() {
+                    // `s = s + a + b`, where nothing else can be holding `s`.
+                    // The same answer, added to where `s` already is whenever
+                    // the arena can still give that room back — which is what
+                    // turns building a string in a loop from quadratic in
+                    // *memory* into linear. See `owned_strings`.
+                    let chain = match ty.fits_in_a_register() {
+                        true => self.append_chain(name, value),
+                        false => None,
+                    };
+                    match chain {
+                        Some(pieces) => {
+                            for piece in pieces {
+                                // Whether this piece was built by this very
+                                // statement, and so is nobody else's to lose.
+                                let own = self.builds_a_temporary(piece);
+                                let rhs = self.expr(piece);
+                                self.emit(Instr::RtCall {
+                                    dst: Some(dst),
+                                    callee: Runtime::Append,
+                                    args: vec![
+                                        Value::Reg(dst),
+                                        rhs,
+                                        Value::Const(i64::from(own)),
+                                    ],
+                                });
+                            }
+                        }
                         // The variable keeps its register; the assignment
-                        // overwrites it.
-                        true => self.keep_into(dst, value),
-                        // An aggregate variable keeps its *room*, so the value
-                        // is copied into it rather than the address swapped.
-                        // Anything else would make assignment aliasing.
-                        false => self.write_through(Value::Reg(dst), value, Room::Named),
+                        // overwrites it. An aggregate variable keeps its
+                        // *room*, so the value is copied into it rather than
+                        // the address swapped — anything else would make
+                        // assignment aliasing.
+                        None => match ty.fits_in_a_register() {
+                            true => self.keep_into(dst, value),
+                            false => self.write_through(Value::Reg(dst), value, Room::Named),
+                        },
                     }
                 }
                 // Everything else names memory rather than a register, so the
@@ -1412,9 +1516,16 @@ impl Lowering<'_> {
                 // which is what makes `push(xs, xs[0])` mean what it says.
                 let (callee, mut rest) = match elem.fits_in_a_register() {
                     true => (Runtime::ListPush, vec![value]),
-                    false => {
-                        (Runtime::ListPushBig, vec![value, Value::Const(i64::from(bytes))])
-                    }
+                    // What goes in is a copy, and a copy owns nothing yet —
+                    // so the routine is told whether to give it its own.
+                    false => (
+                        Runtime::ListPushBig,
+                        vec![
+                            value,
+                            Value::Const(i64::from(bytes)),
+                            Value::Const(i64::from(self.table.holds_a_list(elem))),
+                        ],
+                    ),
                 };
                 match target {
                     Place::Var { name, .. } => {
@@ -1522,6 +1633,11 @@ impl Lowering<'_> {
             unreachable!("the caller matched a match");
         };
         let value = self.expr(scrutinee);
+        let scrutinee_ty = self.types.of(scrutinee.id);
+        // A boxed enum is a pointer, and every test below is about the tag it
+        // points at — so that is read once here rather than once per arm. The
+        // pointer itself is still what an arm's bindings are read out of.
+        let tested = self.tag_of(scrutinee_ty, value);
         let before = self.current;
 
         // Where each arm's decision begins, so a failing test knows where to
@@ -1532,8 +1648,10 @@ impl Lowering<'_> {
         let mut exits = Vec::new();
 
         for (index, arm) in arms.iter().enumerate() {
-            let tag = self.arm_tag(scrutinee, arm);
             if index + 1 == arms.len() {
+                // The last arm is never tested: either it is the `_` that takes
+                // whatever is left, or the domain was countable and the arms
+                // before it took everything else. Control simply runs in.
                 entries.push(self.new_block(BlockKind::Arm));
             } else {
                 // The first test belongs to the block the scrutinee was
@@ -1543,16 +1661,17 @@ impl Lowering<'_> {
                     self.new_block(BlockKind::Case);
                 }
                 entries.push(self.current);
-                let cond = self.fresh_temp();
-                self.emit(Instr::Cmp {
-                    op: CmpOp::Eq,
-                    dst: cond,
-                    lhs: value,
-                    rhs: Value::Const(tag),
-                });
+                let cond = self.arm_test(scrutinee, tested, arm);
                 let test = self.current;
                 let arm_block = self.new_block(BlockKind::Arm);
-                tests.push((test, Value::Reg(cond), arm_block));
+                tests.push((test, cond, arm_block));
+            }
+            // What the pattern named is in scope for exactly this arm, so the
+            // arm gets a scope of its own — which is what lets two arms use one
+            // name for quite different things.
+            self.scopes.push(HashMap::new());
+            if let Ty::Enum(id) = scrutinee_ty {
+                self.bind_arm_payload(id, value, arm);
             }
             match &arm.body {
                 // A value arm leaves its answer where the join will read it.
@@ -1564,6 +1683,7 @@ impl Lowering<'_> {
                 },
                 ArmBody::Block(block) => self.block_stmts(block),
             }
+            self.scopes.pop();
             exits.push(self.current);
         }
 
@@ -1588,6 +1708,130 @@ impl Lowering<'_> {
 
     /// The tag a `Color::Red` expression stands for, which `sema` has already
     /// established exists.
+    /// Bytes in front of a boxed enum's payload, holding its tag.
+    ///
+    /// The same eight a string and a list spend on their length, and it sits in
+    /// the same place: at the front, where the value points.
+    const TAG_BYTES: u32 = 8;
+
+    /// Build `Enum::Variant(...)` into `dst`.
+    ///
+    /// An enum whose variants all carry nothing *is* its tag, and costs exactly
+    /// what an integer literal does — which is what every TinyC enum was until
+    /// payloads existed, and what most still are.
+    ///
+    /// One that carries something is a **pointer** to its tag and payload in
+    /// the arena, laid out like every other run of values here: the thing that
+    /// tells the value apart in front, the values after it. It can be a pointer
+    /// rather than something in the frame because an enum is read-only — there
+    /// is no syntax that writes into a payload — so two names for one of them
+    /// cannot be told apart. That is the same bargain a string strikes, and it
+    /// is why an enum still fits in a register however much it carries.
+    fn variant_into(&mut self, dst: VReg, expr: &Expr, args: &[Expr]) {
+        let ExprKind::Variant { variant, .. } = &expr.kind else {
+            unreachable!("the caller matched a variant");
+        };
+        let Ty::Enum(id) = self.types.of(expr.id) else {
+            unreachable!("sema gives a variant its enum's type");
+        };
+        let info = self.table.enum_info(id);
+        let tag = info.tag(variant).expect("sema rejects an unknown variant");
+        if !info.carries_data() {
+            return self.emit(Instr::Const { dst, val: tag });
+        }
+
+        // A variant of a boxed enum that carries nothing is the same value
+        // every time it is written, so it is written down once, in `.data`.
+        // Nothing else would be gained by allocating a fresh eight bytes to
+        // hold a number the compiler already knows.
+        if args.is_empty() {
+            return self.emit(Instr::VariantAddr { dst, id, tag: tag as u32 });
+        }
+
+        let slots = info.slots() as u32;
+        let bytes = Self::TAG_BYTES + slots * 8;
+        self.emit(Instr::RtCall {
+            dst: Some(dst),
+            callee: Runtime::Alloc,
+            args: vec![Value::Const(i64::from(bytes))],
+        });
+        self.emit(Instr::Store { addr: Value::Reg(dst), value: Value::Const(tag) });
+        for (index, arg) in args.iter().enumerate() {
+            let at = self.fresh_temp();
+            self.emit(Instr::Field {
+                dst: at,
+                base: Value::Reg(dst),
+                offset: Self::TAG_BYTES + index as u32 * 8,
+            });
+            // `Room::Fresh`, and through the same path a field takes: what goes
+            // into a variant is the variant's from then on, so a list is copied
+            // in rather than shared. There is no way to reach it again except
+            // by matching, which copies back out.
+            self.write_through(Value::Reg(at), arg, Room::Fresh);
+        }
+    }
+
+    /// Whether a value of this type is a pointer to a tag rather than the tag.
+    fn is_boxed_enum(&self, ty: Ty) -> bool {
+        matches!(ty, Ty::Enum(id) if self.table.enum_info(id).carries_data())
+    }
+
+    /// The tag of an enum value, whichever of the two shapes it has.
+    ///
+    /// For an enum that carries nothing anywhere the value *is* the tag and
+    /// this is the identity — which is what keeps every such program emitting
+    /// exactly the instructions it emitted before payloads existed.
+    fn tag_of(&mut self, ty: Ty, value: Value) -> Value {
+        if !self.is_boxed_enum(ty) {
+            return value;
+        }
+        let dst = self.fresh_temp();
+        self.emit(Instr::Load { dst, addr: value });
+        Value::Reg(dst)
+    }
+
+    /// Name what the matched variant carries, at the top of its arm.
+    ///
+    /// A list comes out as a copy, exactly as it went in. That is what makes an
+    /// enum's payload the enum's: there is no way to reach the elements it
+    /// holds except through a pattern, and a pattern hands back something of
+    /// the arm's own.
+    fn bind_arm_payload(&mut self, id: EnumId, value: Value, arm: &MatchArm) {
+        let Pattern::Variant { variant, bindings, .. } = &arm.pattern else { return };
+        if bindings.is_empty() {
+            return;
+        }
+        let info = self.table.enum_info(id);
+        let payload = info.variant(variant).map(|v| v.payload.clone()).unwrap_or_default();
+        for (index, (name, _)) in bindings.iter().enumerate() {
+            let Some(&ty) = payload.get(index) else { break };
+            let dst = self.declare(name, ty);
+            let at = self.fresh_temp();
+            self.emit(Instr::Field {
+                dst: at,
+                base: value,
+                offset: Self::TAG_BYTES + index as u32 * 8,
+            });
+            self.emit(Instr::Load { dst, addr: Value::Reg(at) });
+            if let Ty::List(list) = ty {
+                let elem = self.table.element(list);
+                let bytes = self.table.size_of(elem);
+                let deep = i64::from(self.table.holds_a_list(elem));
+                self.emit(Instr::RtCall {
+                    dst: Some(dst),
+                    callee: Runtime::ListClone,
+                    args: vec![
+                        Value::Reg(dst),
+                        Value::Const(i64::from(bytes)),
+                        Value::Const(deep),
+                    ],
+                });
+            }
+        }
+    }
+
+    /// The tag of a variant that carries nothing, for the enums that are still
+    /// a bare tag.
     fn variant_tag(&self, expr: &Expr) -> i64 {
         let ExprKind::Variant { variant, .. } = &expr.kind else {
             unreachable!("the caller matched a variant");
@@ -1598,15 +1842,47 @@ impl Lowering<'_> {
         self.table.enum_info(id).tag(variant).expect("sema rejects an unknown variant")
     }
 
-    /// The tag an arm's pattern selects.
+    /// Whether the scrutinee is what this arm's pattern selects, as a `bool`.
     ///
-    /// Both halves were checked by [`crate::sema`], which is what makes the
-    /// lookup here an `expect` rather than a diagnostic.
-    fn arm_tag(&self, scrutinee: &Expr, arm: &MatchArm) -> i64 {
-        let Ty::Enum(id) = self.types.of(scrutinee.id) else {
-            unreachable!("sema rejects a match on anything but an enum");
+    /// One comparison for everything a register holds — a variant's tag, a
+    /// number, a character, a `bool` — because in every one of those cases the
+    /// pattern is a value settled while the program was compiled. A string is
+    /// the exception, and the same exception `==` already is: comparing the
+    /// addresses would answer a different question, so it costs a call.
+    ///
+    /// Every pattern here was checked by [`crate::sema`], which is what makes
+    /// the lookups `expect`s rather than diagnostics.
+    fn arm_test(&mut self, scrutinee: &Expr, value: Value, arm: &MatchArm) -> Value {
+        if let Pattern::Str(chars) = &arm.pattern {
+            let id = self.intern(chars);
+            let literal = self.fresh_temp();
+            self.emit(Instr::StrAddr { dst: literal, id });
+            let dst = self.fresh_temp();
+            self.emit(Instr::RtCall {
+                dst: Some(dst),
+                callee: Runtime::StrEq,
+                args: vec![value, Value::Reg(literal)],
+            });
+            return Value::Reg(dst);
+        }
+        let wanted = match &arm.pattern {
+            Pattern::Variant { variant, .. } => {
+                let Ty::Enum(id) = self.types.of(scrutinee.id) else {
+                    unreachable!("sema rejects a variant pattern on anything but an enum");
+                };
+                self.table.enum_info(id).tag(variant).expect("sema rejects an unknown variant")
+            }
+            Pattern::Int(v) => *v,
+            Pattern::Char(c) => i64::from(u32::from(*c)),
+            Pattern::Bool(v) => i64::from(*v),
+            Pattern::Str(_) => unreachable!("handled above"),
+            // A catch-all is the last arm, and the last arm is the one control
+            // simply runs into — so nothing ever asks it a question.
+            Pattern::Wildcard => unreachable!("sema puts `_` last, where nothing is tested"),
         };
-        self.table.enum_info(id).tag(&arm.variant).expect("sema rejects an unknown variant")
+        let dst = self.fresh_temp();
+        self.emit(Instr::Cmp { op: CmpOp::Eq, dst, lhs: value, rhs: Value::Const(wanted) });
+        Value::Reg(dst)
     }
 
     /// Lower a `break` or a `continue`: hand the block it ends to the innermost
@@ -1799,12 +2075,79 @@ impl Lowering<'_> {
         self.expr_into(dst, expr);
         let ty = self.types.of(expr.id);
         if matches!(ty, Ty::List(_)) && !builds_its_own(expr) {
-            let (_, bytes) = self.element_of(ty);
+            let (elem, bytes) = self.element_of(ty);
             self.emit(Instr::RtCall {
                 dst: Some(dst),
                 callee: Runtime::ListClone,
-                args: vec![Value::Reg(dst), Value::Const(i64::from(bytes))],
+                args: vec![
+                    Value::Reg(dst),
+                    Value::Const(i64::from(bytes)),
+                    // The elements are copies too. If one of them holds a list
+                    // of its own, copying its bytes shared that list, and the
+                    // clone has to go one level further in.
+                    Value::Const(i64::from(self.table.holds_a_list(elem))),
+                ],
             });
+        }
+    }
+
+    /// `s = s + a + b + …` taken apart into the pieces to add, in order, for a
+    /// string `s` that [`owned_strings`] proved nothing else can be holding.
+    ///
+    /// The chain matters as much as the single step. `+` leans left, so
+    /// `s = s + string(i) + ","` is `s = ((s + string(i)) + ",")` — its
+    /// outermost operand is not the variable, and matching only `s = s + e`
+    /// would leave the commonest way of building a line quadratic.
+    ///
+    /// The shape has to start at the variable. `s = "a" + s` is not it —
+    /// prepending cannot grow a block where it stands, whatever is known about
+    /// it — and neither is `s = t + e`, which is somebody else's string.
+    ///
+    /// **No piece may mention `s` itself.** Appending them one at a time makes
+    /// the intermediate values visible where the single expression would have
+    /// read the variable once, at the start; `s = s + f(s)` would hand `f` a
+    /// string the original never would.
+    fn append_chain<'e>(&self, name: &str, value: &'e Expr) -> Option<Vec<&'e Expr>> {
+        if !self.owned.contains(name) {
+            return None;
+        }
+        let mut pieces = Vec::new();
+        let mut at = value;
+        while let ExprKind::Bin { op: BinOp::Add, lhs, rhs } = &at.kind {
+            if self.types.of(lhs.id) != Ty::Str {
+                return None;
+            }
+            pieces.push(&**rhs);
+            at = lhs;
+        }
+        let ExprKind::Var(left) = &at.kind else { return None };
+        if left != name || pieces.is_empty() {
+            return None;
+        }
+        if pieces.iter().any(|piece| mentions(piece, name)) {
+            return None;
+        }
+        pieces.reverse();
+        Some(pieces)
+    }
+
+    /// Whether this expression allocates the string it produces *here*, so that
+    /// what it produced is this statement's own and nobody else's.
+    ///
+    /// The narrow question the arena needs in order to hand a block back: a
+    /// temporary built and consumed inside one statement is the one thing the
+    /// bump pointer can safely retract. A literal is deliberately not one — it
+    /// lives in `.data` and there is nothing to retract — and neither is a
+    /// variable, a call, an element or a field, all of which hand on a string
+    /// that already had a name.
+    fn builds_a_temporary(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Bin { op: BinOp::Add, lhs, .. } => self.types.of(lhs.id) == Ty::Str,
+            ExprKind::Convert { to: Prim::Str, .. } => true,
+            ExprKind::Call { name, args, .. } => {
+                name == Builtin::ReadLine.name() && args.is_empty()
+            }
+            _ => false,
         }
     }
 
@@ -1892,6 +2235,17 @@ impl Lowering<'_> {
     fn write_through(&mut self, addr: Value, value: &Expr, room: Room) {
         let ty = self.types.of(value.id);
         if ty.fits_in_a_register() {
+            // A list fits, and is the one thing that fits and can still be
+            // written to — so storing what the expression produced would give
+            // this room a second name for somebody else's elements. The same
+            // reason `keep_into` exists, one indirection further along, and
+            // what makes a list *field* copy like every other field.
+            if matches!(ty, Ty::List(_)) {
+                let held = self.fresh_temp();
+                self.keep_into(held, value);
+                self.emit(Instr::Store { addr, value: Value::Reg(held) });
+                return;
+            }
             let value = self.expr(value);
             self.emit(Instr::Store { addr, value });
             return;
@@ -1917,6 +2271,30 @@ impl Lowering<'_> {
         let src = self.expr(value);
         let bytes = self.table.size_of(ty);
         self.emit(Instr::CopyBytes { dst: addr, src, bytes });
+        self.fixup_after_copy(addr, ty);
+    }
+
+    /// Give a fresh copy its own elements, where what was copied may hold a
+    /// list.
+    ///
+    /// Emitted only where [`TypeTable::holds_a_list`] says it can be needed, so
+    /// a program whose classes hold nothing but numbers and objects carries
+    /// none of this — not the instruction, not the routines, not the word in
+    /// front of its vtables.
+    fn fixup_after_copy(&mut self, at: Value, ty: Ty) {
+        if !self.table.holds_a_list(ty) {
+            return;
+        }
+        // An array was copied whole, so every element of it is a fresh copy.
+        // Anything else is one value.
+        let (count, stride) = match ty {
+            Ty::Array(id) => {
+                let info = self.table.array(id);
+                (i64::from(info.len), self.table.size_of(info.elem))
+            }
+            _ => (1, 0),
+        };
+        self.emit(Instr::Fixup { at, count: Value::Const(count), stride });
     }
 
     /// Put a class's vtable pointer and every field where `at` points.
@@ -2124,10 +2502,7 @@ impl Lowering<'_> {
         match &expr.kind {
             ExprKind::Int(v) => self.emit(Instr::Const { dst, val: *v }),
             ExprKind::Bool(v) => self.emit(Instr::Const { dst, val: i64::from(*v) }),
-            ExprKind::Variant { .. } => {
-                let val = self.variant_tag(expr);
-                self.emit(Instr::Const { dst, val });
-            }
+            ExprKind::Variant { args, .. } => self.variant_into(dst, expr, args),
             // The array's room is reserved first, then filled: an element's
             // value may itself mention the array being built only in ways sema
             // has already ruled out, so the order is not observable.
@@ -2371,10 +2746,19 @@ impl Lowering<'_> {
             ExprKind::Int(v) => Value::Const(*v),
             ExprKind::Bool(v) => Value::Const(i64::from(*v)),
             ExprKind::Var(name) => Value::Reg(self.lookup(name)),
-            // A variant *is* its tag, so it needs no more machinery than an
-            // integer literal does — which is the whole reason a payload-free
-            // enum costs the backend nothing.
-            ExprKind::Variant { .. } => Value::Const(self.variant_tag(expr)),
+            // A variant of an enum that carries nothing anywhere *is* its tag,
+            // so it needs no more machinery than an integer literal does —
+            // which is the whole reason such an enum costs the backend nothing.
+            // One that carries something has to be built, and building takes a
+            // register to build into.
+            ExprKind::Variant { .. } if !self.is_boxed_enum(self.types.of(expr.id)) => {
+                Value::Const(self.variant_tag(expr))
+            }
+            ExprKind::Variant { args, .. } => {
+                let dst = self.fresh_temp();
+                self.variant_into(dst, expr, args);
+                Value::Reg(dst)
+            }
             // A length is a fact about a type, so it is a constant here and
             // costs nothing at all — `i < len(xs)` compares against a literal.
             ExprKind::Char(c) => Value::Const(i64::from(*c as u32)),
@@ -2501,6 +2885,11 @@ impl Lowering<'_> {
             if let PrintPart::Value(expr) | PrintPart::Spec { expr, .. } = part {
                 let ty = self.types.of(expr.id);
                 let val = self.expr(expr);
+                // What an enum prints is the *name* of its variant, which the
+                // backend looks up by tag. A boxed one is a pointer, so the tag
+                // is read here — and the backend goes on doing exactly what it
+                // did, with the number it always expected.
+                let val = self.tag_of(ty, val);
                 written.push(Instr::Print { ty, val, newline: false });
             }
         }
@@ -2592,6 +2981,325 @@ impl Lowering<'_> {
 /// The three that do are the two literals and a call, which fills room the
 /// caller reserved for it. Everything else — a variable, a field, an element —
 /// points at somebody's else's, so assigning it means copying.
+/// The string variables of one function that **nothing else can be holding**.
+///
+/// A string is read-only, so sharing one is free and the compiler has never had
+/// to ask this before: two names for the same characters cannot be told apart.
+/// One operation would tell them apart, and it is the one worth having —
+/// growing a string *where it stands*, which bumps a count at `[p-8]` that
+/// every other name for it can see.
+///
+/// So this asks the narrow question that makes that operation safe, and asks it
+/// the cautious way round: a name is owned only if it can be *proved* to be,
+/// and anything the analysis does not recognise means no. Being wrong in the
+/// permissive direction would be memory corruption; being wrong in the strict
+/// direction costs a program the optimisation it would have got.
+///
+/// A name is owned when all of this holds:
+///
+/// * It is a **local**, not a parameter — a parameter is a string the caller
+///   still holds — and it is declared exactly once in the function, so the name
+///   cannot mean two different variables in two blocks.
+/// * Every value it is ever given is **freshly built**: a concat, a conversion,
+///   a `read_line`. A literal counts too, and is the reason the runtime keeps a
+///   check of its own: a literal lives in `.data`, which is not the arena, so
+///   the in-place path simply never fires for one.
+/// * It is never **kept** anywhere else: not assigned to another variable, not
+///   passed to a function, not returned, not put in a list, an array or a
+///   field. Reading it — its length, one of its characters, printing it,
+///   comparing it, joining it to something — is not keeping it.
+///
+/// What this is *not* is ownership in the type system. Nothing about the
+/// language changes, no program is refused that was not refused before, and a
+/// name that fails any of these tests simply gets the code it got yesterday.
+fn owned_strings(function: &FnDecl, types: &Types) -> HashSet<String> {
+    let mut facts = Owned {
+        types,
+        declared: HashMap::new(),
+        fresh: HashMap::new(),
+        escaped: HashSet::new(),
+    };
+    // A parameter is the caller's, whatever the body does with it.
+    for param in &function.params {
+        facts.escaped.insert(param.name.clone());
+    }
+    facts.block(&function.body);
+
+    facts
+        .declared
+        .iter()
+        .filter(|(name, times)| {
+            // Declared once, so the name means one variable everywhere.
+            **times == 1
+                && facts.fresh.get(*name).copied().unwrap_or(false)
+                && !facts.escaped.contains(*name)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The sweep [`owned_strings`] is made of.
+struct Owned<'a> {
+    types: &'a Types,
+    /// How many times each name is declared, so shadowing can be ruled out.
+    declared: HashMap<String, usize>,
+    /// Whether every value the name has been given so far was freshly built.
+    fresh: HashMap<String, bool>,
+    /// Names whose *pointer* reaches somewhere that outlives the read.
+    escaped: HashSet<String>,
+}
+
+impl Owned<'_> {
+    fn block(&mut self, block: &AstBlock) {
+        for stmt in &block.stmts {
+            self.stmt(stmt);
+        }
+    }
+
+    fn stmt(&mut self, stmt: &Stmt) {
+        match stmt {
+            Stmt::Decl { id, name, init, .. } => {
+                *self.declared.entry(name.clone()).or_insert(0) += 1;
+                let fresh = self.types.of(*id) == Ty::Str && self.is_fresh(init);
+                let entry = self.fresh.entry(name.clone()).or_insert(true);
+                *entry &= fresh;
+                self.expr(init, Kept::Yes);
+            }
+            Stmt::Assign { target, value } => {
+                if let Place::Var { name, .. } = target {
+                    let fresh = self.types.of(value.id) == Ty::Str && self.is_fresh(value);
+                    let entry = self.fresh.entry(name.clone()).or_insert(true);
+                    *entry &= fresh;
+                } else {
+                    self.place(target);
+                }
+                self.expr(value, Kept::Yes);
+            }
+            // What is pushed is kept by the list; where it is pushed is a place.
+            Stmt::Push { target, value, .. } => {
+                self.place(target);
+                self.expr(value, Kept::Yes);
+            }
+            // Handed outward, so whoever called this function keeps it.
+            Stmt::Return { value, .. } => {
+                if let Some(value) = value {
+                    self.expr(value, Kept::Yes);
+                }
+            }
+            Stmt::Print { parts, .. } => {
+                for part in parts {
+                    match part {
+                        PrintPart::Text(_) => {}
+                        PrintPart::Value(expr) | PrintPart::Spec { expr, .. } => {
+                            self.expr(expr, Kept::No)
+                        }
+                    }
+                }
+            }
+            Stmt::If { cond, then_block, else_block } => {
+                self.expr(cond, Kept::No);
+                self.block(then_block);
+                if let Some(block) = else_block {
+                    self.block(block);
+                }
+            }
+            Stmt::While { cond, body } => {
+                self.expr(cond, Kept::No);
+                self.block(body);
+            }
+            Stmt::For { init, cond, step, body } => {
+                self.stmt(init);
+                self.expr(cond, Kept::No);
+                self.stmt(step);
+                self.block(body);
+            }
+            Stmt::Match(expr) | Stmt::Call(expr) => self.expr(expr, Kept::No),
+            Stmt::Break { .. } | Stmt::Continue { .. } => {}
+        }
+    }
+
+    /// The index expressions inside a place, which are read and nothing more.
+    fn place(&mut self, place: &Place) {
+        match place {
+            Place::Var { .. } => {}
+            Place::Element { base, index, .. } => {
+                self.place(base);
+                self.expr(index, Kept::No);
+            }
+            Place::Field { base, .. } => self.place(base),
+        }
+    }
+
+    /// Walk an expression, knowing whether the value it produces is kept.
+    ///
+    /// The recursion is where the whole judgement lives: `y = x` keeps `x`,
+    /// while `y = x + "!"` does not — the concat reads `x` and builds something
+    /// else. So an operator passes [`Kept::No`] down to its operands, and
+    /// anything that stores a value away passes [`Kept::Yes`].
+    ///
+    /// Every shape that could keep a value is listed. A shape this does not
+    /// recognise cannot arise, but if one ever did, the wildcard treats its
+    /// children as kept — the cautious answer.
+    fn expr(&mut self, expr: &Expr, kept: Kept) {
+        match &expr.kind {
+            ExprKind::Var(name) => {
+                if matches!(kept, Kept::Yes) {
+                    self.escaped.insert(name.clone());
+                }
+            }
+            // A string operator reads its operands and allocates its answer.
+            ExprKind::Bin { lhs, rhs, .. } | ExprKind::Cmp { lhs, rhs, .. } => {
+                self.expr(lhs, Kept::No);
+                self.expr(rhs, Kept::No);
+            }
+            ExprKind::Logic { lhs, rhs, .. } => {
+                self.expr(lhs, Kept::No);
+                self.expr(rhs, Kept::No);
+            }
+            ExprKind::Neg(inner) | ExprKind::Not(inner) => self.expr(inner, Kept::No),
+            ExprKind::Len { array, .. } => self.expr(array, Kept::No),
+            ExprKind::Index { array, index } => {
+                self.expr(array, Kept::No);
+                self.expr(index, Kept::No);
+            }
+            // A conversion builds a new value out of what it reads.
+            ExprKind::Convert { value, .. } => self.expr(value, Kept::No),
+            // A callee may keep anything it is handed, and there is no
+            // whole-program analysis here to say otherwise.
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.expr(arg, Kept::Yes);
+                }
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.expr(receiver, Kept::Yes);
+                for arg in args {
+                    self.expr(arg, Kept::Yes);
+                }
+            }
+            // Both put what they are given *into* something that outlives the
+            // expression.
+            ExprKind::Array { elements, .. } => {
+                for element in elements {
+                    self.expr(element, Kept::Yes);
+                }
+            }
+            ExprKind::New { fields, .. } => {
+                for field in fields {
+                    self.expr(&field.value, Kept::Yes);
+                }
+            }
+            // A match hands its arm's value on as its own, so the arms inherit
+            // whatever was asked of the match. The scrutinee is only compared.
+            ExprKind::Match { scrutinee, arms, .. } => {
+                self.expr(scrutinee, Kept::No);
+                for arm in arms {
+                    match &arm.body {
+                        ArmBody::Value(value) => self.expr(value, kept),
+                        ArmBody::Block(block) => self.block(block),
+                    }
+                }
+            }
+            ExprKind::Field { object, .. } => self.expr(object, Kept::No),
+            ExprKind::Int(_)
+            | ExprKind::Str(_)
+            | ExprKind::Char(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Variant { .. } => {}
+        }
+    }
+
+    /// Whether this expression *builds* the string it produces, rather than
+    /// handing on one that already existed somewhere.
+    ///
+    /// Every routine named here allocates a block of its own and gives it to
+    /// nobody else. A literal is not built at all, and is included for a
+    /// different reason: it lives in `.data`, so the in-place path cannot fire
+    /// for it and there is nothing to be wrong about.
+    fn is_fresh(&self, expr: &Expr) -> bool {
+        match &expr.kind {
+            // `a + b` on strings, which is a `concat` and allocates.
+            ExprKind::Bin { op: BinOp::Add, lhs, .. } => self.types.of(lhs.id) == Ty::Str,
+            // `string(n)`, `string(c)` and `string(cs)` all allocate; the
+            // conversions that do not produce a string never reach here.
+            ExprKind::Convert { to: Prim::Str, .. } => true,
+            ExprKind::Str(_) => true,
+            // `read_line()` seals a fresh list of characters into a string. Its
+            // name cannot mean anything else — `sema` refuses to let a program
+            // redefine a built-in.
+            ExprKind::Call { name, args, .. } => {
+                name == Builtin::ReadLine.name() && args.is_empty()
+            }
+            // A match is fresh when every arm is. Anything else — a variable, a
+            // call, an element, a field — hands on a string that already had a
+            // name somewhere.
+            ExprKind::Match { arms, .. } => arms.iter().all(|arm| match &arm.body {
+                ArmBody::Value(value) => self.is_fresh(value),
+                ArmBody::Block(_) => false,
+            }),
+            _ => false,
+        }
+    }
+}
+
+/// Whether the value an expression produces is stored somewhere that outlives
+/// the expression itself.
+#[derive(Clone, Copy)]
+enum Kept {
+    Yes,
+    No,
+}
+
+/// Whether this expression reads the variable `name` anywhere inside it.
+///
+/// Asked by [`Lowering::append_chain`], which turns one expression into several
+/// statements and so has to be sure nothing in it could tell the difference.
+/// The one shape not walked is a block arm, which is answered `true` without
+/// looking: it may hold statements, and the cautious answer costs nothing but
+/// an optimisation.
+fn mentions(expr: &Expr, name: &str) -> bool {
+    let mut found = false;
+    let mut visit = |e: &Expr| found |= mentions(e, name);
+    match &expr.kind {
+        ExprKind::Var(other) => return other == name,
+        ExprKind::Int(_)
+        | ExprKind::Str(_)
+        | ExprKind::Char(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Variant { .. } => {}
+        ExprKind::Neg(inner) | ExprKind::Not(inner) => visit(inner),
+        ExprKind::Bin { lhs, rhs, .. }
+        | ExprKind::Cmp { lhs, rhs, .. }
+        | ExprKind::Logic { lhs, rhs, .. } => {
+            visit(lhs);
+            visit(rhs);
+        }
+        ExprKind::Index { array, index } => {
+            visit(array);
+            visit(index);
+        }
+        ExprKind::Len { array, .. } => visit(array),
+        ExprKind::Convert { value, .. } => visit(value),
+        ExprKind::Field { object, .. } => visit(object),
+        ExprKind::Array { elements, .. } => elements.iter().for_each(visit),
+        ExprKind::New { fields, .. } => fields.iter().for_each(|f| visit(&f.value)),
+        ExprKind::Call { args, .. } => args.iter().for_each(visit),
+        ExprKind::MethodCall { receiver, args, .. } => {
+            visit(receiver);
+            args.iter().for_each(visit);
+        }
+        ExprKind::Match { scrutinee, arms, .. } => {
+            visit(scrutinee);
+            let arms_mention = arms.iter().any(|arm| match &arm.body {
+                ArmBody::Value(value) => mentions(value, name),
+                ArmBody::Block(_) => true,
+            });
+            found |= arms_mention;
+        }
+    }
+    found
+}
+
 fn builds_its_own(expr: &Expr) -> bool {
     matches!(
         expr.kind,
@@ -3340,7 +4048,7 @@ mod tests {
         let ir = lower_colour("print(Colour::Red);");
         assert_eq!(ir.table.enums.len(), 1);
         assert_eq!(ir.table.enums[0].name, "Colour");
-        assert_eq!(ir.table.enums[0].variants, vec!["Red", "Green", "Blue"]);
+        assert_eq!(ir.table.enums[0].names(), vec!["Red", "Green", "Blue"]);
     }
 
     // -- negation and remainder --------------------------------------------
@@ -3872,6 +4580,111 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The proof `append` rests on, read off the IR: which shapes get it and
+    /// which fall back to an ordinary join.
+    ///
+    /// The negative half matters more than the positive one. Getting this wrong
+    /// in the permissive direction would lengthen a string somebody else is
+    /// holding — so every one of these is a case the analysis has to refuse.
+    #[test]
+    fn a_string_is_grown_in_place_only_where_nothing_else_can_hold_it() {
+        let grows = |src: &str| {
+            let program = format!(
+                "class Box {{ string text; }}\n\
+                 fn keep(string s) -> string {{ return s; }}\n\
+                 fn main() {{\n{src}\n}}\n"
+            );
+            routines(&lower_src(&program)).contains(&Runtime::Append)
+        };
+
+        // The shape it exists for, and the chain that is how a line is written.
+        assert!(grows("string s = \"\";\ns = s + \"x\";\nprint(s);"));
+        assert!(grows("string s = \"\";\ns = s + string(1) + \",\";\nprint(s);"));
+        // Built by a conversion or by reading, which are blocks of their own.
+        assert!(grows("string s = string(1);\ns = s + \"x\";\nprint(s);"));
+
+        // Another name for it, taken anywhere in the function — before or
+        // after, since the analysis is not a flow one and does not pretend to
+        // be.
+        assert!(!grows("string s = \"a\";\nstring t = s;\ns = s + \"x\";\nprint(t);"));
+        assert!(!grows("string s = \"a\";\ns = s + \"x\";\nstring t = s;\nprint(t);"));
+        // Handed to a function, put in a list, put in an object, returned.
+        assert!(!grows("string s = \"a\";\nprint(keep(s));\ns = s + \"x\";"));
+        assert!(!grows(
+            "string s = \"a\";\nstring[] all = [];\npush(all, s);\ns = s + \"x\";\nprint(s);"
+        ));
+        assert!(!grows(
+            "string s = \"a\";\nBox b = Box { text: s };\ns = s + \"x\";\nprint(b.text);"
+        ));
+        // Given a value that already had a name.
+        assert!(!grows(
+            "string o = \"a\" + \"b\";\nstring s = o;\ns = s + \"x\";\nprint(s);"
+        ));
+        // Given the answer of a call, which may be anybody's.
+        assert!(!grows("string s = keep(\"a\");\ns = s + \"x\";\nprint(s);"));
+        // Prepending cannot grow a block where it stands.
+        assert!(!grows("string s = \"a\";\ns = \"x\" + s;\nprint(s);"));
+        // A piece that reads the variable: appending one at a time would let
+        // the second piece see what the first one wrote.
+        assert!(!grows(
+            "string s = \"a\";\ns = s + string(len(s)) + \"!\";\nprint(s);"
+        ));
+
+        // A parameter is the caller's string, whatever the body does with it.
+        let ir = lower_src(
+            "fn grow(string s) -> string {\n  s = s + \"x\";\n  return s;\n}\n\
+             fn main() {\n  print(grow(\"a\"));\n}\n",
+        );
+        assert!(!routines(&ir).contains(&Runtime::Append), "{}", ir.dump());
+    }
+
+    /// A copy is only followed by a fix-up where the type says one can be
+    /// needed, so a program whose classes hold nothing but numbers carries
+    /// none of the machinery.
+    #[test]
+    fn only_a_copy_that_can_share_is_followed_by_a_fixup() {
+        let fixups = |ir: &Program| {
+            ir.functions
+                .iter()
+                .flat_map(|f| &f.blocks)
+                .flat_map(|b| &b.instrs)
+                .filter(|i| matches!(i, Instr::Fixup { .. }))
+                .count()
+        };
+
+        // Nothing in a `Point` is anybody else's, so its bytes are the whole
+        // of it.
+        let plain = lower_src(
+            "class Point { int x; }\n\
+             fn main() {\n  Point a = Point { x: 1 };\n  Point b = a;\n  print(b.x);\n}\n",
+        );
+        assert_eq!(fixups(&plain), 0, "{}", plain.dump());
+
+        // A list field, and the copy has to be told to go and get its own.
+        let sharing = lower_src(
+            "class Bag { int[] items; }\n\
+             fn main() {\n  Bag a = Bag { items: [1] };\n  Bag b = a;\n  \
+             print(len(b.items));\n}\n",
+        );
+        assert_eq!(fixups(&sharing), 1, "{}", sharing.dump());
+
+        // An array of them is one fix-up over the run rather than one each:
+        // the copy was one `CopyBytes`, and this is its other half.
+        let array = lower_src(
+            "class Bag { int[] items; }\n\
+             fn main() {\n  Bag[2] a = [Bag { items: [1] }, Bag { items: [2] }];\n  \
+             Bag[2] b = a;\n  print(len(b[0].items));\n}\n",
+        );
+        let run = instrs(&array)
+            .into_iter()
+            .find_map(|i| match i {
+                Instr::Fixup { count, stride, .. } => Some((*count, *stride)),
+                _ => None,
+            })
+            .expect("the array copy has one");
+        assert_eq!(run, (Value::Const(2), 16), "two objects, sixteen bytes apart");
     }
 
     #[test]

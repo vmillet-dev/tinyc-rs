@@ -81,15 +81,26 @@ impl Platform for Linux {
     /// no console API here, a terminal is a file — except the four calls it
     /// takes to find out where the stack ends.
     fn externs(&self, used: &Used) -> Vec<&'static str> {
-        match used.checks_stack {
-            true => vec![
+        let mut names = Vec::new();
+        if used.writes_text() {
+            // A real exported variable here, holding the `FILE*` — which is
+            // the whole of the difference from Windows.
+            names.push("stdout");
+        }
+        if used.checks_stack {
+            names.extend([
                 "pthread_self",
                 "pthread_getattr_np",
                 "pthread_attr_getstack",
                 "pthread_attr_destroy",
-            ],
-            false => Vec::new(),
+            ]);
         }
+        names
+    }
+
+    /// `stdout` is a variable holding the stream, so reaching it is one load.
+    fn stdout_stream(&self, asm: &mut Asm) {
+        asm.asm(&format!("mov  {RAX}, [stdout]"));
     }
 
     /// A terminal on Linux carries UTF-8 because the locale says so, and the

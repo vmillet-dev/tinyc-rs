@@ -6,9 +6,12 @@ use crate::ir::Program;
 use super::asm::Asm;
 use super::runtime::{
     ABORTS, ARENA_CHUNK, ARENA_END, ARENA_NEXT, FIRST_READ, INPUT, INPUT_BYTES, INPUT_DONE,
-    INPUT_LEN, INPUT_POS, SCRATCH, SCRATCH_CAP, STACK_LIMIT,
+    INPUT_LEN, INPUT_POS, SCRATCH, SCRATCH_CAP, STACK_LIMIT, STDOUT,
 };
-use super::used::{Used, enum_table, enum_variant_text, text_label, vtable_label};
+use super::used::{
+    Used, enum_table, enum_variant_text, fixup_label, text_label, variant_value, vtable_header,
+    vtable_label,
+};
 use super::{ENTRY_POINT, Platform, symbol};
 
 /// The format strings `printf` is handed, and the two words a `bool` prints as.
@@ -45,7 +48,16 @@ pub fn header(asm: &mut Asm, platform: &dyn Platform, used: &Used) {
     asm.blank();
 
     // What every C library provides, under the name every C library uses.
-    asm.line("extern printf");
+    if used.needs_printf() {
+        asm.line("extern printf");
+    }
+    if used.writes_text() {
+        // Everything the language writes goes out by *length*, and `fwrite` is
+        // the one C library call that takes one and still shares `printf`'s
+        // buffered stream — so a program that writes both still comes out in
+        // the order it was written. See `runtime::WRITE_TEXT`.
+        asm.line("extern fwrite");
+    }
     if used.aborts {
         // Reporting a runtime failure needs a stream the compiler can write to
         // without a `FILE*`, and a way out that skips the rest of the program.
@@ -83,7 +95,11 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     if used.prints(Ty::Int) {
         asm.asm(&format!("{FMT_INT}: db \"%lld\", 0"));
     }
-    if used.needs_str_format() {
+    // Only an enum still goes out through `%s`: its variants' names are bytes
+    // the compiler wrote, so it can promise there is no NUL among them. A
+    // string and a character can promise no such thing and are written by
+    // length instead.
+    if used.prints_enum() {
         asm.asm(&format!("{FMT_STR}: db \"%s\", 0"));
     }
     if used.prints(Ty::Bool) {
@@ -95,7 +111,9 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
         asm.asm(&format!("{BOOL_FALSE}: db \"false\", 0"));
     }
     // The same three, ending the line, and only the ones a `println` reaches.
-    for (ty, format) in [(Ty::Int, FMT_INT), (Ty::Str, FMT_STR), (Ty::Bool, FMT_BOOL)] {
+    for (ty, format) in
+        [(Ty::Int, FMT_INT), (Ty::Enum(EnumId(0)), FMT_STR), (Ty::Bool, FMT_BOOL)]
+    {
         if used.ends_a_line(ty) {
             let spec = match ty {
                 Ty::Int => "%lld",
@@ -104,8 +122,9 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
             asm.asm(&format!("{}: db \"{spec}\", 10, 0", line_format(format)));
         }
     }
+    // No NUL: this is written by length like every other run of bytes.
     if used.writes_a_bare_newline() {
-        asm.asm(&format!("{NEWLINE}: db 10, 0"));
+        asm.asm(&format!("{NEWLINE}: db 10"));
     }
     // One method table per class that a `New` builds. Its entries are settled
     // at compile time — a subclass's table is its base's with the overridden
@@ -115,9 +134,20 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
         if !used.vtables[index] {
             continue;
         }
+        let id = ClassId(index as u32);
         let entries: Vec<String> =
             slots.iter().map(|&at| symbol(&program.function(at).name)).collect();
-        let label = vtable_label(ClassId(index as u32));
+        let label = vtable_label(id);
+        // The word in front of the slots: what a fresh copy of this class has
+        // to be given of its own, or zero when a copy of it shares nothing.
+        // Everything that reads it reaches it as `[vptr-8]`, so it has to be
+        // laid down immediately before — and eight-aligned, like the slots.
+        let owns = match used.owns_elements(&program.table, id) {
+            true => fixup_label(id),
+            false => "0".to_string(),
+        };
+        asm.asm("align 8");
+        asm.asm(&format!("{}: dq {owns}", vtable_header(id)));
         match entries.is_empty() {
             // NASM needs something to put there, and nothing will read it.
             true => asm.asm(&format!("{label}: dq 0    ; {} has no methods", label)),
@@ -127,13 +157,33 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     // One table per printed enum: the variant names, and the array of pointers
     // a tag indexes. A tag can only have come from a variant of this very enum,
     // so the index is in range by construction and needs no check.
+    // A boxed enum's variants are pointers, so one that carries nothing still
+    // has to *be* one. Its value never changes, so it is written down once
+    // rather than allocated afresh at every mention.
+    for (index, info) in program.table.enums.iter().enumerate() {
+        if !used.variant_values[index] {
+            continue;
+        }
+        let id = EnumId(index as u32);
+        for (tag, variant) in info.variants.iter().enumerate() {
+            if variant.payload.is_empty() {
+                asm.asm("align 8");
+                asm.asm(&format!(
+                    "{}: dq {tag}    ; {}::{}",
+                    variant_value(id, tag),
+                    info.name,
+                    variant.name
+                ));
+            }
+        }
+    }
     for (index, info) in program.table.enums.iter().enumerate() {
         if !used.enums[index] {
             continue;
         }
         let id = EnumId(index as u32);
         for (tag, variant) in info.variants.iter().enumerate() {
-            asm.asm(&format!("{}: db {}, 0", enum_variant_text(id, tag), bytes_of(variant)));
+            asm.asm(&format!("{}: db {}, 0", enum_variant_text(id, tag), bytes_of(&variant.name)));
         }
         let entries: Vec<String> =
             (0..info.variants.len()).map(|tag| enum_variant_text(id, tag)).collect();
@@ -149,8 +199,12 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     // encodes it, counts it or copies it — which is the whole reason the words
     // around a format's specifiers are not string literals by the time they
     // reach here.
+    //
+    // No NUL, and no need of one: how many bytes there are was counted while
+    // the program was compiled, and it is that count the write is given. It is
+    // also what lets a literal hold a `\0` of its own.
     for (index, text) in program.texts.iter().enumerate() {
-        asm.asm(&format!("{}: db {}, 0    ; {:?}", text_label(index), bytes_of(text), text));
+        asm.asm(&format!("{}: db {}    ; {:?}", text_label(index), bytes_of(text), text));
     }
     // A literal is laid out exactly as a string built at run time is: the
     // character count in the eight bytes before the characters, and the
@@ -175,8 +229,17 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     // Uninitialised, so the arena's bookkeeping costs nothing in the file: a
     // next pointer and an end pointer that start equal at zero, which is what
     // sends the very first allocation to ask for a chunk.
-    if used.allocates() || used.print_str || used.reads_text() || used.checks_stack {
+    if used.allocates()
+        || used.print_str
+        || used.reads_text()
+        || used.checks_stack
+        || used.writes_text()
+    {
         asm.line("section .bss");
+        // The stream every write goes to, asked for on the first one and kept.
+        if used.writes_text() {
+            asm.asm(&format!("{STDOUT}: resq 1"));
+        }
         // Where the stack ends, worked out once by the entry point. Zero until
         // then, and a zero can never fire the check — which is exactly what the
         // entry point's own prologue needs, since it runs before the answer

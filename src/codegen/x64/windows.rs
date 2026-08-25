@@ -76,6 +76,10 @@ impl Platform for Windows {
         let mut names = Vec::new();
         if used.writes_text() {
             names.push("SetConsoleOutputCP");
+            // The UCRT has no `stdout` variable to load: the macro every C
+            // program writes expands to this call, and this is the only way to
+            // reach the same `FILE*` `printf` writes to.
+            names.push("__acrt_iob_func");
         }
         if used.checks_stack {
             // Where this thread's stack ends. Windows 8 and later; nothing
@@ -88,6 +92,13 @@ impl Platform for Windows {
             names.extend(["GetStdHandle", "GetConsoleMode", "ReadConsoleW", "WideCharToMultiByte"]);
         }
         names
+    }
+
+    /// `stdout` is a macro here, not a symbol: it expands to the first entry of
+    /// a table the runtime owns, reached through this call.
+    fn stdout_stream(&self, asm: &mut Asm) {
+        asm.asm(&format!("mov  {}, 1    ; stdout is stream 1", ABI.arg(0)));
+        asm.asm("call __acrt_iob_func");
     }
 
     fn entry_setup(&self, asm: &mut Asm, used: &Used) {

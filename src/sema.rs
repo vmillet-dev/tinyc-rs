@@ -24,7 +24,9 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::{
     ArmBody, ArrayId, ArrayInfo, BinOp, Block, Builtin, ClassId, ClassInfo, EnumId, EnumInfo, Expr,
     ListId, Shape,
-    ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Place, Prim, PrintPart,
+    ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Pattern, Place, Prim,
+    VariantInfo,
+    PrintPart,
     Program, Spec, Stmt, Ty, TypeRef, TypeTable, is_scalar_value,
 };
 use crate::diag::{Diagnostic, Result, Span};
@@ -174,9 +176,15 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
 
         // Variants are named within their own enum, so two enums may both have
         // a `Red` — but one enum may not have two.
-        let mut variants: Vec<String> = Vec::new();
+        //
+        // What a variant *carries* is left until later: a payload may name a
+        // class, and no class has been registered yet. Nothing in this pass
+        // depends on it — an enum is one pointer or one tag whatever it
+        // carries — so the two questions come apart cleanly. See
+        // [`resolve_payloads`].
+        let mut variants: Vec<VariantInfo> = Vec::new();
         for variant in &declaration.variants {
-            if variants.contains(&variant.name) {
+            if variants.iter().any(|v| v.name == variant.name) {
                 errors.push(
                     Diagnostic::new(
                         format!("`{}` is declared twice in `{}`", variant.name, declaration.name),
@@ -186,7 +194,7 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
                 );
                 continue;
             }
-            variants.push(variant.name.clone());
+            variants.push(VariantInfo { name: variant.name.clone(), payload: Vec::new() });
         }
 
         if let Some(previous) = enums.type_named(&declaration.name) {
@@ -201,6 +209,55 @@ fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
     }
 
     enums
+}
+
+/// Pass 0c: what each variant carries, now that every type has a name.
+///
+/// Split from [`collect_enums`] because a payload may name a class, and
+/// classes are registered after enums are. Nothing in between needs the answer:
+/// a value of an enum is one pointer when the enum carries anything and one tag
+/// when it does not, and neither number depends on *what* is carried.
+///
+/// Every payload type has to fit in a register. An object or an array would
+/// have to live inside the value, which would give an enum a size — the biggest
+/// of its variants — and pull it into the containment ordering that classes
+/// already need. A list is allowed and costs nothing extra, because an enum is
+/// read-only: what goes in is copied in, what comes out of a pattern is copied
+/// out, and there is no third way to reach it.
+fn resolve_payloads(program: &Program, declared: &mut Declared, errors: &mut Vec<Diagnostic>) {
+    for declaration in &program.enums {
+        let Some(id) = declared.enum_id(&declaration.name) else { continue };
+        // A name declared twice kept only its first enum, whose variants are
+        // the ones in the table. Line the two up by name rather than by
+        // position, so a duplicate variant cannot shift everything after it.
+        for variant in &declaration.variants {
+            let mut payload = Vec::new();
+            for written in &variant.payload {
+                let Some(ty) = resolve_type(declared, written, errors) else { continue };
+                if !ty.fits_in_a_register() {
+                    errors.push(
+                        Diagnostic::new(
+                            format!("a variant cannot carry {}", ty.with_article(&declared.table)),
+                            written.span,
+                        )
+                        .with_label("a payload has to fit in a register")
+                        .with_note(
+                            "an object or an array lives inside the value that holds it, which \
+                             would give this enum a size of its own; a class is what holds one \
+                             of those",
+                            None,
+                        ),
+                    );
+                    continue;
+                }
+                payload.push(ty);
+            }
+            let info = &mut declared.table.enums[id.0 as usize];
+            if let Some(at) = info.variants.iter().position(|v| v.name == variant.name) {
+                info.variants[at].payload = payload;
+            }
+        }
+    }
 }
 
 /// "`X` is already declared", underlining both places.
@@ -230,6 +287,33 @@ const VPTR_SIZE: u32 = 8;
 /// The limit is what turns that into a diagnostic rather than a crash in a
 /// program that compiled. A list is what holds a quantity the frame cannot.
 pub const MAX_OBJECT_BYTES: u32 = 64 * 1024;
+
+/// What a `match` may ask of its scrutinee, and when the arms are complete.
+///
+/// The two shapes this covers are the whole of what changes between
+/// `match (colour)` and `match (n)`, and they meet in one struct because
+/// everything *else* about a match — the arms agreeing, a block arm having to
+/// diverge, a duplicate arm never running — is the same question either way.
+struct Domain {
+    /// The values a program could write out, in the order a diagnostic should
+    /// name them. Empty where there are too many to enumerate.
+    names: Vec<String>,
+    /// Whether `_` is allowed. False for exactly one type: a declared enum,
+    /// where writing every variant out *is* the point of the check.
+    catch_all: bool,
+    /// What one of [`Self::names`] is called in a message.
+    noun: &'static str,
+}
+
+/// What one arm's pattern takes out of the domain.
+enum Selected {
+    /// One of the values [`Domain::names`] lists, by position.
+    One(usize),
+    /// One value out of too many to count, identified by the pattern itself.
+    Literal,
+    /// `_`, and so everything the arms before it did not take.
+    Everything,
+}
 
 /// A field whose type is settled but whose place in the object is not yet.
 ///
@@ -327,12 +411,19 @@ fn collect_classes(program: &Program, declared: &mut Declared, errors: &mut Vec<
 
 /// Turn every field's written type into the type it names.
 ///
-/// The one type refused is a list, and the reason is the whole difference
-/// between the two kinds of aggregate. An array or an object lives *inside* the
-/// object that holds it, so copying the outer one copies it too. A list's
-/// elements live in the arena and a field would hold only their address — so
-/// two objects would end up naming one list, and writing through either would
-/// be visible through the other.
+/// Every type is allowed here, a list included — and a list is the one that
+/// costs something. An array or an object lives *inside* the object that holds
+/// it, so copying the outer one copies it whole; a list's elements live in the
+/// arena and the field holds their address, so a byte copy would leave two
+/// objects naming one list. What pays for it is a second step after the bytes:
+/// see [`TypeTable::holds_a_list`] and the fix-up routine the backend emits
+/// from it.
+///
+/// Allowing it is also what makes a class **recursive**. `Node next` is still
+/// refused — a field lives inside the object, so the object would have to be
+/// bigger than itself — but `Node[] kids` does not, because the elements are
+/// not in the object at all. That is the whole of how TinyC gets trees without
+/// a reference type and without `null`.
 fn resolve_fields(
     program: &Program,
     declared: &mut Declared,
@@ -342,23 +433,6 @@ fn resolve_fields(
     for (id, class) in order_of_declarations(program, declared) {
         for field in &class.fields {
             let Some(ty) = resolve_type(declared, &field.ty, errors) else { continue };
-            if matches!(ty, Ty::List(_)) {
-                errors.push(
-                    Diagnostic::new(
-                        format!("a field cannot be {}", ty.with_article(&declared.table)),
-                        field.ty.span,
-                    )
-                    .with_label(
-                        "a list's elements live in the arena, and a field would hold their address",
-                    )
-                    .with_note(
-                        "copying the object would share them rather than copy them — an array \
-                         or another object nests, because it lives inside the object itself",
-                        None,
-                    ),
-                );
-                continue;
-            }
             resolved[id.0 as usize].push(ResolvedField {
                 name: field.name.clone(),
                 name_span: field.name_span,
@@ -848,6 +922,14 @@ fn no_such_member(class: &str, kind: &str, name: &str, at: Span, known: &[&str])
         .with_note(note, None)
 }
 
+/// `1 value` but `2 values` — a count a message can read out loud.
+fn count(n: usize, one: &str, many: &str) -> String {
+    match n {
+        1 => format!("1 {one}"),
+        _ => format!("{n} {many}"),
+    }
+}
+
 /// `A`, `A` and `B`, `A`, `B` and `C` — so a list reads as prose.
 fn list(items: &[&str]) -> String {
     let quoted: Vec<String> = items.iter().map(|item| format!("`{item}`")).collect();
@@ -889,6 +971,8 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
     // Pass 0: the declared types, before anything can mention one.
     let mut declared = collect_enums(program, &mut errors);
     collect_classes(program, &mut declared, &mut errors);
+    // Last of the three, because a payload may name either of the others.
+    resolve_payloads(program, &mut declared, &mut errors);
 
     // Pass 1: every signature, before any body. A method's goes in its class
     // rather than in the program's namespace.
@@ -1554,30 +1638,160 @@ impl<'a, 'c> FnChecker<'a, 'c> {
     ///
     /// Both halves can be wrong independently, and are reported separately: the
     /// enum name underlines one, the variant the other.
-    fn variant(&mut self, name: &str, span: Span, variant: &str, variant_span: Span) -> Ty {
+    fn variant(
+        &mut self,
+        name: &str,
+        span: Span,
+        variant: &str,
+        variant_span: Span,
+        args: &[Expr],
+    ) -> Ty {
         let Some(id) = self.shared.declared.enum_id(name) else {
             self.error(
                 Diagnostic::new(format!("unknown enum `{name}`"), span)
                     .with_label("no enum goes by this name")
                     .with_note("a variant is always written `Enum::Variant`", None),
             );
+            for arg in args {
+                self.expr(arg);
+            }
             return Ty::Int;
         };
 
-        if self.shared.declared.info(id).tag(variant).is_none() {
+        let Some(payload) = self.shared.declared.info(id).variant(variant).map(|v| v.payload.clone())
+        else {
             let info = self.shared.declared.info(id);
-            let known: Vec<&str> = info.variants.iter().map(String::as_str).collect();
+            let known: Vec<&str> = info.names();
             let note = format!("`{name}` has {}", list(&known));
             self.error(
                 Diagnostic::new(format!("`{name}` has no variant `{variant}`"), variant_span)
                     .with_label("not one of its variants")
                     .with_note(note, None),
             );
-        }
-        // Even a misspelt variant has the enum's type: that much was written
-        // down, and reporting the same mistake again as a type error would not
-        // help anybody.
+            for arg in args {
+                self.expr(arg);
+            }
+            // Even a misspelt variant has the enum's type: that much was
+            // written down, and reporting the same mistake again as a type
+            // error would not help anybody.
+            return Ty::Enum(id);
+        };
+
+        self.payload_args(name, variant, variant_span, &payload, args, span);
         Ty::Enum(id)
+    }
+
+    /// Name what a variant carries, for the length of the arm that matched it.
+    ///
+    /// The names are the *arm's* rather than the declaration's — a variant is
+    /// declared positionally, so `Shape::Circle(radius)` and
+    /// `Shape::Circle(r)` are the same pattern spelt for two different readers.
+    /// Each is an ordinary local from here on, with the type the declaration
+    /// gave that position.
+    fn bind_payload(
+        &mut self,
+        enum_name: &str,
+        variant: &str,
+        variant_span: Span,
+        id: EnumId,
+        tag: i64,
+        bindings: &[(String, Span)],
+    ) {
+        let payload = self.shared.declared.info(id).variants[tag as usize].payload.clone();
+        if bindings.len() != payload.len() {
+            let carries = match payload.is_empty() {
+                true => format!("`{enum_name}::{variant}` carries nothing"),
+                false => format!(
+                    "`{enum_name}::{variant}` carries {}",
+                    count(payload.len(), "value", "values")
+                ),
+            };
+            self.error(
+                Diagnostic::new(
+                    format!(
+                        "this arm names {} of what `{enum_name}::{variant}` carries",
+                        count(bindings.len(), "value", "values")
+                    ),
+                    variant_span,
+                )
+                .with_label(carries)
+                .with_note(
+                    "a pattern names every value a variant carries, in order — there is no \
+                     way to leave one out",
+                    None,
+                ),
+            );
+        }
+        for (index, (name, span)) in bindings.iter().enumerate() {
+            // A name with nothing behind it still goes in scope, as an `int`,
+            // so the arm's body does not then report it undeclared as well.
+            let ty = payload.get(index).copied().unwrap_or(Ty::Int);
+            self.declare(name, ty, *span, "a name for what this variant carries");
+        }
+    }
+
+    /// What a variant is given, checked against what it carries.
+    ///
+    /// The same shape as a call's arguments, and deliberately as strict: a
+    /// variant that carries an `int` takes an `int`, and nothing converts on
+    /// the way in.
+    fn payload_args(
+        &mut self,
+        name: &str,
+        variant: &str,
+        variant_span: Span,
+        payload: &[Ty],
+        args: &[Expr],
+        span: Span,
+    ) {
+        if args.len() != payload.len() {
+            // Point at the first argument with nothing to be, or at the
+            // variant itself when there are too few.
+            let at = args.get(payload.len()).map_or(variant_span, |arg| arg.span);
+            let carries = match payload.is_empty() {
+                true => format!("`{name}::{variant}` carries nothing"),
+                false => format!(
+                    "`{name}::{variant}` carries {}",
+                    count(payload.len(), "value", "values")
+                ),
+            };
+            self.error(
+                Diagnostic::new(
+                    format!(
+                        "`{name}::{variant}` was given {}",
+                        count(args.len(), "value", "values")
+                    ),
+                    span,
+                )
+                .with_label(carries)
+                .with_note("a variant takes exactly what it declares, in order", Some(at)),
+            );
+        }
+
+        for (index, arg) in args.iter().enumerate() {
+            let Some(&expected) = payload.get(index) else {
+                self.expr(arg);
+                continue;
+            };
+            let actual = self.value_of_type(arg, expected);
+            if !self.coerces(actual, expected) {
+                self.error(
+                    Diagnostic::new(
+                        format!(
+                            "`{name}::{variant}` carries {} here, but this is {}",
+                            self.ty_article(expected),
+                            self.ty_article(actual)
+                        ),
+                        arg.span,
+                    )
+                    .with_label(format!(
+                        "expected {}, found {}",
+                        self.ty_name(expected),
+                        self.ty_name(actual)
+                    )),
+                );
+            }
+        }
     }
 
     /// Check a `match` and answer the type it produces, or `None` when it
@@ -1597,14 +1811,18 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         let span = *keyword;
 
         let ty = self.expr(scrutinee);
-        let Ty::Enum(id) = ty else {
+        let Some(domain) = self.domain_of(ty) else {
             self.error(
                 Diagnostic::new(
                     format!("cannot match on {}", self.ty_article(ty)),
                     scrutinee.span,
                 )
-                .with_label("a match needs an enum, whose variants can be counted")
-                .with_note("`if` is what asks a question about an int, string or bool", None),
+                .with_label("a match needs a value that can be compared to a pattern")
+                .with_note(
+                    "an enum, an `int`, a `char`, a `string` or a `bool`; a run of values \
+                     and an object are neither",
+                    None,
+                ),
             );
             // The arms are still checked: their own mistakes are worth
             // reporting whatever the scrutinee turned out to be.
@@ -1614,40 +1832,41 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             return None;
         };
 
-        // Where the first arm for each variant was, in declaration order, which
-        // is the order both diagnostics below want to talk about them in.
-        let variants = self.shared.declared.info(id).variants.clone();
-        let mut covered: Vec<Option<Span>> = vec![None; variants.len()];
-
-        // An arm whose pattern named nothing leaves a hole that is not the
-        // program's real mistake. Reporting what it failed to cover on top of
-        // that would be saying the same thing twice, and the derived complaint
-        // sorts ahead of the true one.
+        // An arm whose pattern said nothing usable leaves a hole that is not
+        // the program's real mistake. Reporting what it failed to cover on top
+        // of that would be saying the same thing twice, and the derived
+        // complaint sorts ahead of the true one.
         let mut readable = true;
+        // Where the first arm for each value of a countable domain was, in
+        // declaration order — which is the order the diagnostics below want to
+        // talk about them in.
+        let mut covered: Vec<Option<Span>> = vec![None; domain.names.len()];
+        // Where `_` was, and what it makes of every arm after it.
+        let mut catch_all: Option<Span> = None;
+        // The literal patterns seen so far, for the domains with nothing to
+        // count: two arms saying `3` is the same mistake as two saying `Red`.
+        let mut literals: Vec<(&Pattern, Span)> = Vec::new();
+
         for arm in arms {
-            readable &= self.match_arm(id, arm, &variants, &mut covered);
+            if let Some(previous) = catch_all {
+                self.error(
+                    Diagnostic::new("this arm can never run", arm.span)
+                        .with_label("`_` before it already took everything")
+                        .with_note("the catch-all has to come last", Some(previous)),
+                );
+            }
+            readable &= self.match_arm(
+                ty,
+                &domain,
+                arm,
+                &mut covered,
+                &mut catch_all,
+                &mut literals,
+            );
         }
 
-        let missing: Vec<&str> = variants
-            .iter()
-            .zip(&covered)
-            .filter(|(_, seen)| seen.is_none())
-            .map(|(name, _)| name.as_str())
-            .collect();
-        if !missing.is_empty() && readable {
-            let name = self.ty_name(ty);
-            self.error(
-                Diagnostic::new(
-                    format!("this match does not cover every variant of `{name}`"),
-                    span,
-                )
-                .with_label(format!("{} not handled", missing_verb(&missing)))
-                .with_note(
-                    "every variant needs an arm; TinyC has no catch-all pattern, so that \
-                     adding a variant cannot be quietly ignored",
-                    None,
-                ),
-            );
+        if catch_all.is_none() && readable {
+            self.report_gaps(ty, &domain, span, &covered);
         }
 
         self.match_value(span, arms, as_statement)
@@ -2095,9 +2314,13 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         let mut readable = true;
 
         for field in fields {
-            let actual = self.expr(&field.value);
+            // Which field this is has to be settled *before* its value is
+            // checked, because one value cannot say what it is on its own:
+            // `[]` is an empty list of whatever was asked for, and what asked
+            // here is the field. See `value_of_type`.
             let Some(at) = declared.iter().position(|f| f.name == field.name) else {
                 readable = false;
+                self.expr(&field.value);
                 let known: Vec<&str> = declared.iter().map(|f| f.name.as_str()).collect();
                 let at = field.name_span;
                 self.error(no_such_member(class, "field", &field.name, at, &known));
@@ -2105,6 +2328,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             };
 
             if let Some(previous) = given[at] {
+                self.expr(&field.value);
                 self.error(
                     Diagnostic::new(format!("`{}` is given twice", field.name), field.name_span)
                         .with_label("a field takes one value")
@@ -2115,6 +2339,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             given[at] = Some(field.name_span);
 
             let expected = declared[at].ty;
+            let actual = self.value_of_type(&field.value, expected);
             if !self.coerces(actual, expected) {
                 self.error(
                     Diagnostic::new(
@@ -2406,7 +2631,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             let ArmBody::Block(block) = &arm.body else { continue };
             if !diverges(block) {
                 self.error(
-                    Diagnostic::new("this arm produces no value", arm.variant_span)
+                    Diagnostic::new("this arm produces no value", arm.span)
                         .with_label("but the match it belongs to is used as one")
                         .with_note(
                             "an arm is either an expression, or a block that returns, \
@@ -2430,67 +2655,247 @@ impl<'a, 'c> FnChecker<'a, 'c> {
         Some(produced.map_or(Ty::Int, |(ty, _)| ty))
     }
 
-    /// One arm: it must name the scrutinee's enum, name a variant of it, and be
-    /// the first arm to do so.
+    /// What a value of `ty` can be matched against, or `None` when nothing can.
     ///
-    /// Answers whether the pattern named a variant at all — a duplicate still
-    /// did, and so still says something about coverage.
-    fn match_arm(
-        &mut self,
-        id: EnumId,
-        arm: &MatchArm,
-        variants: &[String],
-        covered: &mut [Option<Span>],
-    ) -> bool {
-        // Always check the body, whatever the pattern turns out to be.
-        let pattern = self.arm_tag(id, arm, variants);
-        self.arm_body(&arm.body);
-
-        let Some(tag) = pattern else { return false };
-        let at = tag as usize;
-        if let Some(previous) = covered[at] {
-            self.error(
-                Diagnostic::new(
-                    format!("`{}` is already covered", variants[at]),
-                    arm.variant_span,
-                )
-                .with_label("this arm can never run")
-                .with_note("covered here", Some(previous)),
-            );
-            return true;
+    /// Two shapes of answer, and the difference is the whole of what changes
+    /// between `match (colour)` and `match (n)`. An enum and a `bool` have a
+    /// list of values a program could write out, so a match on one is complete
+    /// when it has written them all out. An `int`, a `char` and a `string` do
+    /// not, so a match on one is complete only with a `_`.
+    fn domain_of(&self, ty: Ty) -> Option<Domain> {
+        match ty {
+            Ty::Enum(id) => Some(Domain {
+                names: self.shared.declared.info(id).names().iter().map(|n| n.to_string()).collect(),
+                // Writing out every variant is exactly what the check is for.
+                catch_all: false,
+                noun: "variant",
+            }),
+            // `false` is 0 and `true` is 1, which is also how they are stored.
+            Ty::Bool => Some(Domain {
+                names: vec!["false".to_string(), "true".to_string()],
+                catch_all: true,
+                noun: "value",
+            }),
+            Ty::Int | Ty::Char | Ty::Str => {
+                Some(Domain { names: Vec::new(), catch_all: true, noun: "value" })
+            }
+            // A run of values and an object cannot even be compared for
+            // equality, so there is nothing a pattern could ask of one.
+            Ty::Array(_) | Ty::List(_) | Ty::Class(_) => None,
         }
-        covered[at] = Some(arm.variant_span);
+    }
+
+    /// One arm: its pattern has to be about the scrutinee's type, and has to be
+    /// the first arm to select what it selects.
+    ///
+    /// Answers whether the pattern said something usable about coverage — a
+    /// duplicate still did, a mistyped one did not.
+    fn match_arm<'p>(
+        &mut self,
+        ty: Ty,
+        domain: &Domain,
+        arm: &'p MatchArm,
+        covered: &mut [Option<Span>],
+        catch_all: &mut Option<Span>,
+        literals: &mut Vec<(&'p Pattern, Span)>,
+    ) -> bool {
+        // Always check the body, whatever the pattern turns out to be. What a
+        // pattern binds is in scope for exactly that body, so the arm gets a
+        // scope of its own — which is also what lets two arms use one name for
+        // quite different things.
+        self.scopes.push(HashMap::new());
+        let selected = self.arm_pattern(ty, domain, arm);
+        self.arm_body(&arm.body);
+        self.scopes.pop();
+
+        let Some(selected) = selected else { return false };
+        match selected {
+            // One of a countable set: recorded by position, so what is left
+            // over can be named in declaration order.
+            Selected::One(at) => {
+                if let Some(previous) = covered[at] {
+                    self.error(
+                        Diagnostic::new(
+                            format!("`{}` is already covered", domain.names[at]),
+                            arm.span,
+                        )
+                        .with_label("this arm can never run")
+                        .with_note("covered here", Some(previous)),
+                    );
+                    return true;
+                }
+                covered[at] = Some(arm.span);
+            }
+            // One of a set nobody could write out, so the only question a
+            // second one raises is whether it repeats an earlier arm.
+            Selected::Literal => {
+                let previous = literals
+                    .iter()
+                    .find(|(seen, _)| seen.same_as(&arm.pattern))
+                    .map(|(_, at)| *at);
+                if let Some(previous) = previous {
+                    self.error(
+                        Diagnostic::new(
+                            format!("{} is already covered", arm.pattern.describe()),
+                            arm.span,
+                        )
+                        .with_label("this arm can never run")
+                        .with_note("covered here", Some(previous)),
+                    );
+                    return true;
+                }
+                literals.push((&arm.pattern, arm.span));
+            }
+            Selected::Everything => *catch_all = Some(arm.span),
+        }
         true
     }
 
-    /// The tag an arm's pattern selects, or `None` when the pattern does not
-    /// name a variant of this enum — reported here.
-    fn arm_tag(&mut self, id: EnumId, arm: &MatchArm, variants: &[String]) -> Option<i64> {
-        let expected = self.shared.declared.info(id).name.clone();
-        if arm.enum_name != expected {
+    /// What an arm's pattern selects, or `None` when it is not about this
+    /// scrutinee at all — reported here.
+    fn arm_pattern(&mut self, ty: Ty, domain: &Domain, arm: &MatchArm) -> Option<Selected> {
+        match &arm.pattern {
+            Pattern::Wildcard => {
+                if !domain.catch_all {
+                    self.error(
+                        Diagnostic::new("`_` cannot be used here", arm.span)
+                            .with_label(format!(
+                                "every {} of {} has to be written out",
+                                domain.noun,
+                                self.ty_article(ty)
+                            ))
+                            .with_note(
+                                "that is what the check is for: adding a variant should stop \
+                                 every match that does not handle it from compiling, and a \
+                                 catch-all would swallow exactly that",
+                                None,
+                            ),
+                    );
+                    return None;
+                }
+                Some(Selected::Everything)
+            }
+            Pattern::Variant { enum_name, enum_span, variant, variant_span, bindings } => {
+                let Ty::Enum(id) = ty else {
+                    self.error(
+                        Diagnostic::new(
+                            format!(
+                                "this arm matches a variant, but the value is {}",
+                                self.ty_article(ty)
+                            ),
+                            arm.span,
+                        )
+                        .with_label(format!("expected {}", self.ty_article(ty))),
+                    );
+                    return None;
+                };
+                let expected = self.shared.declared.info(id).name.clone();
+                if *enum_name != expected {
+                    self.error(
+                        Diagnostic::new(
+                            format!(
+                                "this arm matches `{enum_name}`, but the value is a `{expected}`"
+                            ),
+                            *enum_span,
+                        )
+                        .with_label(format!("expected a variant of `{expected}`")),
+                    );
+                    return None;
+                }
+                let Some(tag) = self.shared.declared.info(id).tag(variant) else {
+                    let known: Vec<&str> = domain.names.iter().map(String::as_str).collect();
+                    self.error(
+                        Diagnostic::new(
+                            format!("`{expected}` has no variant `{variant}`"),
+                            *variant_span,
+                        )
+                        .with_label("not one of its variants")
+                        .with_note(format!("`{expected}` has {}", list(&known)), None),
+                    );
+                    return None;
+                };
+                self.bind_payload(&expected, variant, *variant_span, id, tag, bindings);
+                Some(Selected::One(tag as usize))
+            }
+            // A literal is exactly as type-checked as it would be beside an
+            // `==`, and for the same reason: nothing in TinyC converts on its
+            // own, so `match (n) { 'a' => ... }` is the same mistake as
+            // `n == 'a'`.
+            literal => {
+                let wanted = literal.matches_ty().expect("the two others are handled above");
+                if wanted != ty {
+                    self.error(
+                        Diagnostic::new(
+                            format!(
+                                "this arm matches {}, but the value is {}",
+                                self.ty_article(wanted),
+                                self.ty_article(ty)
+                            ),
+                            arm.span,
+                        )
+                        .with_label(format!(
+                            "expected {}, found {}",
+                            self.ty_name(ty),
+                            self.ty_name(wanted)
+                        )),
+                    );
+                    return None;
+                }
+                // `false` is 0 and `true` is 1, which is both how a `bool` is
+                // stored and where it goes in the coverage table.
+                match literal {
+                    Pattern::Bool(v) => Some(Selected::One(usize::from(*v))),
+                    _ => Some(Selected::Literal),
+                }
+            }
+        }
+    }
+
+    /// What a match with no `_` still leaves unaccounted for.
+    fn report_gaps(&mut self, ty: Ty, domain: &Domain, span: Span, covered: &[Option<Span>]) {
+        // Nothing to count: the only way to be complete is the catch-all, and
+        // there is not one.
+        if domain.names.is_empty() {
+            let name = self.ty_name(ty);
             self.error(
-                Diagnostic::new(
-                    format!("this arm matches `{}`, but the value is a `{expected}`", arm.enum_name),
-                    arm.enum_span,
-                )
-                .with_label(format!("expected a variant of `{expected}`")),
+                Diagnostic::new(format!("this match does not cover every `{name}`"), span)
+                    .with_label("add `_ => ...` for the rest")
+                    .with_note(
+                        format!(
+                            "a `{name}` has no list of values to write out, so a match on one \
+                             is only complete with a catch-all"
+                        ),
+                        None,
+                    ),
             );
-            return None;
+            return;
         }
 
-        let tag = self.shared.declared.info(id).tag(&arm.variant);
-        if tag.is_none() {
-            let known: Vec<&str> = variants.iter().map(String::as_str).collect();
-            self.error(
-                Diagnostic::new(
-                    format!("`{expected}` has no variant `{}`", arm.variant),
-                    arm.variant_span,
-                )
-                .with_label("not one of its variants")
-                .with_note(format!("`{expected}` has {}", list(&known)), None),
-            );
+        let missing: Vec<&str> = domain
+            .names
+            .iter()
+            .zip(covered)
+            .filter(|(_, seen)| seen.is_none())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if missing.is_empty() {
+            return;
         }
-        tag
+        let name = self.ty_name(ty);
+        let what = match domain.catch_all {
+            true => format!("this match does not cover every `{name}`"),
+            false => format!("this match does not cover every variant of `{name}`"),
+        };
+        let note = match domain.catch_all {
+            true => "write the rest out, or add `_ => ...`",
+            false => "every variant needs an arm; a match on an enum has no catch-all, so that \
+                      adding a variant cannot be quietly ignored",
+        };
+        self.error(
+            Diagnostic::new(what, span)
+                .with_label(format!("{} not handled", missing_verb(&missing)))
+                .with_note(note, None),
+        );
     }
 
     /// A loop's body, checked with one more loop open around it.
@@ -2770,13 +3175,13 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         )
                         .with_label(format!("expected {}, found {}", self.ty_name(lhs_ty), self.ty_name(rhs_ty))),
                     );
-                } else if !lhs_ty.has_equality() || (op.is_ordering() && !lhs_ty.is_ordered()) {
+                } else if !lhs_ty.has_equality(&self.shared.declared.table) || (op.is_ordering() && !lhs_ty.is_ordered()) {
                     // Ints and characters are ordered. Everything else that can
                     // be compared at all answers only `==`, since that is a
                     // question about *which value it is*; an array or an object
                     // answers nothing, because comparing addresses would quietly
                     // answer something else again.
-                    let label = if !lhs_ty.has_equality() {
+                    let label = if !lhs_ty.has_equality(&self.shared.declared.table) {
                         format!(
                             "comparing two `{}` values would compare addresses, not contents",
                             self.ty_name(lhs_ty)
@@ -2834,8 +3239,8 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 }
                 Ty::Bool
             }
-            ExprKind::Variant { enum_name, enum_span, variant, variant_span } => {
-                self.variant(enum_name, *enum_span, variant, *variant_span)
+            ExprKind::Variant { enum_name, enum_span, variant, variant_span, args } => {
+                self.variant(enum_name, *enum_span, variant, *variant_span, args)
             }
             ExprKind::Array { elements, span } => self.array_literal(elements, *span),
             ExprKind::Index { array, index } => {
@@ -2909,6 +3314,12 @@ mod tests {
 
     fn errors_in_main(body: &str) -> Vec<Diagnostic> {
         check_main(body).unwrap_err()
+    }
+
+    /// Whether a body checks with nothing to report, for the tests that are
+    /// about a form being *accepted*.
+    fn errors_in_main_none(body: &str) -> bool {
+        check_main(body).is_ok()
     }
 
     // -- how many diagnostics, and in what order ---------------------------
@@ -3807,9 +4218,33 @@ mod tests {
     }
 
     #[test]
-    fn a_field_cannot_be_a_list() {
-        let errors = check_src("class Bag {\n  int[] items;\n}\nfn main() {\n}").unwrap_err();
-        assert!(errors[0].message.contains("a field cannot be"), "{}", errors[0].message);
+    fn a_field_may_be_a_list_and_costs_the_object_one_pointer() {
+        let types = check_src("class Bag {\n  int[] items;\n}\nfn main() {\n}").unwrap();
+        let bag = types.table().class(ClassId(0));
+        // The elements live in the arena, so what the object holds is their
+        // address — one register, like every other field that fits in one.
+        assert_eq!(bag.field("items").unwrap().offset, 8);
+        assert_eq!(bag.size, 16, "a vtable pointer and one address");
+        // And it is what makes copying a `Bag` more than a copy of its bytes.
+        assert!(types.table().holds_a_list(Ty::Class(ClassId(0))));
+    }
+
+    /// The one thing a list field buys that nothing else could: a class that
+    /// contains *itself*, and so a tree.
+    ///
+    /// By value it is still refused — the object would have to be bigger than
+    /// itself. Through a list it is not, because the elements are not in the
+    /// object at all. That is how TinyC gets a recursive type without a
+    /// reference type and without `null`.
+    #[test]
+    fn a_class_may_reach_itself_through_a_list() {
+        let types = check_src(
+            "class Node {\n  int v;\n  Node[] kids;\n}\nfn main() {\n}",
+        )
+        .unwrap();
+        let node = types.table().class(ClassId(0));
+        assert_eq!(node.size, 24, "a vtable pointer, an int and one address");
+        assert!(types.table().holds_a_list(Ty::Class(ClassId(0))));
     }
 
     #[test]
@@ -4264,12 +4699,196 @@ print(len(n));")[0].message.contains("`len` needs"));
         assert!(errors[0].message.contains("but the value is a `A`"), "{}", errors[0].message);
     }
 
+    /// A `match` needs something a pattern can be compared *to*. An array, a
+    /// list and an object are exactly the types with no equality, so there is
+    /// nothing a pattern could ask of one.
     #[test]
-    fn rejects_a_match_on_something_that_is_not_an_enum() {
-        for body in ["match (1) {\n}", "match (true) {\n}", "match (\"a\") {\n}"] {
+    fn rejects_a_match_on_something_no_pattern_could_be_about() {
+        for body in [
+            "int[3] xs = [1, 2, 3];\nmatch (xs) {\n  _ => { }\n}",
+            "int[] ys = [1];\nmatch (ys) {\n  _ => { }\n}",
+        ] {
             let errors = errors_in_main(body);
             assert!(errors[0].message.contains("cannot match on"), "{body}: {}", errors[0].message);
         }
+        let errors = check_src(
+            "class P { int x; }\nfn main() {\n  P p = P { x: 1 };\n  match (p) {\n    _ => { }\n  }\n}",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("cannot match on"), "{}", errors[0].message);
+    }
+
+    /// The four that are not enums and *can* be matched, each needing the
+    /// catch-all that says what is left — except `bool`, whose two values a
+    /// program can simply write out.
+    #[test]
+    fn a_match_on_a_value_with_no_list_of_variants_needs_a_catch_all() {
+        for body in [
+            "int n = 1;\nprint(match (n) {\n  1 => 1,\n});",
+            "char c = 'a';\nprint(match (c) {\n  'a' => 1,\n});",
+            "string s = \"a\";\nprint(match (s) {\n  \"a\" => 1,\n});",
+        ] {
+            let errors = errors_in_main(body);
+            assert!(
+                errors[0].message.contains("does not cover every"),
+                "{body}: {}",
+                errors[0].message
+            );
+        }
+        // With one, each is accepted.
+        for body in [
+            "int n = 1;\nprint(match (n) {\n  1 => 1,\n  _ => 0,\n});",
+            "char c = 'a';\nprint(match (c) {\n  'a' => 1,\n  _ => 0,\n});",
+            "string s = \"a\";\nprint(match (s) {\n  \"a\" => 1,\n  _ => 0,\n});",
+            // A `bool` has two values and they can be written out, so it needs
+            // no catch-all — though it may have one.
+            "bool b = true;\nprint(match (b) {\n  true => 1,\n  false => 0,\n});",
+            "bool b = true;\nprint(match (b) {\n  true => 1,\n  _ => 0,\n});",
+        ] {
+            assert!(errors_in_main_none(body), "{body}");
+        }
+    }
+
+    /// What a variant carries is checked exactly as a call's arguments are,
+    /// and named exactly as many times in the pattern that takes it apart.
+    #[test]
+    fn a_variant_takes_what_it_declares_and_a_pattern_names_all_of_it() {
+        let with = |body: &str| {
+            format!("enum E {{ A(int), B(int, string), C }}\nfn main() {{\n{body}\n}}\n")
+        };
+        let refuses = |body: &str, message: &str| {
+            let errors = check_src(&with(body)).unwrap_err();
+            assert!(
+                errors.iter().any(|d| d.message.contains(message)),
+                "{body}: {:#?}",
+                errors.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        };
+
+        refuses("E e = E::A(1, 2);", "was given 2 values");
+        refuses("E e = E::A();", "was given 0 values");
+        refuses("E e = E::C(1);", "was given 1 value");
+        refuses("E e = E::A(\"x\");", "carries an `int` here");
+        refuses(
+            "E e = E::A(1);\nprint(match (e) { E::A(x, y) => x, E::B(a, b) => a, E::C => 0 });",
+            "names 2 values",
+        );
+        refuses(
+            "E e = E::A(1);\nprint(match (e) { E::A => 1, E::B(a, b) => a, E::C => 0 });",
+            "names 0 values",
+        );
+
+        // And the shapes that are right.
+        assert!(check_src(&with("E e = E::C;\nprint(\"%e\", e);")).is_ok());
+        assert!(
+            check_src(&with(
+                "E e = E::B(1, \"x\");\n\
+                 print(match (e) { E::A(n) => n, E::B(n, s) => n + len(s), E::C => 0 });"
+            ))
+            .is_ok()
+        );
+    }
+
+    /// A payload has to fit in a register: an object or an array would have to
+    /// live inside the value, which would give an enum a size of its own.
+    #[test]
+    fn a_variant_cannot_carry_something_that_does_not_fit_in_a_register() {
+        for payload in ["P", "int[3]"] {
+            let src = format!(
+                "class P {{ int x; }}\nenum E {{ A({payload}), B }}\nfn main() {{\n}}\n"
+            );
+            let errors = check_src(&src).unwrap_err();
+            assert!(
+                errors[0].message.contains("a variant cannot carry"),
+                "{payload}: {}",
+                errors[0].message
+            );
+        }
+        // A list does fit, and is allowed: an enum is read-only, so what goes
+        // in is copied in and what a pattern hands back is copied out.
+        assert!(
+            check_src("enum E { A(int[]), B }\nfn main() {\n}\n").is_ok(),
+            "a list payload is one pointer like any other"
+        );
+    }
+
+    /// Two values of a payload-carrying enum are equal when they carry equal
+    /// things, and comparing the two pointers would answer something else.
+    #[test]
+    fn an_enum_that_carries_something_cannot_be_compared() {
+        let errors = check_src(
+            "enum E { A(int), B }\nfn main() {\n  E e = E::A(1);\n  \
+             if (e == E::B) {\n  }\n}\n",
+        )
+        .unwrap_err();
+        assert!(errors[0].message.contains("cannot be compared with `==`"), "{}", errors[0].message);
+        // One whose variants carry nothing still compares, exactly as before.
+        assert!(
+            check_src(
+                "enum E { A, B }\nfn main() {\n  E e = E::A;\n  if (e == E::B) {\n  }\n}\n"
+            )
+            .is_ok()
+        );
+    }
+
+    /// A pattern's names belong to its arm and to nothing else, which is what
+    /// lets two arms call quite different things by one name.
+    #[test]
+    fn what_a_pattern_names_is_in_scope_for_its_arm_alone() {
+        let src = "enum E { A(int), B(string) }\nfn main() {\n  E e = E::A(1);\n  \
+                   match (e) {\n    E::A(v) => { print(v); }\n    E::B(v) => { print(v); }\n  }\n}\n";
+        assert!(check_src(src).is_ok(), "one name, two types, two arms");
+
+        let leaks = "enum E { A(int), B }\nfn main() {\n  E e = E::A(1);\n  \
+                     match (e) {\n    E::A(v) => { print(v); }\n    E::B => { }\n  }\n  \
+                     print(v);\n}\n";
+        let errors = check_src(leaks).unwrap_err();
+        assert!(errors[0].message.contains("undeclared variable `v`"), "{}", errors[0].message);
+    }
+
+    /// The catch-all stops exactly at the type where it would do harm.
+    #[test]
+    fn an_enum_still_has_no_catch_all() {
+        let errors =
+            colour_errors("Colour c = Colour::Red;\nprint(match (c) {\n  _ => 1,\n});");
+        assert!(errors[0].message.contains("`_` cannot be used here"), "{}", errors[0].message);
+        assert!(
+            errors[0].note.as_ref().is_some_and(|(text, _)| text.contains("adding a variant")),
+            "the note says why: {:?}",
+            errors[0].note
+        );
+    }
+
+    #[test]
+    fn a_literal_pattern_is_held_to_the_scrutinee_s_type() {
+        let errors = errors_in_main("int n = 1;\nprint(match (n) {\n  'a' => 1,\n  _ => 0,\n});");
+        assert!(
+            errors[0].message.contains("this arm matches a `char`, but the value is an `int`"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn two_arms_that_select_the_same_value_are_refused() {
+        for body in [
+            "int n = 1;\nprint(match (n) {\n  1 => 1,\n  1 => 2,\n  _ => 0,\n});",
+            "string s = \"a\";\nprint(match (s) {\n  \"a\" => 1,\n  \"a\" => 2,\n  _ => 0,\n});",
+            "bool b = true;\nprint(match (b) {\n  true => 1,\n  true => 2,\n  _ => 0,\n});",
+        ] {
+            let errors = errors_in_main(body);
+            assert!(
+                errors[0].message.contains("is already covered"),
+                "{body}: {}",
+                errors[0].message
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_may_follow_the_catch_all() {
+        let errors = errors_in_main("int n = 1;\nprint(match (n) {\n  _ => 0,\n  1 => 1,\n});");
+        assert!(errors[0].message.contains("this arm can never run"), "{}", errors[0].message);
     }
 
     #[test]

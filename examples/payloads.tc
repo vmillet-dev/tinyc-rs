@@ -1,0 +1,111 @@
+// A variant that carries something.
+//
+// An enum whose variants all carry nothing *is* its tag: it moves and compares
+// like an int, and costs the backend a table of names and nothing else. That is
+// still what most enums are, and none of them changed.
+//
+// A variant may also carry values, written after its name. Such an enum is a
+// pointer to its tag and payload in the arena, laid out like every other run of
+// values here — what tells it apart in front, the values after it. It can be a
+// pointer rather than something in the frame because an enum is **read-only**:
+// there is no syntax that writes into a payload, so two names for one of them
+// cannot be told apart. That is the same bargain a string strikes.
+
+// The shape this exists for: an answer, or the reason there is none. There is
+// no `null` in TinyC and no way to return "nothing", so before payloads this
+// had to be a sentinel value and a convention.
+enum Parsed {
+  Ok(int),
+  Bad(string),
+}
+
+// A variant may carry more than one thing, and a variant of the same enum may
+// carry none at all.
+enum Shape {
+  Circle(int),
+  Rect(int, int),
+  Empty,
+}
+
+// A payload has to fit in a register. An object or an array would have to live
+// *inside* the value, which would give an enum a size of its own; a class is
+// what holds one of those. A list does fit, and works, because everything that
+// crosses the boundary is copied — see `Tally` below.
+enum Tally {
+  Counts(int[]),
+  Nothing,
+}
+
+// A pattern names what the variant carries, in order and all of it. The names
+// are the *arm's*: `Shape::Circle(r)` and `Shape::Circle(radius)` are the same
+// pattern spelt for two different readers, and a name lives only as long as
+// its arm.
+fn area(Shape s) -> int {
+  return match (s) {
+    Shape::Circle(r) => 3 * r * r,
+    Shape::Rect(width, height) => width * height,
+    Shape::Empty => 0,
+  };
+}
+
+fn parse(string text) -> Parsed {
+  if (is_int(text)) {
+    return Parsed::Ok(int(text));
+  }
+  return Parsed::Bad("`" + text + "` spells no number");
+}
+
+fn total(Tally t) -> int {
+  return match (t) {
+    Tally::Counts(ns) => {
+      int sum = 0;
+      for (int i = 0; i < len(ns); i = i + 1) {
+        sum = sum + ns[i];
+      }
+      return sum;
+    }
+    Tally::Nothing => 0,
+  };
+}
+
+fn main() {
+  // Built, stored, put in a list, passed on: a value like any other.
+  Shape[] shapes = [];
+  push(shapes, Shape::Circle(2));
+  push(shapes, Shape::Rect(3, 4));
+  push(shapes, Shape::Empty);
+  for (int i = 0; i < len(shapes); i = i + 1) {
+    println("%e is %d", shapes[i], area(shapes[i]));
+  }
+
+  // Printing one writes what an enum has always written: the name of its
+  // variant. What it carries has a type of its own and a way of being written
+  // already.
+  match (parse("42")) {
+    Parsed::Ok(n) => { println("got %d", n); }
+    Parsed::Bad(why) => { println(why); }
+  }
+  match (parse("twelve")) {
+    Parsed::Ok(n) => { println("got %d", n); }
+    Parsed::Bad(why) => { println(why); }
+  }
+
+  // Assignment copies, as everywhere else. There is nothing to copy here — the
+  // value is one pointer and what it points at can never change — which is
+  // exactly why sharing it is free.
+  Shape a = Shape::Rect(5, 6);
+  Shape b = a;
+  println("%d %d", area(a), area(b));
+
+  // A list payload keeps the same rule, and pays for it where you would want:
+  // what goes in is copied in, and what a pattern hands back is the arm's own.
+  int[] ns = [1, 2, 3];
+  Tally t = Tally::Counts(ns);
+  push(ns, 100);                 // the enum kept its own
+  println("%d, and outside %d", total(t), len(ns));
+
+  // Two enums that carry things are not interchangeable, and a variant that
+  // carries something cannot be compared with `==` — two `Circle`s are the
+  // same value only if their radii are, and `match` is what asks that.
+  println(total(Tally::Nothing));
+}

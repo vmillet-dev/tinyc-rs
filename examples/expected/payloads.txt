@@ -1,0 +1,8 @@
+Circle is 12
+Rect is 12
+Empty is 0
+got 42
+`twelve` spells no number
+30 30
+6, and outside 4
+0

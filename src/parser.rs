@@ -4,7 +4,8 @@
 //!
 //! ```text
 //! program := (enum_decl | fn_decl)*
-//! enum    := "enum" IDENT "{" IDENT ("," IDENT)* "}"
+//! enum    := "enum" IDENT "{" variant ("," variant)* ","? "}"
+//! variant := IDENT ("(" type ("," type)* ")")?
 //! fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 //! params  := param ("," param)*
 //! param   := type IDENT
@@ -32,14 +33,16 @@
 //! unary   := ("-" | "!") unary | primary
 //! primary := INT | STRING | CHAR | BOOL | IDENT | variant | call | match
 //!          | array | index | len | convert | "(" expr ")"
-//! variant := IDENT "::" IDENT
+//! variant := IDENT "::" IDENT ("(" (expr ("," expr)*)? ")")?
 //! array   := "[" (expr ("," expr)*)? "]"
 //! index   := IDENT "[" expr "]"
 //! len     := "len" "(" expr ")"
 //! convert := ("int" | "char" | "string" | "bool") "(" expr ")"
 //! call    := IDENT "(" (expr ("," expr)*)? ")"
 //! match   := "match" "(" expr ")" "{" arm* "}"
-//! arm     := IDENT "::" IDENT "=>" (expr ","? | block ","?)
+//! arm     := pattern "=>" (expr ","? | block ","?)
+//! pattern := IDENT "::" IDENT ("(" IDENT ("," IDENT)* ")")?
+//!          | "-"? INT | STRING | CHAR | BOOL | "_"
 //! ```
 //!
 //! A `match` is a primary expression, and a statement only in the way a call is
@@ -48,8 +51,8 @@
 use crate::ast;
 use crate::ast::{
     ArmBody, BinOp, Block, ClassDecl, CmpOp, EnumDecl, Expr, ExprKind, FieldDecl, FieldInit,
-    FnDecl, LogicOp, MatchArm, NodeId, Param, Place, Prim, PrintPart, Program, Shape, Spec, Stmt,
-    TypeRef, Variant,
+    FnDecl, LogicOp, MatchArm, NodeId, Param, Pattern, Place, Prim, PrintPart, Program, Shape,
+    Spec, Stmt, TypeRef, Variant, WILDCARD,
 };
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{StrLit, Token, TokenKind};
@@ -447,9 +450,29 @@ impl<'a> Parser<'a> {
         if !matches!(self.peek().kind, TokenKind::RBrace) {
             loop {
                 let (name, name_span) = self.expect_ident("a variant name")?;
-                variants.push(Variant { name, name_span });
-                // As in a parameter list, a comma promises another one.
+                // `Circle(int)` — what this variant carries, if anything. A
+                // variant without parentheses carries nothing, which is every
+                // variant TinyC had before.
+                let mut payload = Vec::new();
+                if self.eat(&TokenKind::LParen) {
+                    loop {
+                        payload.push(self.expect_type("a variant's payload")?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect_closing(TokenKind::RParen, name_span, "expected `)` here")?;
+                }
+                variants.push(Variant { name, name_span, payload });
                 if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+                // A trailing comma is allowed here and nowhere else in the
+                // language, because this is the one list that is normally
+                // written down the page rather than across it — a variant with
+                // a payload is long enough that a per-line enum is the usual
+                // shape, and then the last line should look like the others.
+                if matches!(self.peek().kind, TokenKind::RBrace) {
                     break;
                 }
             }
@@ -651,15 +674,13 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `Color::Red => "warm",` or `Color::Red => { ... }`
+    /// `Color::Red => "warm",` or `3 => "three",` or `_ => { ... }`
     ///
-    /// The token after `=>` decides between the two, with no lookahead beyond
-    /// it: a `{` can only open a block, because TinyC has no other use for one
-    /// in expression position.
+    /// The token after `=>` decides between a value and a block, with no
+    /// lookahead beyond it: a `{` can only open a block, because TinyC has no
+    /// other use for one in expression position.
     fn match_arm(&mut self) -> PResult<MatchArm> {
-        let (enum_name, enum_span) = self.expect_ident("an enum name")?;
-        self.expect(TokenKind::ColonColon)?;
-        let (variant, variant_span) = self.expect_ident("a variant name")?;
+        let (pattern, span) = self.pattern()?;
         self.expect(TokenKind::FatArrow)?;
 
         let body = if matches!(self.peek().kind, TokenKind::LBrace) {
@@ -677,7 +698,88 @@ impl<'a> Parser<'a> {
             }
             ArmBody::Value(value)
         };
-        Ok(MatchArm { enum_name, enum_span, variant, variant_span, body })
+        Ok(MatchArm { pattern, span, body })
+    }
+
+    /// What an arm matches, and where it was written.
+    ///
+    /// Every shape here is settled by one token, or by two for a qualified
+    /// variant. There is nothing to disambiguate: a pattern is a value, so it
+    /// is spelled exactly as the value would be, and `_` is the one spelling
+    /// that is not a value at all.
+    ///
+    /// Which of these the scrutinee *admits* is not a syntactic question — an
+    /// `int` takes `3` and not `Color::Red` — so the parser accepts them all
+    /// and [`crate::sema`] holds each to the type it is matching.
+    fn pattern(&mut self) -> PResult<(Pattern, Span)> {
+        let token = self.peek();
+        let span = token.span;
+        let pattern = match &token.kind {
+            TokenKind::Int(v) => Pattern::Int(*v),
+            TokenKind::Char(c) => Pattern::Char(*c),
+            TokenKind::Str(lit) => Pattern::Str(lit.chars.clone()),
+            TokenKind::Bool(v) => Pattern::Bool(*v),
+            // A negative number is two tokens everywhere else in the grammar
+            // too; here there is no expression to fold it into, so it is read
+            // as part of the literal.
+            TokenKind::Minus => {
+                self.bump();
+                let token = self.peek();
+                let TokenKind::Int(v) = token.kind else {
+                    return Err(Diagnostic::new(
+                        format!("expected a number, found {}", token.kind.describe()),
+                        token.span,
+                    )
+                    .with_label("a `-` in a pattern has to be part of a number"));
+                };
+                let end = self.bump().span;
+                // `-9223372036854775808` is the one value whose positive half
+                // does not fit, and the lexer has already refused anything
+                // bigger — so this cannot overflow.
+                return Ok((Pattern::Int(-v), span.to(end)));
+            }
+            TokenKind::Ident(name) if name == WILDCARD => Pattern::Wildcard,
+            TokenKind::Ident(name) => {
+                let name = name.clone();
+                let enum_span = self.bump().span;
+                self.expect(TokenKind::ColonColon)?;
+                let (variant, variant_span) = self.expect_ident("a variant name")?;
+                // `Shape::Circle(r)` — the names this arm gives what the
+                // variant carries. Names, not patterns: TinyC does not nest
+                // one pattern inside another, so what is between the
+                // parentheses is exactly a list of new variables.
+                let mut bindings = Vec::new();
+                let mut end = variant_span;
+                if self.eat(&TokenKind::LParen) {
+                    loop {
+                        bindings.push(self.expect_ident("a name for what it carries")?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    end = self.expect_closing(TokenKind::RParen, enum_span, "expected `)` here")?;
+                }
+                return Ok((
+                    Pattern::Variant {
+                        enum_name: name,
+                        enum_span,
+                        variant,
+                        variant_span,
+                        bindings,
+                    },
+                    enum_span.to(end),
+                ));
+            }
+            other => {
+                return Err(Diagnostic::new(
+                    format!("expected a pattern, found {}", other.describe()),
+                    span,
+                )
+                .with_label("expected a variant, a literal or `_`"));
+            }
+        };
+        self.bump();
+        Ok((pattern, span))
     }
 
     /// `{ stmt* }`
@@ -1202,14 +1304,24 @@ impl<'a> Parser<'a> {
                 // variable — and no enum may quietly shadow a name.
                 if self.eat(&TokenKind::ColonColon) {
                     let (variant, variant_span) = self.expect_ident("a variant name")?;
+                    // `Shape::Circle(5)` — what the variant is given. Written
+                    // exactly like a call, and told apart from one by the `::`
+                    // that had to come first.
+                    let mut args = Vec::new();
+                    let mut end = variant_span;
+                    if self.eat(&TokenKind::LParen) {
+                        args = self.call_args()?;
+                        end = self.expect_closing_paren(span)?;
+                    }
                     return Ok(Expr {
                         id: self.node_id(),
-                        span: span.to(variant_span),
+                        span: span.to(end),
                         kind: ExprKind::Variant {
                             enum_name: name,
                             enum_span: span,
                             variant,
                             variant_span,
+                            args,
                         },
                     });
                 }
@@ -2022,10 +2134,17 @@ mod tests {
         assert_eq!(program.enums[0].variants.len(), 1);
     }
 
+    /// The one list in the language that takes a trailing comma.
+    ///
+    /// It earns it by being the one normally written down the page rather than
+    /// across it: a variant with a payload is long enough that a line each is
+    /// the usual shape, and then the last line should look like the others.
     #[test]
-    fn rejects_a_trailing_comma_in_a_variant_list() {
-        // As in a parameter list, a comma promises another one.
-        let errors = parse_src("enum Color { Red, }\nfn main() {\n}").unwrap_err();
+    fn a_variant_list_may_end_with_a_comma() {
+        let program = parse_src("enum Color { Red, Green, }\nfn main() {\n}\n").unwrap();
+        assert_eq!(program.enums[0].variants.len(), 2);
+        // Two in a row is still a variant that is not there.
+        let errors = parse_src("enum Color { Red,, }\nfn main() {\n}").unwrap_err();
         assert!(errors[0].message.contains("expected a variant name"), "{}", errors[0].message);
     }
 

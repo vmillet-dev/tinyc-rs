@@ -17,9 +17,9 @@ use super::asm::Asm;
 use super::data::{BOOL_FALSE, BOOL_TRUE, FMT_BOOL, FMT_INT, FMT_STR, NEWLINE, line_format};
 use super::runtime::{
     ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_OVERFLOW, ABORT_STACK, PRINT_CHAR,
-    PRINT_STR, STACK_LIMIT, STACK_MARGIN,
+    FIXUP, PRINT_STR, STACK_LIMIT, STACK_MARGIN, WRITE_TEXT,
 };
-use super::used::{Used, enum_table, text_label, vtable_label};
+use super::used::{Used, enum_table, text_label, variant_value, vtable_label};
 use super::{
     Abi, ENTRY_POINT, PAGE_BYTES, Platform, RAX, RDX, SCRATCH0, SCRATCH1, SCRATCH1_8,
     half, jump_if_false, narrow, runtime_symbol, setcc, symbol,
@@ -554,6 +554,11 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             Instr::VTable { dst, class } => self.produce(*dst, |e, work| {
                 e.asm.asm(&format!("lea  {work}, [{}]", vtable_label(*class)));
             }),
+            // The one value a variant that carries nothing has, written down
+            // once in `.data` rather than allocated afresh every time.
+            Instr::VariantAddr { dst, id, tag } => self.produce(*dst, |e, work| {
+                e.asm.asm(&format!("lea  {work}, [{}]", variant_value(*id, *tag as usize)));
+            }),
             // No source of these moves can be an argument register, because the
             // allocator is never given one — see the module docs.
             Instr::Call { dst, callee, args } => {
@@ -581,21 +586,31 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 self.asm.asm(&format!("call {}", runtime_symbol(*callee)));
                 self.take_result(*dst);
             }
+            // A copy has just been made, and the objects in it still name the
+            // original's elements. What has to be done to one is the *object's*
+            // business rather than this instruction's, so the run is handed to
+            // the dispatcher and it reads each vtable in turn.
+            Instr::Fixup { at, count, stride } => {
+                self.pass(&[*at, *count]);
+                let arg2 = self.arg(2);
+                self.asm.asm(&format!("mov  {arg2}, {stride}"));
+                self.asm.asm(&format!("call {FIXUP}"));
+            }
             // Bytes that are already in the file: one call, no arena, no
-            // encoder. The text is `printf`'s *argument* and never its format —
-            // a `%%` in a TinyC format has become one `%` by now, and handing
-            // that to `printf` as a format would make it a specifier again.
+            // encoder. How many there are was counted while the program was
+            // compiled, so the write needs no terminator and the text may hold
+            // anything a TinyC literal can — a `\0` included.
             Instr::PrintText { id } => {
-                self.asm.asm(&format!("lea  {}, [{FMT_STR}]", self.arg(0)));
+                let bytes = self.program.texts[id.0 as usize].len();
                 self.asm
-                    .asm(&format!("lea  {}, [{}]", self.arg(1), text_label(id.0 as usize)));
-                self.asm.variadic(self.abi);
-                self.asm.asm("call printf");
+                    .asm(&format!("lea  {}, [{}]", self.arg(0), text_label(id.0 as usize)));
+                self.asm.asm(&format!("mov  {}, {bytes}", self.arg(1)));
+                self.asm.asm(&format!("call {WRITE_TEXT}"));
             }
             // A string and a character are written by a routine rather than by
-            // `printf`, because what they hold has to be encoded first. The
-            // routine ends in the same `printf` all the same, so everything
-            // still reaches one buffered stream and nothing interleaves.
+            // `printf`, because what they hold has to be encoded first — and
+            // because what they hold may include the one byte a C string uses
+            // to mean "no more". Both end in the write that takes a count.
             Instr::Print { ty: ty @ (Ty::Str | Ty::Char), val, newline } => {
                 let value = self.value(val);
                 let arg0 = self.arg(0);
@@ -606,14 +621,13 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                 };
                 self.asm.asm(&format!("call {routine}"));
                 // These two go out through a routine rather than a format of
-                // their own, so ending the line is still a call — but one that
-                // hands `printf` the newline itself rather than a `%s` and a
-                // pointer to it.
+                // their own, so ending the line is still a call — one byte,
+                // written the same way as every other.
                 if *newline {
-                    let arg0 = self.arg(0);
+                    let (arg0, arg1) = (self.arg(0), self.arg(1));
                     self.asm.asm(&format!("lea  {arg0}, [{NEWLINE}]"));
-                    self.asm.variadic(self.abi);
-                    self.asm.asm("call printf");
+                    self.asm.asm(&format!("mov  {arg1}, 1"));
+                    self.asm.asm(&format!("call {WRITE_TEXT}"));
                 }
             }
             Instr::Print { ty, val, newline } => {

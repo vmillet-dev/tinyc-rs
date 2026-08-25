@@ -8,16 +8,19 @@
 //! Which symbols the answers turn into is [`super::Platform::externs`]'s
 //! business.
 
-use crate::ast::{ClassId, EnumId, Ty};
+use crate::ast::{ClassId, EnumId, Ty, TypeTable};
 use crate::ir::{DivGuards, Instr, Program, Runtime};
 
 use super::{ENTRY_POINT, format_index};
 
 pub struct Used {
-    formats: [bool; 3],
-    /// The same three, for a value that *ends* a line. A program that prints
+    /// Which `printf` format each shape of value goes out through, indexed by
+    /// [`super::format_index`]. The last slot is a string or a character,
+    /// which go out through no format at all — they are written by length.
+    formats: [bool; 4],
+    /// The same four, for a value that *ends* a line. A program that prints
     /// without ever calling `println` carries no format that ends one.
-    lines: [bool; 3],
+    lines: [bool; 4],
     /// Which enums have a value printed, and so need their table of variant
     /// names emitted. An enum used only in a `match` needs none: matching is
     /// arithmetic on the tag, and never asks what the tag is called.
@@ -47,6 +50,10 @@ pub struct Used {
     /// through another one. A program that never touches a string pays for
     /// none of them — not even the arena.
     pub concat: bool,
+    /// `s = s + e` where nothing else can be holding `s`. It falls back to
+    /// [`Runtime::Concat`] whenever it cannot grow in place, so a program with
+    /// one carries both.
+    pub append: bool,
     pub str_eq: bool,
     pub check_char: bool,
     pub char_str: bool,
@@ -66,13 +73,22 @@ pub struct Used {
     /// put characters on the console, which is a question of its own.
     pub print_text: bool,
     pub print_char: bool,
+    /// Whether anything is given its own elements after a copy — the price of
+    /// a list field. See [`crate::ir::Instr::Fixup`].
+    pub fixup: bool,
+    /// Whether any variant that carries something is built, and so whether
+    /// the arena is needed for one.
+    pub variant_new: bool,
+    /// Which enums need the one value each of their empty variants has written
+    /// down in `.data`. Only a boxed enum has any.
+    pub variant_values: Vec<bool>,
 }
 
 impl Used {
     pub fn of(program: &Program) -> Used {
         let mut used = Used {
-            formats: [false; 3],
-            lines: [false; 3],
+            formats: [false; 4],
+            lines: [false; 4],
             enums: vec![false; program.table.enums.len()],
             vtables: vec![false; program.vtables.len()],
             aborts: false,
@@ -84,6 +100,7 @@ impl Used {
             // point is something the program really calls.
             checks_stack: program.functions.iter().any(|f| f.name != ENTRY_POINT),
             concat: false,
+            append: false,
             str_eq: false,
             check_char: false,
             char_str: false,
@@ -100,6 +117,9 @@ impl Used {
             print_str: false,
             print_char: false,
             print_text: false,
+            fixup: false,
+            variant_new: false,
+            variant_values: vec![false; program.table.enums.len()],
         };
         for instr in program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instrs) {
             match instr {
@@ -115,13 +135,12 @@ impl Used {
                         _ => {}
                     }
                 }
-                // Text is written by handing `printf` bytes that are already in
-                // the file, so it needs the `%s` format and nothing else.
-                Instr::PrintText { .. } => {
-                    used.formats[format_index(Ty::Str)] = true;
-                    used.print_text = true;
-                }
+                // Text is bytes that are already in the file, written by the
+                // count the compiler took of them: no format, and no encoder.
+                Instr::PrintText { .. } => used.print_text = true,
                 Instr::VTable { class, .. } => used.vtables[class.0 as usize] = true,
+                Instr::Fixup { .. } => used.fixup = true,
+                Instr::VariantAddr { id, .. } => used.variant_values[id.0 as usize] = true,
                 other => {
                     // Which way it can fail, not merely that it can: the two
                     // questions used to be one, and the answer to the narrow
@@ -139,6 +158,7 @@ impl Used {
                     if let Instr::RtCall { callee, .. } = other {
                         match callee {
                             Runtime::Concat => used.concat = true,
+                            Runtime::Append => used.append = true,
                             Runtime::StrEq => used.str_eq = true,
                             Runtime::CheckChar => used.check_char = true,
                             Runtime::CharToStr => used.char_str = true,
@@ -149,6 +169,11 @@ impl Used {
                             Runtime::ListPush => used.list_push = true,
                             Runtime::ListPushBig => used.list_push_big = true,
                             Runtime::ListClone => used.list_clone = true,
+                            // Room for a variant that carries something. It
+                            // names the arena directly rather than through a
+                            // routine, so this is the flag that pulls the
+                            // arena in.
+                            Runtime::Alloc => used.variant_new = true,
                             Runtime::CharsToStr => used.chars_str = true,
                             Runtime::ReadLine => used.read_line = true,
                             Runtime::Eof => used.eof = true,
@@ -161,6 +186,16 @@ impl Used {
         // `print` encodes into a buffer cut from the arena, cloning a list
         // builds the new one with `list_new`, and reading a line accumulates
         // its characters in a list before sealing it into a string.
+        // A class that is built at all and whose fields reach a list needs the
+        // routine that gives a copy of it its own — and its vtable names that
+        // routine whether or not anything in the program ever copies one.
+        used.fixup |= (0..program.table.classes.len() as u32)
+            .map(ClassId)
+            .any(|id| used.vtables[id.0 as usize] && program.table.class_holds_a_list(id));
+        // Giving a list field its own elements *is* a clone.
+        used.list_clone |= used.fixup;
+        // Appending in place is the same routine when it cannot: it falls back.
+        used.concat |= used.append;
         used.list_new |= used.list_clone | used.read_line;
         used.list_push |= used.read_line;
         used.chars_str |= used.read_line;
@@ -175,20 +210,44 @@ impl Used {
         self.formats[format_index(ty)]
     }
 
+    /// Whether this class needs a routine of its own: it is built somewhere,
+    /// and what it holds reaches a list.
+    ///
+    /// A class whose *base* holds one still needs its own, because the routine
+    /// walks every field the object has — inherited ones included — and it is
+    /// reached through the object's own vtable.
+    pub fn owns_elements(&self, table: &TypeTable, id: ClassId) -> bool {
+        self.vtables[id.0 as usize] && table.class_holds_a_list(id)
+    }
+
     /// Whether a value of this type ever ends a line, and so whether the format
     /// that ends one is needed.
     pub fn ends_a_line(&self, ty: Ty) -> bool {
         self.lines[format_index(ty)]
     }
 
-    /// Whether the plain `%s` is needed.
+    /// Whether a variant name is ever written, and so whether the plain `%s`
+    /// is needed.
     ///
-    /// Not the same question as `prints(Ty::Str)` any more, and the difference
-    /// is a routine: the two that write a string and a character reach for this
-    /// format themselves, and go on doing so when a `println` ends the line
-    /// afterwards with a newline of its own.
-    pub fn needs_str_format(&self) -> bool {
-        self.prints(Ty::Str) || self.print_str || self.print_char
+    /// An enum is the last thing that goes out through `printf`'s `%s`, and it
+    /// may because its variants' names are bytes the *compiler* wrote: no NUL
+    /// is among them, so "up to the first NUL" and "all of them" are the same
+    /// answer. A string cannot promise that, which is why it is written by
+    /// length instead.
+    pub fn prints_enum(&self) -> bool {
+        self.formats[super::enum_slot()]
+    }
+
+    /// Whether `printf` is called at all.
+    ///
+    /// Only the shapes with a format of their own reach it now. A program that
+    /// writes nothing but strings, characters and literal text needs `fwrite`
+    /// and nothing else out of the C library's output half.
+    pub fn needs_printf(&self) -> bool {
+        self.writes(Ty::Int)
+            || self.writes(Ty::Bool)
+            || self.prints_enum()
+            || self.lines[super::enum_slot()]
     }
 
     /// Whether a value of this type is ever written at all, whichever of the
@@ -205,10 +264,9 @@ impl Used {
     ///
     /// A string and a character go out through a routine rather than a format
     /// of their own, so a `println` of one still ends its line separately —
-    /// with one call and one argument now, rather than a format and an
-    /// argument to write a single character.
+    /// one byte, written by the same count-taking call as everything else.
     pub fn writes_a_bare_newline(&self) -> bool {
-        self.ends_a_line(Ty::Str) && (self.print_str || self.print_char)
+        self.lines[super::text_slot()]
     }
 
     /// Whether the routine `int(s)` and `is_int(s)` are both wrappers around is
@@ -234,6 +292,7 @@ impl Used {
             || self.list_clone
             || self.chars_str
             || self.print_str
+            || self.variant_new
     }
 
     /// Whether any character reaches the console, and so whether it may need
@@ -266,14 +325,39 @@ pub fn text_label(index: usize) -> String {
     format!("text{index}")
 }
 
-/// The label of a class's method table.
+/// The label of a class's method table — the *slots*, which is what an object's
+/// vtable pointer points at.
 pub fn vtable_label(class: ClassId) -> String {
     format!("vtable{}", class.0)
+}
+
+/// The word laid down immediately in front of those slots, holding the routine
+/// that gives a fresh copy of this class its own elements — or zero when a copy
+/// of it shares nothing.
+///
+/// In front rather than in a slot of its own, so that method numbering stays
+/// the hierarchy's business alone and adding this changed no dispatch. A string
+/// and a list carry their length the same way, for the same reason.
+pub fn vtable_header(class: ClassId) -> String {
+    format!("vtable{}_owns", class.0)
+}
+
+/// The label of that routine.
+pub fn fixup_label(class: ClassId) -> String {
+    format!("tc$rt$fixup${}", class.0)
 }
 
 /// The label of the table that maps an enum's tags to its variants' names.
 pub fn enum_table(id: EnumId) -> String {
     format!("enum{}_names", id.0)
+}
+
+/// The label of the one value a variant that carries nothing has.
+///
+/// Only an enum some other variant of which carries something needs these: its
+/// values are pointers, and a variant with no payload still has to be one.
+pub fn variant_value(id: EnumId, tag: usize) -> String {
+    format!("enum{}_v{tag}_value", id.0)
 }
 
 /// The label of one variant's name within that table.

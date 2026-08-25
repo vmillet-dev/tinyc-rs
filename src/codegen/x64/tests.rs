@@ -17,7 +17,7 @@ use super::data::{BOOL_TRUE, FMT_BOOL, FMT_INT, NEWLINE, line_format};
 use super::runtime::{
     ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_NOT_A_NUMBER, ABORT_OOM, ABORT_REPORT,
     ABORT_STACK, ALLOC, ARENA_CHUNK, ARENA_END, ARENA_NEXT, INPUT, LIST_ROOM, PARSE_INT,
-    PRINT_CHAR, READY, REFILL, STACK_LIMIT, UTF8, UTF8_DECODE,
+    PRINT_CHAR, READY, REFILL, STACK_LIMIT, UTF8, UTF8_DECODE, WRITE_TEXT,
 };
 use super::*;
 use crate::codegen::regalloc;
@@ -1174,19 +1174,43 @@ fn the_prefixes_keep_the_two_namespaces_apart() {
 
 // -- writing things out -------------------------------------------------
 
-/// Literal text is bytes in the file, handed to `printf` as its *argument*.
+/// Literal text is bytes in the file, written by the count taken of them.
 ///
-/// Never as its format: a `%%` in a TinyC format has already become one `%`
-/// by the time it reaches here, and giving that to `printf` as a format
-/// would make it a specifier again — of a variadic argument nobody passed.
+/// `printf` cannot be given it either way round. As a *format*, a `%%` that
+/// has already become one `%` would turn back into a specifier — of a
+/// variadic argument nobody passed. As an *argument* to `%s`, the write would
+/// stop at the first NUL, and a TinyC literal may hold one.
 #[test]
-fn literal_text_is_an_argument_to_printf_and_never_its_format() {
+fn literal_text_is_written_by_length_and_never_through_printf() {
     let asm = compile("print(\"100%% sure\");");
-    assert!(asm.contains("text0: db"), "{asm}");
     assert!(asm.contains("; \"100% sure\""), "the percent survives as one: {asm}");
-    // `rcx` is the format and `rdx` the argument: the text is in `rdx`.
-    let at = asm.find("lea  rdx, [text0]").expect("the text as an argument");
-    assert!(asm[..at].ends_with("lea  rcx, [fmt_str]\n    "), "{asm}");
+    // No terminator after the bytes: the count is what says where they end.
+    assert!(
+        asm.contains("text0: db 49, 48, 48, 37, 32, 115, 117, 114, 101    ; \"100% sure\""),
+        "{asm}"
+    );
+    assert!(asm.contains("lea  rcx, [text0]"), "{asm}");
+    assert!(asm.contains("mov  rdx, 9"), "nine bytes, counted while compiling: {asm}");
+    assert!(asm.contains(&format!("call {WRITE_TEXT}")), "{asm}");
+    assert!(!asm.contains("call printf"), "a run of text needs no format at all: {asm}");
+}
+
+/// The bug this whole path exists to rule out.
+///
+/// A TinyC string is a run of *characters*, and `char(0)` is one of them — the
+/// lexer takes `"\0"`, a line of input may simply contain one. A C string is
+/// the bytes up to the first NUL, so anything that reached `printf("%s")`
+/// would come out short, and a `println` would lose its newline with it and
+/// run two lines together.
+#[test]
+fn nothing_that_writes_a_string_stops_at_a_nul() {
+    let asm = compile("string s = \"a\\0b\";\nprintln(s);\nprintln(\"x\\0y\");");
+    // Neither the literal run of text nor the encoded string carries one.
+    assert!(asm.contains("text0: db 120, 0, 121, 10    ; \"x\\0y\\n\""), "{asm}");
+    assert!(!asm.contains("mov  byte [r13], 0"), "the encoder terminates nothing: {asm}");
+    // Both go out through the write that takes a count.
+    assert_eq!(asm.matches(&format!("call {WRITE_TEXT}")).count(), 3, "{asm}");
+    assert!(!asm.contains("fmt_str"), "no `%s` is left to stop early: {asm}");
 }
 
 /// A `print` writes what it was given and no more; a `println` ends its line
@@ -1221,13 +1245,14 @@ fn a_println_ends_its_line_in_the_same_call_that_writes_the_value() {
 }
 
 /// A string and a character go out through a routine rather than a format of
-/// their own, so ending their line is still a call — but one that hands
-/// `printf` the newline itself rather than a `%s` and a pointer to it.
+/// their own, so ending their line is still a call — one byte, written by the
+/// same call that takes a count as everything else.
 #[test]
 fn a_println_of_a_string_writes_the_newline_on_its_own() {
     let asm = compile("string s = \"hi\";\nprintln(s);");
-    assert!(asm.contains(&format!("{NEWLINE}: db 10, 0")), "{asm}");
+    assert!(asm.contains(&format!("{NEWLINE}: db 10\n")), "no terminator on it: {asm}");
     assert!(asm.contains(&format!("lea  rcx, [{NEWLINE}]")), "{asm}");
+    assert!(asm.contains("mov  rdx, 1"), "one byte: {asm}");
     // Never for a `print`, which ends no line.
     let printed = compile("string s = \"hi\";\nprint(s);");
     assert!(!printed.contains(NEWLINE), "{printed}");

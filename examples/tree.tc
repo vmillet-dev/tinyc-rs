@@ -1,0 +1,72 @@
+// A tree: a class that reaches itself through a list.
+//
+// `Node next` is refused, and has to be — a field lives *inside* the object, so
+// an object holding one of its own kind would have to be bigger than itself.
+// `Node[] kids` is not, because a list's elements do not live in the object at
+// all: the field holds their address, and the elements live in the arena.
+//
+// That one difference is the whole of how TinyC gets a recursive type, with no
+// reference type, no `null` and no lifetimes. The price is paid where you would
+// want it paid: copying an object copies the lists inside it, so a `Node` put
+// into another's `kids` is a *snapshot* and the two go their own ways
+// afterwards.
+
+class Node {
+  string name;
+  int weight;
+  Node[] kids;
+
+  fn total(self) -> int {
+    int sum = self.weight;
+    for (int i = 0; i < len(self.kids); i = i + 1) {
+      sum = sum + self.kids[i].total();
+    }
+    return sum;
+  }
+
+  fn deepest(self) -> int {
+    int best = 0;
+    for (int i = 0; i < len(self.kids); i = i + 1) {
+      int below = self.kids[i].deepest();
+      if (below > best) {
+        best = below;
+      }
+    }
+    return best + 1;
+  }
+}
+
+// A leaf is a node with nowhere to go. `[]` is an empty list of whatever the
+// field asked for, which is the only way to write one.
+fn leaf(string name, int weight) -> Node {
+  return Node { name: name, weight: weight, kids: [] };
+}
+
+fn main() {
+  Node docs = leaf("docs", 3);
+  push(docs.kids, leaf("readme", 1));
+  push(docs.kids, leaf("licence", 2));
+
+  Node src = leaf("src", 0);
+  push(src.kids, leaf("main", 8));
+  push(src.kids, docs);
+
+  Node root = leaf("project", 1);
+  push(root.kids, src);
+  push(root.kids, leaf("build", 4));
+
+  println("%s weighs %d", root.name, root.total());   // 1 + (0+8+(3+1+2)) + 4
+  println("and is %d deep", root.deepest());
+
+  // The `docs` that went into `src` was a copy, so growing the original now
+  // leaves the tree exactly as it was. Assignment copies, and a list field
+  // is copied along with the object that holds it.
+  push(docs.kids, leaf("changelog", 100));
+  println("docs is now %d, the tree is still %d", docs.total(), root.total());
+
+  // The same rule one step further out: a whole subtree, copied.
+  Node clone = src;
+  push(clone.kids, leaf("tests", 50));
+  println("src has %d, its copy %d", len(src.kids), len(clone.kids));
+  println("src weighs %d, its copy %d", src.total(), clone.total());
+}

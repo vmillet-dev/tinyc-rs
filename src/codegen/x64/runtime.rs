@@ -14,11 +14,11 @@
 //! calls, and `rsi`/`rdi` are never touched except as an argument register,
 //! because on Windows they belong to the caller.
 
+use crate::ast::{ClassId, Ty, TypeTable};
 use crate::ir::{CHAR_BYTES, Runtime, STR_HEADER};
 
 use super::asm::{Asm, StubFrame};
-use super::data::FMT_STR;
-use super::used::Used;
+use super::used::{Used, fixup_label};
 use super::{Abi, Platform, RAX, RDX, STDERR, half, runtime_symbol};
 
 // -- where a program can stop ----------------------------------------------
@@ -149,6 +149,27 @@ pub const PARSE_INT: &str = "tc$rt$parse_int";
 /// The same for the two pushes: this makes the room and says where it is, and
 /// they differ only in what they put there.
 pub const LIST_ROOM: &str = "tc$rt$list_room";
+
+// -- writing out -----------------------------------------------------------
+
+/// The `FILE*` standard output goes to, worked out on the first write and kept.
+///
+/// Asked for lazily rather than by the entry point, so a program that prints
+/// nothing carries neither the question nor the eight bytes to hold the answer.
+pub const STDOUT: &str = "tc$rt$stdout";
+
+/// Write out exactly `len` bytes: **the one routine every `print` ends in.**
+///
+/// It takes a length, and that is the whole point. A TinyC string is a run of
+/// characters and `char(0)` is one of them — the lexer accepts `"\0"`, `char(0)`
+/// converts to it, and a line of input may simply contain one. A *C* string is
+/// the bytes up to the first NUL, so `printf("%s", …)` cannot say what this
+/// language can hold: it stopped at the first `\0`, and for a `println` it
+/// swallowed the newline after it too, silently running two lines together.
+///
+/// `fwrite` is the same buffered stream `printf` writes to, so a program that
+/// mixes an `int` and a `string` still comes out in the order it was written.
+pub const WRITE_TEXT: &str = "tc$rt$write_text";
 
 /// Encodes one character as UTF-8, which is the only place the language's
 /// representation meets the one the outside world reads.
@@ -287,10 +308,18 @@ pub fn arena(asm: &mut Asm, abi: &Abi) {
     asm.line(".refill:");
     asm.comment("what is left of the old chunk is abandoned: nothing here frees");
     asm.asm(&format!("mov  r12, {CHUNK_BYTES}"));
-    asm.asm("cmp  r12, rbx");
+    asm.comment("A single block can be bigger than a chunk, and then the chunk is asked");
+    asm.comment("for half again as much as it needs. That spare room is not waste: it is");
+    asm.comment("what the *next* block gets bumped into, and in particular what a string");
+    asm.comment("or a list growing in place grows into. Without it, something that has");
+    asm.comment("outgrown a chunk asks for an exact fit every time it gains a character,");
+    asm.comment("and starts copying itself on every step again.");
+    asm.asm("mov  r10, rbx");
+    asm.asm("shr  r10, 1");
+    asm.asm("add  r10, rbx");
+    asm.asm("cmp  r12, r10");
     asm.asm("jae  .big_enough");
-    asm.comment("a single string can be bigger than a chunk, so ask for it whole");
-    asm.asm("mov  r12, rbx");
+    asm.asm("mov  r12, r10");
     asm.line(".big_enough:");
     asm.asm(&format!("mov  {}, r12", abi.arg(0)));
     asm.asm("call malloc");
@@ -304,6 +333,139 @@ pub fn arena(asm: &mut Asm, abi: &Abi) {
     frame.ret(asm);
 }
 
+// -- writing out -----------------------------------------------------------
+
+/// [`WRITE_TEXT`], and the one question it needs answered first.
+///
+/// Everything the language writes arrives here as *bytes and a count*: the
+/// literal words of a format, a string encoded into the scratch buffer, one
+/// encoded character, the newline a `println` ends with. Nothing anywhere
+/// looks for a NUL, which is why a `\0` inside a string is now written like
+/// any other character rather than cutting the line short.
+pub fn output_stubs(asm: &mut Asm, platform: &dyn Platform, _used: &Used) {
+    let abi = platform.abi();
+    let (a0, a1, a2, a3) = (abi.arg(0), abi.arg(1), abi.arg(2), abi.arg(3));
+
+    asm.blank();
+    asm.comment("write out exactly this many bytes — never up to a NUL");
+    asm.line(&format!("{WRITE_TEXT}:"));
+    asm.comment(&format!("{a0} = the bytes, {a1} = how many"));
+    let frame = StubFrame::enter(asm, abi, &["rbx", "r12"], 0, "");
+    asm.asm(&format!("mov  rbx, {a0}"));
+    asm.asm(&format!("mov  r12, {a1}"));
+    asm.comment("the stream, asked for once and remembered");
+    asm.asm(&format!("mov  {RAX}, [{STDOUT}]"));
+    asm.asm(&format!("test {RAX}, {RAX}"));
+    asm.asm("jnz  .have");
+    platform.stdout_stream(asm);
+    asm.asm(&format!("mov  [{STDOUT}], {RAX}"));
+    asm.line(".have:");
+    asm.comment("fwrite(bytes, 1, how many, stdout)");
+    asm.asm(&format!("mov  {a3}, {RAX}"));
+    asm.asm(&format!("mov  {a0}, rbx"));
+    asm.asm(&format!("mov  {a1}, 1"));
+    asm.asm(&format!("mov  {a2}, r12"));
+    asm.asm("call fwrite");
+    frame.ret(asm);
+}
+
+// -- giving a copy its own elements ----------------------------------------
+
+/// Walk a run of freshly copied objects and give each one what it does not yet
+/// own. `(at, count, stride)`, and nothing comes back.
+///
+/// The dispatch is the point. A field declared `Reading` may hold a `Frost`,
+/// and a `Frost` has fields a `Reading` does not — so what to fix up cannot be
+/// read off the *hole*, only off the value in it. Every object carries its
+/// vtable pointer at offset 0 and the routine sits in the word in front of the
+/// slots, so one indirect call answers it for every class at once.
+pub const FIXUP: &str = "tc$rt$fixup";
+
+/// [`FIXUP`], and one routine per class that has something to give.
+///
+/// Each of those is straight-line code over the class's own fields, because
+/// the class is known while the program is compiled and its layout is settled.
+/// The only loop is this one, over the run.
+pub fn fixup_stubs(asm: &mut Asm, abi: &Abi, table: &TypeTable, used: &Used) {
+    let (a0, a1, a2) = (abi.arg(0), abi.arg(1), abi.arg(2));
+
+    asm.blank();
+    asm.comment("give each object in a fresh copy what the copy does not yet own");
+    asm.line(&format!("{FIXUP}:"));
+    asm.comment(&format!("{a0} = the first, {a1} = how many, {a2} = bytes apart"));
+    let frame = StubFrame::enter(asm, abi, &["rbx", "r12", "r13"], 0, "");
+    asm.asm(&format!("mov  rbx, {a0}"));
+    asm.asm(&format!("mov  r12, {a1}"));
+    asm.asm(&format!("mov  r13, {a2}"));
+    asm.line(".next:");
+    asm.asm("test r12, r12");
+    asm.asm("jz   .done");
+    asm.comment("the object's own vtable says what it owns; the word before the slots");
+    asm.asm(&format!("mov  {RAX}, [rbx]"));
+    asm.asm(&format!("mov  {RAX}, [{RAX}-8]"));
+    asm.asm(&format!("test {RAX}, {RAX}"));
+    asm.asm("jz   .step    ; a class that shares nothing");
+    asm.asm(&format!("mov  {a0}, rbx"));
+    asm.asm(&format!("call {RAX}"));
+    asm.line(".step:");
+    asm.asm("add  rbx, r13");
+    asm.asm("dec  r12");
+    asm.asm("jmp  .next");
+    asm.line(".done:");
+    frame.ret(asm);
+
+    for (index, class) in table.classes.iter().enumerate() {
+        let id = ClassId(index as u32);
+        if !used.owns_elements(table, id) {
+            continue;
+        }
+        asm.blank();
+        asm.comment(&format!("what a fresh `{}` has to be given of its own", class.name));
+        asm.line(&format!("{}:", fixup_label(id)));
+        asm.comment(&format!("{a0} = the object"));
+        let frame = StubFrame::enter(asm, abi, &["rbx"], 0, "");
+        asm.asm(&format!("mov  rbx, {a0}"));
+        for field in class.fields.iter().filter(|f| table.holds_a_list(f.ty)) {
+            let at = field.offset;
+            asm.comment(&format!("`{}`, at {at}", field.name));
+            match field.ty {
+                // The field holds an address, so the copy holds the *same*
+                // address. This is the one place a list is duplicated for a
+                // reason other than an assignment, and the reason is the same:
+                // two names for one list would be observable.
+                Ty::List(list) => {
+                    let elem = table.element(list);
+                    let deep = i64::from(table.holds_a_list(elem));
+                    asm.asm(&format!("mov  {a0}, [rbx+{at}]"));
+                    asm.asm(&format!("mov  {a1}, {}", table.size_of(elem)));
+                    asm.asm(&format!("mov  {a2}, {deep}"));
+                    asm.asm(&format!("call {}", runtime_symbol(Runtime::ListClone)));
+                    asm.asm(&format!("mov  [rbx+{at}], {RAX}"));
+                }
+                // Held whole, inside these very bytes — so there is nothing to
+                // replace, only something further in to go and look at.
+                Ty::Class(_) => {
+                    asm.asm(&format!("lea  {a0}, [rbx+{at}]"));
+                    asm.asm(&format!("mov  {a1}, 1"));
+                    asm.asm(&format!("mov  {a2}, 0"));
+                    asm.asm(&format!("call {FIXUP}"));
+                }
+                // The same, once per element. An array's length is part of its
+                // type, so both numbers are written out here.
+                Ty::Array(array) => {
+                    let info = table.array(array);
+                    asm.asm(&format!("lea  {a0}, [rbx+{at}]"));
+                    asm.asm(&format!("mov  {a1}, {}", info.len));
+                    asm.asm(&format!("mov  {a2}, {}", table.size_of(info.elem)));
+                    asm.asm(&format!("call {FIXUP}"));
+                }
+                other => unreachable!("nothing else can hold a list: {other:?}"),
+            }
+        }
+        frame.ret(asm);
+    }
+}
+
 // -- strings ---------------------------------------------------------------
 
 /// The routines a string's operators become.
@@ -313,7 +475,7 @@ pub fn arena(asm: &mut Asm, abi: &Abi) {
 /// emits inline; only the operations that have to walk the characters are worth
 /// a call.
 pub fn string_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
-    let (a0, a1) = (abi.arg(0), abi.arg(1));
+    let (a0, a1, a2) = (abi.arg(0), abi.arg(1), abi.arg(2));
 
     if used.concat {
         asm.blank();
@@ -362,6 +524,93 @@ pub fn string_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
         asm.asm("dec  r11");
         asm.asm("jmp  .right");
         asm.line(".done:");
+        frame.ret(asm);
+    }
+
+    if used.append {
+        asm.blank();
+        asm.comment("s = s + t, where nothing else can be holding s");
+        asm.comment("");
+        asm.comment("The same answer `concat` gives, made where `s` already is when the");
+        asm.comment("arena can still give that room back. A string's length lives with its");
+        asm.comment("characters, so growing one where it stands bumps a count every other");
+        asm.comment("name for it can see — which is why lowering only reaches this after");
+        asm.comment("proving there is no other name. See `ir::owned_strings`.");
+        asm.line(&format!("{}:", runtime_symbol(Runtime::Append)));
+        asm.comment(&format!(
+            "{a0} = the accumulator, {a1} = what to add, {a2} = whether {a1} is this \
+             statement's own -> rax = the answer"
+        ));
+        let frame =
+            StubFrame::enter(asm, abi, &["rbx", "r12", "r13", "r14", "r15"], 0, "");
+        asm.asm(&format!("mov  rbx, {a0}"));
+        asm.asm(&format!("mov  r12, {a1}"));
+        asm.asm(&format!("mov  r13, {a2}"));
+        asm.asm("mov  r14, [rbx-8]    ; how many characters it has");
+        asm.asm("mov  r15, [r12-8]    ; and how many are being added");
+
+        asm.comment("where the accumulator's block ends, the arena's rounding included");
+        asm.asm(&format!("lea  {RAX}, [r14*{CHAR_BYTES}+{}+15]", STR_HEADER));
+        asm.asm(&format!("and  {RAX}, -16"));
+        asm.asm(&format!("lea  {RAX}, [rbx+{RAX}-{STR_HEADER}]"));
+        asm.asm(&format!("cmp  {RAX}, [{ARENA_NEXT}]"));
+        asm.asm("je   .last");
+
+        asm.comment("Not the last block — but there is one more case that can still be");
+        asm.comment("given back. What was just built to be added sits immediately after,");
+        asm.comment("and it is this statement's own, so consuming it costs nobody");
+        asm.comment("anything: `s = s + string(n)` in a loop stays linear because of it.");
+        asm.asm("test r13, r13");
+        asm.asm("jz   .fallback");
+        asm.asm(&format!("lea  r11, [r12-{STR_HEADER}]"));
+        asm.asm(&format!("cmp  r11, {RAX}"));
+        asm.asm("jne  .fallback    ; something else is in between");
+        asm.asm(&format!("lea  r11, [r15*{CHAR_BYTES}+{}+15]", STR_HEADER));
+        asm.asm("and  r11, -16");
+        asm.asm(&format!("lea  r11, [r12+r11-{STR_HEADER}]"));
+        asm.asm(&format!("cmp  r11, [{ARENA_NEXT}]"));
+        asm.asm("jne  .fallback    ; nor is it the last");
+
+        asm.line(".last:");
+        asm.comment("and it has to lie in the chunk the bump pointer is walking, rather");
+        asm.comment("than in an older one that ends where it happens to stand");
+        asm.asm(&format!("lea  r11, [rbx-{STR_HEADER}]"));
+        asm.asm(&format!("cmp  r11, [{ARENA_CHUNK}]"));
+        asm.asm("jb   .fallback");
+
+        asm.comment("the room the answer needs, from the same start");
+        asm.asm("lea  r10, [r14+r15]");
+        asm.asm(&format!("lea  r11, [r10*{CHAR_BYTES}+{}+15]", STR_HEADER));
+        asm.asm("and  r11, -16");
+        asm.asm(&format!("lea  r11, [rbx+r11-{STR_HEADER}]"));
+        asm.asm(&format!("cmp  r11, [{ARENA_END}]"));
+        asm.asm("ja   .fallback    ; this chunk has no room for the rest");
+        asm.asm(&format!("mov  [{ARENA_NEXT}], r11"));
+
+        asm.comment("the characters go where the ones already there stop. Copied forward,");
+        asm.comment("and the destination is never above the source — so the one case where");
+        asm.comment("the two runs overlap, which is the block being given back, is safe.");
+        asm.asm(&format!("lea  r11, [rbx+r14*{CHAR_BYTES}]"));
+        asm.asm(&format!("xor  {RAX}, {RAX}"));
+        asm.line(".copy:");
+        asm.asm(&format!("cmp  {RAX}, r15"));
+        asm.asm("jae  .copied");
+        asm.asm(&format!("mov  r10d, [r12+{RAX}*{CHAR_BYTES}]"));
+        asm.asm(&format!("mov  [r11+{RAX}*{CHAR_BYTES}], r10d"));
+        asm.asm(&format!("inc  {RAX}"));
+        asm.asm("jmp  .copy");
+        asm.line(".copied:");
+        asm.comment("the count last of all, once the characters it promises are there");
+        asm.asm("lea  r10, [r14+r15]");
+        asm.asm(&format!("mov  [rbx-{STR_HEADER}], r10"));
+        asm.asm(&format!("mov  {RAX}, rbx"));
+        frame.ret(asm);
+
+        asm.line(".fallback:");
+        asm.comment("nothing to grow into, so this is an ordinary join");
+        asm.asm(&format!("mov  {a0}, rbx"));
+        asm.asm(&format!("mov  {a1}, r12"));
+        asm.asm(&format!("call {}", runtime_symbol(Runtime::Concat)));
         frame.ret(asm);
     }
 
@@ -506,7 +755,7 @@ pub fn string_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
 /// register is eight, and an object's storage is a sum of those — which is why
 /// every copy below walks words rather than bytes.
 pub fn list_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
-    let (a0, a1, a2) = (abi.arg(0), abi.arg(1), abi.arg(2));
+    let (a0, a1, a2, a3) = (abi.arg(0), abi.arg(1), abi.arg(2), abi.arg(3));
 
     if used.list_new {
         asm.blank();
@@ -645,11 +894,23 @@ pub fn list_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
         asm.comment("the same, for an element that arrives as an address");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListPushBig)));
         asm.comment(&format!(
-            "{a0} = the list, {a1} = where the element is, {a2} = its size"
+            "{a0} = the list, {a1} = where the element is, {a2} = its size, \
+             {a3} = whether it owns anything"
         ));
-        let frame = StubFrame::enter(asm, abi, &["rbx", "r12"], 0, "");
+        // The fourth argument, and the branch that reads it, exist only where
+        // some class in the program holds a list. Everywhere else the flag is
+        // a constant zero at every call site, so the branch is dead before it
+        // is written.
+        let saved: &'static [&'static str] = match used.fixup {
+            true => &["rbx", "r12", "r13"],
+            false => &["rbx", "r12"],
+        };
+        let frame = StubFrame::enter(asm, abi, saved, 0, "");
         asm.asm(&format!("mov  r12, {a1}    ; where it is now"));
         asm.asm(&format!("mov  rbx, {a2}    ; how much of it"));
+        if used.fixup {
+            asm.asm(&format!("mov  r13, {a3}    ; and whether a copy of it shares"));
+        }
         asm.asm(&format!("mov  {a1}, {a2}"));
         asm.asm(&format!("call {LIST_ROOM}"));
         asm.comment("the list may have moved out from under the source, and the block it");
@@ -665,6 +926,18 @@ pub fn list_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
         asm.asm("inc  r10");
         asm.asm("jmp  .copy");
         asm.line(".copied:");
+        if used.fixup {
+            asm.asm("test r13, r13");
+            asm.asm("jz   .kept");
+            asm.comment("what went in is a copy, and a copy owns nothing yet");
+            asm.asm(&format!("mov  r12, {RAX}    ; the list, over the call"));
+            asm.asm(&format!("mov  {a0}, {RDX}"));
+            asm.asm(&format!("mov  {a1}, 1"));
+            asm.asm(&format!("mov  {a2}, 0"));
+            asm.asm(&format!("call {FIXUP}"));
+            asm.asm(&format!("mov  {RAX}, r12"));
+            asm.line(".kept:");
+        }
         frame.ret(asm);
     }
 
@@ -781,11 +1054,22 @@ pub fn list_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
         asm.blank();
         asm.comment("a second list holding the same elements — what assigning one costs");
         asm.line(&format!("{}:", runtime_symbol(Runtime::ListClone)));
-        asm.comment(&format!("{a0} = the list, {a1} = bytes each -> rax = a list of its own"));
-        let frame =
-            StubFrame::enter(asm, abi, &["rbx", "r12", "r13"], 0, "");
+        asm.comment(&format!(
+            "{a0} = the list, {a1} = bytes each, {a2} = whether the elements own \
+             anything -> rax = a list of its own"
+        ));
+        // As with the push: the third argument is only ever anything but zero
+        // where some class in the program holds a list.
+        let saved: &'static [&'static str] = match used.fixup {
+            true => &["rbx", "r12", "r13", "r14"],
+            false => &["rbx", "r12", "r13"],
+        };
+        let frame = StubFrame::enter(asm, abi, saved, 0, "");
         asm.asm(&format!("mov  r12, {a0}"));
         asm.asm(&format!("mov  r13, {a1}    ; bytes per element"));
+        if used.fixup {
+            asm.asm(&format!("mov  r14, {a2}"));
+        }
         asm.asm("mov  rbx, [r12-8]");
         asm.asm(&format!("mov  {a0}, rbx"));
         asm.asm(&format!("mov  {a1}, r13"));
@@ -803,6 +1087,18 @@ pub fn list_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
         asm.asm("inc  r11");
         asm.asm("jmp  .copy");
         asm.line(".copied:");
+        if used.fixup {
+            asm.asm("test r14, r14");
+            asm.asm("jz   .kept");
+            asm.comment("the elements are copies too, and share what the originals hold");
+            asm.asm(&format!("mov  r12, {RAX}    ; the new list, over the call"));
+            asm.asm(&format!("mov  {a0}, {RAX}"));
+            asm.asm(&format!("mov  {a1}, rbx"));
+            asm.asm(&format!("mov  {a2}, r13"));
+            asm.asm(&format!("call {FIXUP}"));
+            asm.asm(&format!("mov  {RAX}, r12"));
+            asm.line(".kept:");
+        }
         frame.ret(asm);
     }
 }
@@ -855,13 +1151,14 @@ pub fn text_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
 
     if used.print_str {
         asm.blank();
-        asm.comment("print a string: encode the whole of it, then hand printf one C string");
+        asm.comment("print a string: encode the whole of it, then write those bytes by count");
         asm.line(&format!("{PRINT_STR}:"));
         asm.comment(&format!("{a0} = the string"));
         let frame = StubFrame::enter(asm, abi, &["rbx", "r12", "r13"], 0, "");
         asm.asm(&format!("mov  r12, {a0}"));
         asm.asm(&format!("mov  rbx, [{a0}-8]"));
-        asm.comment("four bytes per character is the most UTF-8 can need, plus the NUL");
+        asm.comment("four bytes per character is the most UTF-8 can need; the spare byte");
+        asm.comment("keeps an empty string from asking for a buffer of nothing");
         asm.asm(&format!("lea  {a0}, [rbx*4+1]"));
         asm.asm(&format!("cmp  {a0}, [{SCRATCH_CAP}]"));
         asm.asm("jbe  .room");
@@ -883,11 +1180,11 @@ pub fn text_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
         asm.asm("dec  rbx");
         asm.asm("jmp  .next");
         asm.line(".done:");
-        asm.asm("mov  byte [r13], 0");
-        asm.asm(&format!("lea  {a0}, [{FMT_STR}]"));
-        asm.asm(&format!("mov  {a1}, [{SCRATCH}]"));
-        asm.variadic(abi);
-        asm.asm("call printf");
+        asm.comment("what the encoder wrote is where it stopped, less where it began");
+        asm.asm(&format!("mov  {a0}, [{SCRATCH}]"));
+        asm.asm(&format!("mov  {a1}, r13"));
+        asm.asm(&format!("sub  {a1}, {a0}"));
+        asm.asm(&format!("call {WRITE_TEXT}"));
         frame.ret(asm);
     }
 
@@ -900,11 +1197,10 @@ pub fn text_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
             StubFrame::enter(asm, abi, &[], 8, "the encoded character");
         asm.asm(&format!("lea  {a1}, {}", frame.local(0)));
         asm.asm(&format!("call {UTF8}"));
-        asm.asm(&format!("mov  byte [rsp+{RAX}+{}], 0", frame.scratch_at()));
-        asm.asm(&format!("lea  {a0}, [{FMT_STR}]"));
-        asm.asm(&format!("lea  {a1}, {}", frame.local(0)));
-        asm.variadic(abi);
-        asm.asm("call printf");
+        asm.comment("the encoder answers how many bytes it took, which is what to write");
+        asm.asm(&format!("mov  {a1}, {RAX}"));
+        asm.asm(&format!("lea  {a0}, {}", frame.local(0)));
+        asm.asm(&format!("call {WRITE_TEXT}"));
         frame.ret(asm);
     }
 }

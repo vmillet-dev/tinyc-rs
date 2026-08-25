@@ -14,6 +14,20 @@ pub struct ArrayId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ListId(pub u32);
 
+/// One variant of a declared enum: what it is called, and what it carries.
+#[derive(Clone, Debug)]
+pub struct VariantInfo {
+    pub name: String,
+    /// The types written after the name, in order. Empty for a variant that
+    /// carries nothing, which is every variant TinyC had until enums gained
+    /// payloads.
+    ///
+    /// Each has to fit in a register — see `sema`. An object or an array would
+    /// have to live *inside* the value, which would make an enum's size the
+    /// biggest of its variants and drag the whole layout ordering in with it.
+    pub payload: Vec<Ty>,
+}
+
 /// What every stage after the parser needs to know about a declared enum: what
 /// it is called, and what its variants are called *in order*.
 ///
@@ -22,7 +36,30 @@ pub struct ListId(pub u32);
 #[derive(Clone, Debug)]
 pub struct EnumInfo {
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<VariantInfo>,
+}
+
+impl EnumInfo {
+    /// Whether any variant carries something, and so whether a value of this
+    /// enum is a **pointer** rather than a bare tag.
+    ///
+    /// One representation for the whole enum rather than one per variant: a
+    /// `Shape` has to be one thing wherever a `Shape` is expected, and which
+    /// variant is in it is exactly what the program does not know until it
+    /// matches.
+    pub fn carries_data(&self) -> bool {
+        self.variants.iter().any(|v| !v.payload.is_empty())
+    }
+
+    /// How many payload slots a value of this enum reserves: the most any one
+    /// variant carries. Zero for an enum that is still a bare tag.
+    pub fn slots(&self) -> usize {
+        self.variants.iter().map(|v| v.payload.len()).max().unwrap_or(0)
+    }
+
+    pub fn names(&self) -> Vec<&str> {
+        self.variants.iter().map(|v| v.name.as_str()).collect()
+    }
 }
 
 /// An array type: what it holds, and how many.
@@ -173,6 +210,53 @@ impl TypeTable {
         }
     }
 
+    /// Whether copying the *bytes* of a value of this type would leave two
+    /// values naming one run of arena elements.
+    ///
+    /// An array and an object are copied byte for byte, and for everything they
+    /// used to be able to hold that was the whole of the copy: what a field
+    /// holds, it held *inside* itself. A list is the exception — a field holds
+    /// its address — so an object with one in it needs a second step after the
+    /// bytes, and this is the question of whether it does.
+    ///
+    /// Asked of the whole **hierarchy**, not of one class, because the value in
+    /// a `Reading`-shaped hole may be a `Frost`: what has to be fixed up is
+    /// decided by the object at run time, and this only decides whether to ask.
+    ///
+    /// Terminates on a recursive class because the recursion goes *through* a
+    /// list, and a list answers `true` without looking at what it holds:
+    /// `class Node { Node[] kids; }` is settled at `kids`. Containment by value
+    /// cannot cycle at all — `containment_order` refuses it.
+    pub fn holds_a_list(&self, ty: Ty) -> bool {
+        match ty {
+            Ty::List(_) => true,
+            Ty::Array(id) => self.holds_a_list(self.array(id).elem),
+            Ty::Class(id) => self
+                .hierarchy_of(id)
+                .into_iter()
+                .any(|at| self.class(at).fields.iter().any(|f| self.holds_a_list(f.ty))),
+            _ => false,
+        }
+    }
+
+    /// Whether one class's own fields hold a list, which is what decides
+    /// whether *that* class needs a routine of its own — as against
+    /// [`Self::holds_a_list`], which asks about everything a hole of this type
+    /// could turn out to contain.
+    pub fn class_holds_a_list(&self, id: ClassId) -> bool {
+        self.class(id).fields.iter().any(|f| self.holds_a_list(f.ty))
+    }
+
+    /// `id` and every class that may stand in for it: itself and its
+    /// descendants. Its *ancestors* are not among them — a base cannot be put
+    /// where a subclass is wanted — and their fields are in `id`'s list anyway.
+    pub fn hierarchy_of(&self, id: ClassId) -> Vec<ClassId> {
+        (0..self.classes.len() as u32)
+            .map(ClassId)
+            .filter(|&at| self.descends_from(at, id))
+            .collect()
+    }
+
     /// The class at the top of `id`'s hierarchy, which is what decides how much
     /// room every class in it reserves.
     pub fn root_of(&self, id: ClassId) -> ClassId {
@@ -209,7 +293,11 @@ impl TypeTable {
 impl EnumInfo {
     /// The tag a variant is represented by, which is where it was written.
     pub fn tag(&self, variant: &str) -> Option<i64> {
-        self.variants.iter().position(|v| v == variant).map(|at| at as i64)
+        self.variants.iter().position(|v| v.name == variant).map(|at| at as i64)
+    }
+
+    pub fn variant(&self, name: &str) -> Option<&VariantInfo> {
+        self.variants.iter().find(|v| v.name == name)
     }
 }
 
@@ -323,8 +411,17 @@ impl Ty {
     /// addresses would quietly answer a different question, so this one costs a
     /// call. Arrays and objects cannot — element by element is a loop nobody
     /// asked for, and the addresses are not what anybody meant.
-    pub fn has_equality(self) -> bool {
-        !matches!(self, Ty::Array(_) | Ty::List(_) | Ty::Class(_))
+    ///
+    /// An enum that carries a payload joins them, for exactly that reason: two
+    /// `Circle`s are the same value only if their radii are, and comparing the
+    /// two pointers would answer whether they were built by the same
+    /// expression. `match` is what asks about one of those.
+    pub fn has_equality(self, types: &TypeTable) -> bool {
+        match self {
+            Ty::Array(_) | Ty::List(_) | Ty::Class(_) => false,
+            Ty::Enum(id) => !types.enum_info(id).carries_data(),
+            _ => true,
+        }
     }
 
     /// Whether `print` can render a value of this type.
@@ -332,6 +429,10 @@ impl Ty {
     /// Not the same question as whether it fits in a register: a list does, and
     /// printing it would show the address of its elements rather than the
     /// elements — which is the answer to a question nobody asked.
+    ///
+    /// An enum with a payload *is* printable, and prints what an enum has
+    /// always printed: the name of its variant. What it carries has a type of
+    /// its own and a way of being written already.
     pub fn is_printable(self) -> bool {
         self.fits_in_a_register() && !matches!(self, Ty::List(_))
     }
@@ -342,6 +443,12 @@ impl Ty {
     /// holds is their address. That is why assigning one copies rather than
     /// aliases, and why returning one is done by filling room the *caller*
     /// reserved — an address that never travels outward cannot dangle.
+    ///
+    /// An enum does, whether or not it carries anything: one that does is a
+    /// pointer to its tag and payload in the arena, exactly as a string is a
+    /// pointer to its characters. It can be, because an enum is **read-only** —
+    /// there is no syntax that writes into a payload — so two names for one of
+    /// them cannot be told apart, which is the same bargain a string strikes.
     pub fn fits_in_a_register(self) -> bool {
         !matches!(self, Ty::Array(_) | Ty::Class(_))
     }
@@ -713,7 +820,15 @@ pub enum ExprKind {
     /// name and so that a variant never has to be told apart from a variable.
     /// Both halves keep a span: the enum name is what "no enum called `Color`"
     /// underlines, the variant what "`Color` has no variant `Purple`" does.
-    Variant { enum_name: String, enum_span: Span, variant: String, variant_span: Span },
+    Variant {
+        enum_name: String,
+        enum_span: Span,
+        variant: String,
+        variant_span: Span,
+        /// What the variant was given, in order. Empty for one that carries
+        /// nothing, which is every variant written without parentheses.
+        args: Vec<Expr>,
+    },
     /// `match (value) { Colour::Red => "warm", ... }`.
     ///
     /// A match is an expression, and a statement only in the way a call is one:
@@ -1001,16 +1116,96 @@ pub enum ArmBody {
     Block(Block),
 }
 
-/// One arm of a `match`: a qualified variant and what it does.
+/// What an arm matches.
 ///
-/// The pattern is spelled exactly as the expression would be, `Color::Red`, and
-/// carries the same two spans for the same two diagnostics.
+/// A pattern is a **value**, never a name to bind. TinyC has no binding
+/// patterns and no destructuring, so an arm says "the scrutinee is this one"
+/// and nothing else — which is what leaves exhaustiveness a question about
+/// values rather than about shapes.
+#[derive(Clone, Debug)]
+pub enum Pattern {
+    /// `Color::Red`. Always written qualified, so a variant never has to be
+    /// told apart from a variable. Both halves keep a span: the enum name is
+    /// what "this arm matches `X`" underlines, the variant what "`X` has no
+    /// variant `Y`" does.
+    Variant {
+        enum_name: String,
+        enum_span: Span,
+        variant: String,
+        variant_span: Span,
+        /// The names this arm gives what the variant carries, in order. Each
+        /// is a fresh variable for the length of the arm, so two arms may use
+        /// the same name for quite different things.
+        bindings: Vec<(String, Span)>,
+    },
+    /// A literal of whatever the scrutinee is: `3`, `-1`, `'a'`, `"done"`,
+    /// `true`. Spelled exactly as the expression would be.
+    Int(i64),
+    Char(char),
+    Str(Vec<char>),
+    Bool(bool),
+    /// `_` — everything the arms before it did not take.
+    ///
+    /// Deliberately **not** available when matching an enum. The whole value of
+    /// the exhaustiveness check is that adding a variant stops every `match`
+    /// that does not handle it from compiling, and a catch-all would swallow
+    /// exactly that. An `int` or a `string` has no finite set of values to
+    /// enumerate, so there it is not a catch-all but the only way to be
+    /// complete — and it is required rather than optional.
+    Wildcard,
+}
+
+impl Pattern {
+    /// How this pattern is written, for a diagnostic that quotes it back.
+    pub fn describe(&self) -> String {
+        match self {
+            Pattern::Variant { enum_name, variant, .. } => format!("`{enum_name}::{variant}`"),
+            Pattern::Int(v) => format!("`{v}`"),
+            Pattern::Char(c) => format!("`'{c}'`"),
+            Pattern::Str(chars) => {
+                format!("`\"{}\"`", chars.iter().collect::<String>().escape_debug())
+            }
+            Pattern::Bool(v) => format!("`{v}`"),
+            Pattern::Wildcard => "`_`".to_string(),
+        }
+    }
+
+    /// The type a value has to be for this pattern to be about it, or `None`
+    /// for `_`, which is about every type.
+    pub fn matches_ty(&self) -> Option<Ty> {
+        match self {
+            Pattern::Int(_) => Some(Ty::Int),
+            Pattern::Char(_) => Some(Ty::Char),
+            Pattern::Str(_) => Some(Ty::Str),
+            Pattern::Bool(_) => Some(Ty::Bool),
+            // An enum's identity is the program's, so this one cannot answer
+            // on its own: `sema` resolves the name instead.
+            Pattern::Variant { .. } | Pattern::Wildcard => None,
+        }
+    }
+
+    /// Whether two patterns select the same values, which is what makes the
+    /// second of them an arm that can never run.
+    pub fn same_as(&self, other: &Pattern) -> bool {
+        match (self, other) {
+            (Pattern::Variant { variant: a, .. }, Pattern::Variant { variant: b, .. }) => a == b,
+            (Pattern::Int(a), Pattern::Int(b)) => a == b,
+            (Pattern::Char(a), Pattern::Char(b)) => a == b,
+            (Pattern::Str(a), Pattern::Str(b)) => a == b,
+            (Pattern::Bool(a), Pattern::Bool(b)) => a == b,
+            (Pattern::Wildcard, Pattern::Wildcard) => true,
+            _ => false,
+        }
+    }
+}
+
+/// One arm of a `match`: a pattern and what it does.
 #[derive(Clone, Debug)]
 pub struct MatchArm {
-    pub enum_name: String,
-    pub enum_span: Span,
-    pub variant: String,
-    pub variant_span: Span,
+    pub pattern: Pattern,
+    /// The whole pattern as written, which is what a diagnostic about this arm
+    /// underlines.
+    pub span: Span,
     pub body: ArmBody,
 }
 
@@ -1019,6 +1214,14 @@ pub struct MatchArm {
 pub struct Variant {
     pub name: String,
     pub name_span: Span,
+    /// The types written after the name, if there were any: `Circle(int)`.
+    ///
+    /// Positional rather than named, unlike a class's fields. A variant is
+    /// taken apart by a pattern rather than reached into by name, and the
+    /// pattern that takes it apart is where the names get chosen —
+    /// `Shape::Circle(radius)` names it whatever the reader of *that* arm
+    /// wants it called.
+    pub payload: Vec<TypeRef>,
 }
 
 /// One field as it was declared: `int r;`.
@@ -1078,6 +1281,14 @@ pub struct Param {
 
 /// The name a method's receiver goes by.
 pub const SELF: &str = "self";
+
+/// How a match arm spells "everything the arms before me did not take".
+///
+/// An ordinary identifier as far as the lexer is concerned, which is the whole
+/// reason it needs naming here rather than being a token of its own: nothing
+/// stops a program calling a variable `_`, and only a pattern reads it as
+/// anything else.
+pub const WILDCARD: &str = "_";
 
 /// A function declaration: `fn add(int a, int b) -> int { ... }`.
 ///
@@ -1355,7 +1566,8 @@ fn dump_expr(out: &mut String, expr: &Expr, depth: usize) {
             out.push_str(&format!("{pad}match\n"));
             dump_expr(out, scrutinee, depth + 1);
             for arm in arms {
-                out.push_str(&format!("{pad}  {}::{}\n", arm.enum_name, arm.variant));
+                let pattern = arm.pattern.describe();
+                out.push_str(&format!("{pad}  {}\n", pattern.trim_matches('`')));
                 match &arm.body {
                     ArmBody::Value(value) => dump_expr(out, value, depth + 2),
                     ArmBody::Block(block) => dump_block(out, block, depth + 2),
@@ -1409,7 +1621,9 @@ mod tests {
         let mut table = TypeTable::default();
         table.enums.push(EnumInfo {
             name: "Colour".to_string(),
-            variants: vec!["Red".to_string(), "Green".to_string()],
+            variants: ["Red", "Green"]
+                .map(|n| VariantInfo { name: n.to_string(), payload: Vec::new() })
+                .to_vec(),
         });
         table.classes.push(ClassInfo {
             name: "Shape".to_string(),
@@ -1477,14 +1691,28 @@ mod tests {
 
     #[test]
     fn the_aggregates_are_the_types_that_answer_no_equality() {
+        // One enum whose variants carry nothing, and one whose first does.
+        let mut types = TypeTable::default();
+        types.enums.push(EnumInfo {
+            name: "Plain".to_string(),
+            variants: vec![VariantInfo { name: "A".to_string(), payload: Vec::new() }],
+        });
+        types.enums.push(EnumInfo {
+            name: "Carries".to_string(),
+            variants: vec![VariantInfo { name: "A".to_string(), payload: vec![Ty::Int] }],
+        });
+
         for ty in [Ty::Int, Ty::Str, Ty::Char, Ty::Bool, Ty::Enum(EnumId(0))] {
-            assert!(ty.has_equality(), "{ty:?} should compare");
+            assert!(ty.has_equality(&types), "{ty:?} should compare");
         }
         // Element by element is a loop nobody asked for, and comparing the
         // addresses would answer a different question.
         for ty in [Ty::Array(ArrayId(0)), Ty::List(ListId(0)), Ty::Class(ClassId(0))] {
-            assert!(!ty.has_equality(), "{ty:?} should not compare");
+            assert!(!ty.has_equality(&types), "{ty:?} should not compare");
         }
+        // And an enum that carries something joins them, for exactly that
+        // reason: two `Circle`s are the same value only if their radii are.
+        assert!(!Ty::Enum(EnumId(1)).has_equality(&types));
     }
 
     #[test]
