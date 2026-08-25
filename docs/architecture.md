@@ -786,9 +786,47 @@ was left behind — which is still there, because nothing here is ever reclaimed
 The same property that removed lifetimes from the language removes a special
 case from the runtime.
 
-**Growing abandons the old block**, like everything else on this arena. Doubling
-is what keeps that honest: n pushes copy 2n elements in total and leave n behind,
-so both stay linear.
+**Growing usually costs nothing at all, and abandons the old block when it
+cannot.** A bump pointer can give back exactly one thing: the block it handed
+out last. So `list_room` asks, before doubling, whether the block it is about to
+grow *still* ends where the next one would begin — and if it does, and it lies
+in the chunk that pointer is bumping through, and the chunk has room, the
+capacity simply goes up where it stands. No second block, no copy, nothing left
+behind.
+
+```
+mov  r10, r14
+imul r10, r13
+add  r10, 16+15          ; the header, and the arena's rounding
+and  r10, -16
+lea  r10, [r12+r10-16]   ; where this block ends
+cmp  r10, [tc$rt$arena_next]
+jne  .move               ; something has been handed out since
+```
+
+Both guards matter, and the second is the subtle one: without it a block from an
+*older* chunk that happened to end where the current bump pointer stands would
+be extended over memory belonging to something else. `tc$rt$arena_chunk` — the
+start of the chunk in use — is recorded on every refill for that one question.
+
+**A `no` to any of the three costs a copy and never an answer**, which is what
+makes the whole thing safe to get wrong. If the arena's rounding ever stopped
+matching the arithmetic here, every list would simply move as it used to.
+
+What it is worth, measured: a program reading two million lines went from
+**641 MB to 396 MB**, and three thousand lists of four thousand elements from
+194 MB and 1157 ms to **153 MB and 951 ms**. `read_line` builds every line one
+push at a time, so this is the path it takes on every doubling of every line.
+
+**It stops at the size of a chunk.** When a block outgrows `CHUNK_BYTES`, the
+refill asks `malloc` for exactly what was wanted, so the fresh chunk has no
+headroom and the next doubling always moves. A list of thirty million elements
+measures the same either way. Giving big blocks proportional headroom would fix
+it and would cost up to twice the peak for every oversized allocation — strings
+that will never grow included — so it has not been done.
+
+The doubling is what keeps the fallback honest: n pushes copy at most 2n
+elements in total and leave at most n behind, so both stay linear.
 
 **A literal now takes its shape from the type it is given to.** `[1, 2, 3]` is an
 `int[3]` on its own and an `int[]` where a list is wanted, and nothing in the
@@ -893,10 +931,34 @@ an accented literal comes out as mojibake. `Used::encodes_text` and
 #### Where the newline goes
 
 `println` stops being a separate statement during lowering: its line ending
-becomes one more piece of text, joined to the text in front of it when there is
-any. So `println("done")` is a single write of `"done\n"`, and the format
-strings themselves no longer end a line — `fmt_int` is `"%lld", 0`, not
-`"%lld", 10, 0`.
+joins whatever it wrote last. Which is which depends on what that was, and both
+cases end up as **one call**:
+
+* **The last piece is text.** The newline joins it, so `println("done")` is a
+  single write of `"done\n"`.
+* **The last piece is a value.** There is no text to join it to, so the *value*
+  ends the line: `Instr::Print` carries a `newline` flag, and the backend
+  reaches for `fmt_int_line` — `"%lld", 10, 0` — instead of `fmt_int`.
+
+The second used to be two calls, and the second of them handed `printf` a
+format *and* an argument in order to write one character. A program carries only
+the formats it reaches, so one that never calls `print` carries no `fmt_int` at
+all.
+
+A string and a character are the exception, because their value goes out through
+a routine rather than a format of their own: a `println` of one still ends its
+line separately, with `printf(fmt_newline)` — one call and one argument, and
+`fmt_newline` is `10, 0`.
+
+The rule the whole thing rests on is unchanged: **`printf` is only ever handed
+a format the compiler wrote**, with one specifier and one value. Text the
+program wrote is always the argument, never the format.
+
+The first shape of this rule was subtly wrong, and it is worth knowing why. It
+looked for *text left over* rather than for a value of this statement's own —
+and `println()` with nothing to write has no text left over either, so it
+reached back and set the flag on the write before it. The blank line vanished
+into the line above. No dump showed it; running `examples/format.tc` did.
 
 The tree keeps the two spellings apart even so, because `--emit ast` should show
 the program that was written rather than the desugaring. `for` is treated the
@@ -1318,11 +1380,38 @@ Columns are counted in characters rather than bytes, so non-ASCII text earlier
 on a line does not shift them. `examples/errors/` holds one program per kind of
 error.
 
-Three rules keep a list of them readable:
+**Every stage reports every mistake it can still find its footing after**, so a
+file with four things wrong in it is one recompile rather than four.
+
+The type checker was always able to: it checks each function whatever the last
+one did. The lexer and the parser could not, and had to learn how, because
+neither can *continue* through a mistake — a parser that has just read
+`int x = 1` followed by `int` has no idea what the program meant. So instead
+they throw tokens away until they reach somewhere a new one could begin:
+
+| | where it starts again |
+|---|---|
+| lexer, one bad character | the next character — a stray `@` costs the `@` |
+| lexer, a token that went wrong part way | the rest of the line, since what follows an unclosed quote is not worth reading as tokens |
+| parser, in a statement | a `;` (consumed), a `}` (left for the block), or anything that could open a statement |
+| parser, in a declaration | the next `fn`, `class` or `enum` **outside braces** |
+
+That last condition is what keeps one mistake from becoming a message per line:
+a missing `}` never lets the brace count come back to zero, so the rest of the
+file is skipped and the one real mistake is the only thing reported.
+
+Two things are worth knowing about the shape of it. The tree the parser builds
+while recovering is **thrown away whole** — it exists only to let the parser
+keep reading, and `sema` never sees it. And recovery *puts back the nesting the
+failed construct charged*, by remembering the counter and restoring it, since a
+parse that failed part way through has no idea how many levels it took.
+
+Three more rules keep a list of diagnostics readable:
 
 * **Source order.** The type checker walks a statement's value before its name,
   so it finds mistakes out of order; the diagnostics are sorted before they are
-  printed.
+  printed. So are the parser's, for the same reason: a mistake inside a
+  declaration is found before the one that ended it.
 * **One mistake, one message.** `y = y + 1` mentions an undeclared `y` twice and
   is reported once — the first time a name is missed in a function is the only
   time it is worth saying so.
@@ -1648,6 +1737,19 @@ tc$rt$abort:                 ; as emitted for Windows; on Linux the reservation
 It can afford to destroy `rsp` because it never returns. So a leaf full of
 guarded arithmetic is still a leaf, and reserves nothing.
 
+**Only the ways this program can fail are emitted.** There are eleven, each a
+row of `runtime::ABORTS` holding its label, its message, and what in the program
+reaches it. That last field is what the row gained: the table used to go into
+every program that could fail at all, so a `hello.tc` that never indexes and
+never allocates still carried 483 bytes of messages about both. It now carries
+72 — the two it can reach, arithmetic and memory — and `arith.tc`, which the
+optimiser folds to the numbers it prints, carries none at all and does not
+declare `write` or `exit` either.
+
+The reachability is asked once and read three times: to emit the stubs, to emit
+their messages, and to decide whether *anything* can fail. Putting it in the row
+is what keeps adding a twelfth way to fail a matter of adding a line.
+
 ### Why not wrap
 
 Wrapping is what C, Go and Java do, and `int` really is a 64-bit machine word,
@@ -1697,6 +1799,50 @@ The check runs *before* dead functions are pruned, deliberately. A frame nothing
 reaches is still one the program asked for, and `sema` reports a mistake in an
 uncalled function too — what is emitted must not decide what is diagnosed, or a
 program would start failing to compile the moment something called it.
+
+#### What a frame is made of, and what it stopped being made of
+
+Two things used to be in there that are not any more, and both were room the
+program never asked for.
+
+**A literal is built where it is going.** `Row { cells: [c, c, c] }` used to
+reserve room for the array, fill it, and copy it into the field — so the array
+existed twice and the scratch stayed reserved for the whole call. Now the field
+*is* where it is built. In `examples/errors/frame_too_big.tc` that was 42,752
+bytes of the 272,776, and it is why that example needed a seventh cube to go on
+being an error at all.
+
+It is only sound where nothing can name the room being filled, which is what
+`ir::Room` says in the one place it can be got wrong:
+
+| | |
+|---|---|
+| `Room::Fresh` | a field of an object being built, an element of an array literal, the room a declaration just reserved, the room a caller passed for a return |
+| `Room::Named` | the target of an assignment |
+
+The second is not a technicality. `a = [a[1], a[0]]` is a swap, and filling `a`
+element by element would write `a[1]` into `a[0]` and then read it straight back
+out — answering `[2, 2]` for a swap of `[1, 2]`. So an assignment still builds
+the literal elsewhere and copies it, which is what makes the whole value change
+at once, for the same reason assignment copies rather than aliases.
+
+**Room goes back when a block ends.** Two blocks that cannot be running at the
+same time share it:
+
+```c
+if (c) { int[1000] a = ...; } else { int[1000] b = ...; }   // eight kilobytes, not sixteen
+```
+
+Sound for the reason nothing in this language dangles: no address travels
+outward, and inside a function that means no frame address is ever stored into
+memory or kept by a variable declared further out — assignment copies. So when a
+block's names go out of scope, so does every way of reaching what they named. A
+block inside a loop is lowered once, so its room is the same room on every
+iteration, which is what a local in a loop body has always been.
+
+The lowering therefore keeps two counters: how much is in use *here*, which goes
+up and down, and the most that was ever in use at once, which is what the
+prologue reserves.
 
 ### A frame bigger than a page — answered by walking down it
 

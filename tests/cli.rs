@@ -217,7 +217,7 @@ fn no_optimise_hands_the_backend_what_lowering_produced() {
 
     let optimised = tinyc(&[source.as_os_str(), emit_ir[0], emit_ir[1]]);
     assert!(optimised.succeeded(), "{}{}", optimised.stdout, optimised.stderr);
-    assert!(optimised.stdout.contains("print int 13"), "{}", optimised.stdout);
+    assert!(optimised.stdout.contains("println int 13"), "{}", optimised.stdout);
     assert!(!optimised.stdout.contains("add"), "{}", optimised.stdout);
 
     // And it is a compiler flag, not an inspection one: it changes the build.

@@ -394,7 +394,7 @@ impl Backend for X64 {
             runtime::input_stubs(&mut asm, self.platform, &used);
         }
         if used.aborts {
-            runtime::abort_stubs(&mut asm, abi);
+            runtime::abort_stubs(&mut asm, abi, &used);
         }
         asm.finish()
     }

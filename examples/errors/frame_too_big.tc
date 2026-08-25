@@ -3,7 +3,7 @@
 // function declares adds up, even when the values never exist together.
 //
 // Not one of these classes is too big — a cube is well under the limit an
-// object has. Six cubes are, because assignment copies, and each copy is
+// object has. Seven cubes are, because assignment copies, and each copy is
 // another whole cube standing in the frame beside the last.
 class Cell { int[8] v; }              //     72 bytes
 class Row  { Cell[8] cells; }         //    584 bytes
@@ -21,6 +21,7 @@ fn main() {
   Cube four = one;
   Cube five = one;
   Cube six = one;
+  Cube seven = one;
 
-  println(six.grids[0].rows[0].cells[0].v[0]);
+  println(seven.grids[0].rows[0].cells[0].v[0]);
 }

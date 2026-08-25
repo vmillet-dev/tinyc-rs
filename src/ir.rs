@@ -38,6 +38,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{
+    FieldInit,
     ArmBody, BinOp, Block as AstBlock, Builtin, ClassId, CmpOp, Expr, ExprKind, FnDecl, LogicOp,
     MatchArm, Place, Prim, PrintPart, Program as Ast, Stmt, Ty, TypeTable, is_scalar_value,
 };
@@ -195,7 +196,18 @@ pub enum Instr {
     /// only their *spelling* belongs to a backend.
     RtCall { dst: Option<VReg>, callee: Runtime, args: Vec<Value> },
     /// Write one value out, rendered according to its type.
-    Print { ty: Ty, val: Value },
+    ///
+    /// `newline` is set when this write is the last thing a `println` does, so
+    /// that ending the line costs nothing: the format the backend reaches for
+    /// already ends in one. Without it a `println(n)` was two calls, the second
+    /// of them handing `printf` a format *and* an argument in order to write a
+    /// single character.
+    ///
+    /// It is the value that carries the flag rather than a piece of text after
+    /// it, because only the last *part* of a `println` can end the line, and
+    /// when that part is text the newline simply joins it — the same reason
+    /// `println("done")` has always been one call and not two.
+    Print { ty: Ty, val: Value, newline: bool },
     /// Write out a run of text the program settled at compile time: the words
     /// around the specifiers in a format string, and the line ending a
     /// `println` adds.
@@ -602,6 +614,34 @@ impl DivGuards {
     }
 }
 
+/// Whether the room being written into is brand new, or already has a name.
+///
+/// It decides one thing, and it is the difference between two and four
+/// instructions per element: whether an aggregate **literal** may be built where
+/// it is going, rather than somewhere else and then copied over.
+///
+/// * [`Room::Fresh`] — a field of an object being constructed, an element of an
+///   array literal, the room a declaration just reserved, the room a caller
+///   passed for a return. Nothing can name it yet, so the expression filling it
+///   cannot read it, and filling it piece by piece is not observable.
+/// * [`Room::Named`] — the target of an assignment. Here it very much can:
+///
+///   ```text
+///   int[2] a = [1, 2];
+///   a = [a[1], a[0]];      // a swap
+///   ```
+///
+///   Filling `a` element by element would write `a[1]` into `a[0]` and then
+///   read it straight back out, and the swap would answer `[2, 2]`. So an
+///   assignment builds the literal elsewhere and copies it, which is what makes
+///   the whole value change at once — the same reason assignment copies rather
+///   than aliasing in the first place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Room {
+    Fresh,
+    Named,
+}
+
 /// One function's control flow graph, virtual registers and signature.
 pub struct Function {
     pub name: String,
@@ -808,7 +848,15 @@ impl Program {
                     None => call,
                 }
             }
-            Instr::Print { ty, val } => format!("print {} {}", ty.name(&self.table), value(val)),
+            Instr::Print { ty, val, newline } => format!(
+                "print{} {} {}",
+                match newline {
+                    true => "ln",
+                    false => "",
+                },
+                ty.name(&self.table),
+                value(val)
+            ),
             Instr::PrintText { id } => {
                 format!("print text{} {:?}", id.0, self.texts[id.0 as usize])
             }
@@ -862,6 +910,7 @@ pub fn lower(ast: &Ast, types: &Types) -> Result<Program> {
             scopes: vec![HashMap::new()],
             loops: Vec::new(),
             frame_bytes: 0,
+            frame_peak: 0,
             out_pointer: None,
             name_counts: HashMap::new(),
             types,
@@ -1111,10 +1160,15 @@ struct Lowering<'a> {
     scopes: Vec<HashMap<String, (VReg, Ty)>>,
     /// The loops enclosing the statement being lowered, innermost last.
     loops: Vec<LoopFrame>,
-    /// Bytes of frame handed out so far, which is the offset the next aggregate
-    /// gets. Never reclaimed: the room is reserved for the whole call, which
-    /// costs a few bytes and spares the lowering a lifetime analysis.
+    /// Where the next aggregate goes, which is how much of the frame is in use
+    /// *here*. It goes back down when a block ends — see [`Self::block_stmts`].
     frame_bytes: u32,
+    /// The most that was ever in use at once, and so what the prologue reserves.
+    ///
+    /// Two counters rather than one because room can now be given back: what a
+    /// block took is available again to the block after it, and only the
+    /// high-water mark is a fact about the function.
+    frame_peak: u32,
     /// Where a `return` copies to, for a function whose answer does not fit in
     /// a register. `None` for every other function.
     out_pointer: Option<VReg>,
@@ -1188,7 +1242,10 @@ impl Lowering<'_> {
             name: decl.name.clone(),
             params,
             ret,
-            frame_bytes: self.frame_bytes,
+            // What the prologue reserves is the most that was ever in use at
+            // once, not what is in use at the end — which is nothing, since
+            // every scope has closed by now.
+            frame_bytes: self.frame_peak,
             blocks: prune_unreachable(blocks),
             vreg_names: self.vreg_names,
         }
@@ -1274,12 +1331,33 @@ impl Lowering<'_> {
 
     // -- statements --------------------------------------------------------
 
+    /// Lower a block's statements in a scope of their own.
+    ///
+    /// The frame is given back with the scope, so two blocks that cannot be
+    /// running at the same time share their room:
+    ///
+    /// ```text
+    /// if (c) { int[1000] a = ...; } else { int[1000] b = ...; }
+    /// ```
+    ///
+    /// takes eight kilobytes rather than sixteen. That is sound for the same
+    /// reason nothing in this language dangles: **no address ever travels
+    /// outward**, and inside a function that means no frame address is ever
+    /// stored into memory or kept in a variable declared outside — assignment
+    /// copies. So when a block's names go out of scope, so does every way of
+    /// reaching what they named.
+    ///
+    /// A block inside a loop is lowered once and re-entered at run time, so its
+    /// room is the same room on every iteration, which is what a local in a loop
+    /// body has always been.
     fn block_stmts(&mut self, block: &AstBlock) {
+        let outer = self.frame_bytes;
         self.scopes.push(HashMap::new());
         for stmt in &block.stmts {
             self.stmt(stmt);
         }
         self.scopes.pop();
+        self.frame_bytes = outer;
     }
 
     fn stmt(&mut self, stmt: &Stmt) {
@@ -1297,7 +1375,7 @@ impl Lowering<'_> {
                     false if builds_its_own(init) => self.expr_into(dst, init),
                     false => {
                         self.allocate_for(dst, ty);
-                        self.write_through(Value::Reg(dst), init);
+                        self.write_through(Value::Reg(dst), init, Room::Fresh);
                     }
                 }
             }
@@ -1311,14 +1389,14 @@ impl Lowering<'_> {
                         // An aggregate variable keeps its *room*, so the value
                         // is copied into it rather than the address swapped.
                         // Anything else would make assignment aliasing.
-                        false => self.write_through(Value::Reg(dst), value),
+                        false => self.write_through(Value::Reg(dst), value, Room::Named),
                     }
                 }
                 // Everything else names memory rather than a register, so the
                 // write goes through an address.
                 target => {
                     let addr = self.place_address(target);
-                    self.write_through(Value::Reg(addr), value);
+                    self.write_through(Value::Reg(addr), value, Room::Named);
                 }
             },
             // The routine answers where the list *now* is, and that answer has
@@ -1366,17 +1444,21 @@ impl Lowering<'_> {
             // `for (init; cond; step) body` is exactly `init; while (cond) { body; step; }`
             // with the initialiser's variable scoped to the loop.
             Stmt::For { init, cond, step, body } => {
+                let outer = self.frame_bytes;
                 self.scopes.push(HashMap::new());
                 self.stmt(init);
                 self.loop_with_step(cond, body, Some(step));
                 self.scopes.pop();
+                // The initialiser's variable is scoped to the loop, so its room
+                // goes back with it.
+                self.frame_bytes = outer;
             }
             // An aggregate answer is copied into the room the caller reserved,
             // and the function then leaves with nothing — there is no address
             // to hand back, which is exactly why none can dangle.
             Stmt::Return { value: Some(expr), .. } if self.out_pointer.is_some() => {
                 let out = self.out_pointer.expect("just matched");
-                self.write_through(Value::Reg(out), expr);
+                self.write_through(Value::Reg(out), expr, Room::Fresh);
                 self.terminate(Terminator::Return(None));
                 self.new_block(BlockKind::Unreachable);
             }
@@ -1807,16 +1889,77 @@ impl Lowering<'_> {
     /// the expression produced is an *address* and the value is copied out of
     /// it — which is what makes assignment value semantics rather than
     /// aliasing, and what carries an object's vtable pointer along with it.
-    fn write_through(&mut self, addr: Value, value: &Expr) {
+    fn write_through(&mut self, addr: Value, value: &Expr, room: Room) {
         let ty = self.types.of(value.id);
         if ty.fits_in_a_register() {
             let value = self.expr(value);
             self.emit(Instr::Store { addr, value });
             return;
         }
+        // A literal has no room of its own until something gives it some, so
+        // where the room here is new it may as well be this room — see [`Room`]
+        // for why "new" is the condition and not merely "aggregate".
+        if matches!(room, Room::Fresh) {
+            match &value.kind {
+                ExprKind::New { fields, .. } => {
+                    let Ty::Class(id) = ty else {
+                        unreachable!("sema gives an object literal its class's type");
+                    };
+                    return self.fill_object(addr, id, fields);
+                }
+                // A *list* literal is not one of these: its elements live in the
+                // arena, so what it produces is an address rather than room, and
+                // it never reaches here — a list fits in a register.
+                ExprKind::Array { elements, .. } => return self.fill_array(addr, ty, elements),
+                _ => {}
+            }
+        }
         let src = self.expr(value);
         let bytes = self.table.size_of(ty);
         self.emit(Instr::CopyBytes { dst: addr, src, bytes });
+    }
+
+    /// Put a class's vtable pointer and every field where `at` points.
+    ///
+    /// The vtable pointer goes in first, at offset 0. It is what makes the
+    /// object *this* class rather than merely its shape, and it is what travels
+    /// with a copy — so the object is a complete one of its class from the
+    /// first instruction.
+    fn fill_object(&mut self, at: Value, id: ClassId, fields: &[FieldInit]) {
+        let info = self.table.class(id).clone();
+        let vptr = self.fresh_temp();
+        self.emit(Instr::VTable { dst: vptr, class: id });
+        self.emit(Instr::Store { addr: at, value: Value::Reg(vptr) });
+
+        for init in fields {
+            let offset =
+                info.field(&init.name).expect("sema rejects an unknown field").offset;
+            let addr = self.fresh_temp();
+            self.emit(Instr::Field { dst: addr, base: at, offset });
+            // A field of an object being built is room nothing can name, so
+            // whatever fills it may be built there directly.
+            self.write_through(Value::Reg(addr), &init.value, Room::Fresh);
+        }
+    }
+
+    /// Put every element of an array or list literal where `at` points.
+    ///
+    /// The room is filled in written order. An element's value may mention the
+    /// array being built only in ways `sema` has already ruled out, so the order
+    /// is not observable.
+    fn fill_array(&mut self, at: Value, ty: Ty, elements: &[Expr]) {
+        let (len, scale) = self.shape_of(ty, at);
+        for (index, element) in elements.iter().enumerate() {
+            let addr = self.fresh_temp();
+            self.emit(Instr::Elem {
+                dst: addr,
+                base: at,
+                index: Value::Const(index as i64),
+                len,
+                scale,
+            });
+            self.write_through(Value::Reg(addr), element, Room::Fresh);
+        }
     }
 
     /// The address of `object.field`, which is the object's plus a fixed offset.
@@ -1957,6 +2100,7 @@ impl Lowering<'_> {
     fn allocate(&mut self, dst: VReg, bytes: u32) {
         let offset = self.frame_bytes;
         self.frame_bytes = self.frame_bytes.saturating_add(bytes);
+        self.frame_peak = self.frame_peak.max(self.frame_bytes);
         self.emit(Instr::Frame { dst, offset });
     }
 
@@ -1994,25 +2138,8 @@ impl Lowering<'_> {
                 let Ty::Class(id) = self.types.of(expr.id) else {
                     unreachable!("sema gives an object literal its class's type");
                 };
-                let info = self.table.class(id).clone();
-                self.allocate(dst, info.storage);
-
-                // The vtable pointer goes in first, at offset 0. It is what
-                // makes the object *this* class rather than merely its shape,
-                // and it is what travels with a copy.
-                let vptr = self.fresh_temp();
-                self.emit(Instr::VTable { dst: vptr, class: id });
-                self.emit(Instr::Store { addr: Value::Reg(dst), value: Value::Reg(vptr) });
-
-                for init in fields {
-                    let offset = info
-                        .field(&init.name)
-                        .expect("sema rejects an unknown field")
-                        .offset;
-                    let addr = self.fresh_temp();
-                    self.emit(Instr::Field { dst: addr, base: Value::Reg(dst), offset });
-                    self.write_through(Value::Reg(addr), &init.value);
-                }
+                self.allocate(dst, self.table.class(id).storage);
+                self.fill_object(Value::Reg(dst), id, fields);
             }
             ExprKind::Field { object, name, .. } => {
                 let Ty::Class(id) = self.types.of(object.id) else {
@@ -2050,24 +2177,13 @@ impl Lowering<'_> {
                         len,
                         scale: bytes,
                     });
-                    self.write_through(Value::Reg(addr), element);
+                    self.write_through(Value::Reg(addr), element, Room::Fresh);
                 }
             }
             ExprKind::Array { elements, .. } => {
                 let ty = self.types.of(expr.id);
-                let (len, scale) = self.shape_of(ty, Value::Reg(dst));
                 self.allocate_for(dst, ty);
-                for (index, element) in elements.iter().enumerate() {
-                    let addr = self.fresh_temp();
-                    self.emit(Instr::Elem {
-                        dst: addr,
-                        base: Value::Reg(dst),
-                        index: Value::Const(index as i64),
-                        len,
-                        scale,
-                    });
-                    self.write_through(Value::Reg(addr), element);
-                }
+                self.fill_array(Value::Reg(dst), ty, elements);
             }
             ExprKind::Index { array, index, .. } => {
                 let of = self.types.of(array.id);
@@ -2385,25 +2501,52 @@ impl Lowering<'_> {
             if let PrintPart::Value(expr) | PrintPart::Spec { expr, .. } = part {
                 let ty = self.types.of(expr.id);
                 let val = self.expr(expr);
-                written.push(Instr::Print { ty, val });
+                written.push(Instr::Print { ty, val, newline: false });
             }
         }
 
         let mut written = written.into_iter();
         let mut text: Vec<char> = Vec::new();
+        // Whether *this* statement's last piece was a value. Not the same as
+        // finding no text left over: `println()` has none either, and the write
+        // it would attach a line ending to belongs to the statement before it.
+        let mut ended_with_a_value = false;
         for part in parts {
             match part {
-                PrintPart::Text(chars) => text.extend(chars),
+                PrintPart::Text(chars) => {
+                    text.extend(chars);
+                    ended_with_a_value = false;
+                }
                 _ => {
                     self.flush_text(&mut text);
                     self.emit(written.next().expect("one per value part"));
+                    ended_with_a_value = true;
                 }
             }
+        }
+        // Where the last piece written was a value, the line ends with it: the
+        // backend reaches for a format that already ends in one, so `println(n)`
+        // is a single call. Where it was text — `println("done")` — the newline
+        // joins that text below, exactly as it always has.
+        if newline && ended_with_a_value {
+            self.end_the_line_written_last();
+            return;
         }
         if newline {
             text.push('\n');
         }
         self.flush_text(&mut text);
+    }
+
+    /// Make the write just emitted end its line.
+    ///
+    /// Only ever called straight after emitting one, which is what makes the
+    /// last instruction in the block certain to be it.
+    fn end_the_line_written_last(&mut self) {
+        match self.blocks[self.current.0 as usize].instrs.last_mut() {
+            Some(Instr::Print { newline, .. }) => *newline = true,
+            other => unreachable!("a value was just written, not {other:?}"),
+        }
     }
 
     /// Write out the literal text collected so far, if there is any.
@@ -2829,6 +2972,68 @@ mod tests {
             })
             .collect();
         assert_eq!(offsets, vec![0, 24]);
+    }
+
+    /// A literal at a place that already has an address is built *there*.
+    ///
+    /// It used to be built in room of its own and copied, which cost the room
+    /// for the whole call — the room stayed reserved whether or not anything
+    /// still needed it — and a `CopyBytes` nobody asked for.
+    #[test]
+    fn a_literal_in_a_place_that_has_room_reserves_none_of_its_own() {
+        let ir = lower_src(
+            "class P { int[2] xs; }\nfn main() {\n  P p = P { xs: [1, 2] };\n  print(p.xs[0]);\n}",
+        );
+        let main = &ir.functions[0];
+        // One reservation, for the object. The array goes inside it.
+        let frames: Vec<u32> = main.blocks[0]
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Frame { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames, vec![0], "the literal reserved room of its own: {}", ir.dump());
+        // `P` is a vtable pointer and two ints, and that is the whole frame.
+        assert_eq!(main.frame_bytes, 24);
+        // And nothing is copied, because nothing was built anywhere else.
+        assert!(
+            !main.blocks[0].instrs.iter().any(|i| matches!(i, Instr::CopyBytes { .. })),
+            "{}",
+            ir.dump()
+        );
+    }
+
+    /// The same literal *assigned* is not, because it may read what it is
+    /// overwriting — see [`Room`].
+    #[test]
+    fn a_literal_assigned_over_a_place_is_built_elsewhere_and_copied() {
+        let ir = lower_main("int[2] a = [1, 2];\na = [a[1], a[0]];\nprint(a[0]);");
+        let main = &ir.functions[0];
+        assert!(
+            main.blocks[0].instrs.iter().any(|i| matches!(i, Instr::CopyBytes { .. })),
+            "the swap has to change all at once: {}",
+            ir.dump()
+        );
+        // Two reservations: the variable, and the room the swap is built in.
+        assert_eq!(main.frame_bytes, 32);
+    }
+
+    /// Two blocks that cannot be running at once share their room.
+    #[test]
+    fn a_blocks_frame_goes_back_when_the_block_ends() {
+        let shared = lower_main(
+            "int n = 0;\nif (n == 0) {\n  int[3] a = [1, 2, 3];\n  n = a[0];\n}\n\
+             else {\n  int[3] b = [4, 5, 6];\n  n = b[0];\n}\nprint(n);",
+        );
+        // Three ints, once, rather than once per arm.
+        assert_eq!(shared.functions[0].frame_bytes, 24);
+
+        // What is reserved is the most ever needed at *once*, so two arrays
+        // that really are live together still get room each.
+        let both = lower_main("int[3] a = [1, 2, 3];\nint[3] b = [4, 5, 6];\nprint(a[0] + b[0]);");
+        assert_eq!(both.functions[0].frame_bytes, 48);
     }
 
     /// One `int[1024]` is 8,192 bytes, so the limit falls between the
@@ -3532,7 +3737,7 @@ mod tests {
         assert_eq!(main.blocks[0].instrs.len(), 1);
         assert!(matches!(
             main.blocks[0].instrs[0],
-            Instr::Print { ty: Ty::Bool, val: Value::Const(0) }
+            Instr::Print { ty: Ty::Bool, val: Value::Const(0), .. }
         ));
     }
 
@@ -3971,13 +4176,81 @@ mod tests {
         assert_eq!(lower_main("print(\"done\");").texts, vec!["done".to_string()]);
     }
 
-    /// When a format ends in a specifier there is no text to join it to, so the
-    /// newline is a piece of its own — and every `println` in the program that
-    /// ends in a value shares that one piece.
+    /// When a format ends in a specifier there is no text to join the newline
+    /// to — so the *value* ends the line instead, and nothing is written after
+    /// it. That is what makes `println(n)` one call rather than two.
     #[test]
-    fn a_newline_after_a_value_is_its_own_piece_and_is_shared() {
+    fn a_value_that_ends_a_line_says_so_rather_than_being_followed_by_one() {
         let ir = lower_main("int n = 1;\nprintln(n);\nprintln(n);");
-        assert_eq!(ir.texts, vec!["\n".to_string()]);
+        assert!(ir.texts.is_empty(), "there is nothing left to write: {:?}", ir.texts);
+        let printed: Vec<bool> = ir.functions[0].blocks[0]
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Print { newline, .. } => Some(*newline),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(printed, vec![true, true]);
+    }
+
+    /// Only the *last* write of a `println` ends the line, and a `print` never
+    /// does — which is the whole of what the flag means.
+    #[test]
+    fn only_the_last_value_of_a_println_ends_the_line() {
+        let ends: Vec<bool> = ["println(\"%d %d\", 1, 2);", "print(\"%d %d\", 1, 2);"]
+            .iter()
+            .flat_map(|body| {
+                lower_main(body).functions[0].blocks[0]
+                    .instrs
+                    .iter()
+                    .filter_map(|i| match i {
+                        Instr::Print { newline, .. } => Some(*newline),
+                        _ => None,
+                    })
+                    .collect::<Vec<bool>>()
+            })
+            .collect();
+        assert_eq!(ends, vec![false, true, false, false]);
+    }
+
+    /// A `println()` with nothing to write is a blank line, and must not reach
+    /// back and attach its line ending to the write *before* it.
+    ///
+    /// The first shape of this rule looked for text left over rather than for a
+    /// value of its own, and an empty `println` has none either — so the blank
+    /// line disappeared into the line above it. Nothing in a dump showed it;
+    /// running `examples/format.tc` did.
+    #[test]
+    fn an_empty_println_is_a_blank_line_and_not_a_second_one_on_the_line_above() {
+        let ir = lower_main("println(1);\nprintln();\nprintln(2);");
+        assert_eq!(ir.texts, vec!["\n".to_string()], "the blank line is its own write");
+        let kinds: Vec<&str> = ir.functions[0].blocks[0]
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::Print { newline: true, .. } => Some("println"),
+                Instr::Print { .. } => Some("print"),
+                Instr::PrintText { .. } => Some("text"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, vec!["println", "text", "println"]);
+    }
+
+    /// A `println` whose last part is text still ends the line with that text,
+    /// exactly as before: there is a piece to join the newline to.
+    #[test]
+    fn a_println_ending_in_text_still_ends_the_line_with_the_text() {
+        let ir = lower_main("int n = 1;\nprintln(\"n is %d.\", n);");
+        assert_eq!(ir.texts, vec!["n is ".to_string(), ".\n".to_string()]);
+        assert!(
+            ir.functions[0].blocks[0]
+                .instrs
+                .iter()
+                .all(|i| !matches!(i, Instr::Print { newline: true, .. })),
+            "the text ends the line, so no value does"
+        );
     }
 
     /// Every value is evaluated before anything is written.
@@ -4002,7 +4275,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(kinds, vec!["call", "call", "text", "print", "text", "print", "text"]);
+        // Six pieces, not seven: the format ends in a specifier, so the last
+        // *value* ends the line and there is nothing to write after it.
+        assert_eq!(kinds, vec!["call", "call", "text", "print", "text", "print"]);
+        assert_eq!(ir.texts, vec!["a ".to_string(), " b ".to_string()]);
     }
 
     /// A `print` with nothing to write lowers to nothing at all; a `println`

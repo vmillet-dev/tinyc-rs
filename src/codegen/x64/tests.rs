@@ -13,11 +13,11 @@
 //! hold for *every* target, named or not, is in `tests/targets.rs`, which walks
 //! `Target::names()` and never mentions one.
 
-use super::data::{FMT_BOOL, FMT_INT, FMT_STR};
+use super::data::{BOOL_TRUE, FMT_BOOL, FMT_INT, NEWLINE, line_format};
 use super::runtime::{
     ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_NOT_A_NUMBER, ABORT_OOM, ABORT_REPORT,
-    ABORT_STACK, ALLOC, INPUT, PARSE_INT, PRINT_CHAR, READY, REFILL, STACK_LIMIT, UTF8,
-    UTF8_DECODE,
+    ABORT_STACK, ALLOC, ARENA_CHUNK, ARENA_END, ARENA_NEXT, INPUT, LIST_ROOM, PARSE_INT,
+    PRINT_CHAR, READY, REFILL, STACK_LIMIT, UTF8, UTF8_DECODE,
 };
 use super::*;
 use crate::codegen::regalloc;
@@ -472,6 +472,39 @@ fn a_program_that_touches_no_string_gets_no_arena() {
     assert!(!asm.contains("extern malloc"), "{asm}");
     assert!(!asm.contains(ALLOC), "{asm}");
     assert!(!asm.contains("SetConsoleOutputCP"), "{asm}");
+}
+
+/// The one thing a bump pointer can give back.
+///
+/// The arena never frees, so a list that doubles normally leaves its old
+/// elements behind for good. It need not, when the block being grown is still
+/// the last one the arena handed out: then the bytes after it are nobody's, and
+/// the block can simply be made longer. Both guards are checked here, because
+/// each one alone would let a stale block be extended over memory that belongs
+/// to something else.
+#[test]
+fn a_list_that_is_still_the_last_block_grows_where_it_stands() {
+    let asm = compile("int[] xs = [];\npush(xs, 1);\nprintln(len(xs));");
+    let (_, room) = functions_in(&asm)
+        .into_iter()
+        .find(|(name, _)| *name == LIST_ROOM)
+        .expect("the routine that makes room");
+
+    // It ends exactly where the arena would hand out the next bytes...
+    assert!(room.contains(&format!("cmp  r10, [{ARENA_NEXT}]")), "{room}");
+    // ...and it is in the chunk that pointer is bumping through, rather than an
+    // older one that happens to end there.
+    assert!(room.contains(&format!("cmp  r10, [{ARENA_CHUNK}]")), "{room}");
+    // Room for the bigger block, and then the capacity grows with no copy.
+    assert!(room.contains(&format!("cmp  r11, [{ARENA_END}]")), "{room}");
+    assert!(room.contains(&format!("mov  [{ARENA_NEXT}], r11")), "{room}");
+    assert!(room.contains("mov  [r12-16], r14    ; grown where it stands"), "{room}");
+
+    // Every guard leaves by the same door, and the copy is still there behind
+    // it: a `no` to any of them costs a copy and never an answer.
+    assert_eq!(room.matches(".move").count(), 4, "{room}");
+    assert!(room.contains(".copy:"), "{room}");
+    assert!(asm.contains(&format!("{ARENA_CHUNK}: resq 1")), "{asm}");
 }
 
 /// A string *value* has to be encoded before it can be written. A literal
@@ -1156,19 +1189,48 @@ fn literal_text_is_an_argument_to_printf_and_never_its_format() {
     assert!(asm[..at].ends_with("lea  rcx, [fmt_str]\n    "), "{asm}");
 }
 
-/// The format strings do not end a line any more. `print` writes what it was
-/// given and no more, and the newline of a `println` is a piece of text like
-/// any other.
+/// A `print` writes what it was given and no more; a `println` ends its line
+/// with the last thing it writes rather than with a second call.
+///
+/// Two formats per type, and a program carries only the ones it reaches: the
+/// plain one is a `print`, the one ending in a newline is the last write of a
+/// `println`. Nothing at run time reads either — they are the compiler's own
+/// text, and what the program wrote is always the *argument*.
 #[test]
-fn no_format_string_carries_a_newline() {
-    let asm = compile("int n = 1;\nprintln(n);\nprintln(true);\nprintln(\"s\");");
-    for format in [FMT_INT, FMT_STR, FMT_BOOL] {
-        let line = asm
-            .lines()
-            .find(|line| line.trim_start().starts_with(&format!("{format}:")))
-            .unwrap_or_else(|| panic!("{format} should be emitted: {asm}"));
-        assert!(!line.contains(", 10,"), "{format} still ends a line: {line}");
-    }
+fn a_println_ends_its_line_in_the_same_call_that_writes_the_value() {
+    let ends_a_line = |asm: &str, format: &str| {
+        asm.lines()
+            .find(|line| line.trim_start().starts_with(&format!("{}:", line_format(format))))
+            .is_some_and(|line| line.contains(", 10,"))
+    };
+
+    let printed = compile("int n = 1;\nprint(n);\nprint(true);");
+    assert!(printed.contains(&format!("{FMT_INT}: db \"%lld\", 0")), "{printed}");
+    assert!(!printed.contains(&line_format(FMT_INT)), "a `print` ends no line: {printed}");
+
+    let lined = compile("int n = 1;\nprintln(n);\nprintln(true);");
+    assert!(ends_a_line(&lined, FMT_INT), "{lined}");
+    assert!(ends_a_line(&lined, FMT_BOOL), "{lined}");
+    // And the plain forms are gone, since nothing reaches them any more.
+    assert!(!lined.contains(&format!("{FMT_INT}: ")), "{lined}");
+    assert!(!lined.contains(&format!("{FMT_BOOL}: ")), "{lined}");
+    // One call for the value and the line together, where there used to be two.
+    assert_eq!(lined.matches("call printf").count(), 2, "{lined}");
+    // The words a bool picks between are needed whichever format is used.
+    assert!(lined.contains(&format!("{BOOL_TRUE}: ")), "{lined}");
+}
+
+/// A string and a character go out through a routine rather than a format of
+/// their own, so ending their line is still a call — but one that hands
+/// `printf` the newline itself rather than a `%s` and a pointer to it.
+#[test]
+fn a_println_of_a_string_writes_the_newline_on_its_own() {
+    let asm = compile("string s = \"hi\";\nprintln(s);");
+    assert!(asm.contains(&format!("{NEWLINE}: db 10, 0")), "{asm}");
+    assert!(asm.contains(&format!("lea  rcx, [{NEWLINE}]")), "{asm}");
+    // Never for a `print`, which ends no line.
+    let printed = compile("string s = \"hi\";\nprint(s);");
+    assert!(!printed.contains(NEWLINE), "{printed}");
 }
 
 /// A program that only writes literal text needs the console's code page

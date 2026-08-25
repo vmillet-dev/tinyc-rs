@@ -55,7 +55,7 @@ use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{StrLit, Token, TokenKind};
 
 pub fn parse(tokens: &[Token]) -> Result<Program> {
-    Parser { tokens, pos: 0, next_id: 0, depth: 0 }.run().map_err(|d| vec![d])
+    Parser { tokens, pos: 0, next_id: 0, depth: 0, errors: Vec::new() }.run()
 }
 
 type PResult<T> = std::result::Result<T, Diagnostic>;
@@ -79,6 +79,15 @@ struct Parser<'a> {
     next_id: u32,
     /// How many nested expressions and blocks are currently open.
     depth: u32,
+    /// Every mistake found so far.
+    ///
+    /// A recursive-descent parser has no way to *continue* through a mistake —
+    /// it does not know what the program meant — so what it does instead is
+    /// throw away tokens until it reaches somewhere it can start again. See
+    /// [`Parser::recover_to_statement`]. Every error found that way is reported
+    /// and the tree is then discarded whole: it exists only to let the parser
+    /// keep reading, and nothing downstream is ever shown it.
+    errors: Vec<Diagnostic>,
 }
 
 /// A binary operator, whichever of the three kinds of node it builds.
@@ -95,16 +104,124 @@ enum Operator {
 }
 
 impl<'a> Parser<'a> {
-    fn run(mut self) -> PResult<Program> {
+    fn run(mut self) -> Result<Program> {
         let (mut enums, mut classes, mut functions) = (Vec::new(), Vec::new(), Vec::new());
         while !matches!(self.peek().kind, TokenKind::Eof) {
-            match self.peek().kind {
-                TokenKind::KwEnum => enums.push(self.enum_decl()?),
-                TokenKind::KwClass => classes.push(self.class_decl(&mut functions)?),
-                _ => functions.push(self.fn_decl()?),
+            let (mark, depth) = (self.pos, self.depth);
+            let parsed = match self.peek().kind {
+                TokenKind::KwEnum => self.enum_decl().map(|d| enums.push(d)),
+                TokenKind::KwClass => self.class_decl(&mut functions).map(|d| classes.push(d)),
+                _ => self.fn_decl().map(|d| functions.push(d)),
+            };
+            if let Err(error) = parsed {
+                self.errors.push(error);
+                self.depth = depth;
+                self.recover_to_declaration();
+                self.ensure_progress(mark);
             }
         }
-        Ok(Program { enums, classes, functions, node_count: self.next_id as usize })
+        match self.errors.is_empty() {
+            true => Ok(Program { enums, classes, functions, node_count: self.next_id as usize }),
+            // Sorted, because a mistake inside a declaration is found before the
+            // one that ended it — see `crate::sema::check`, which sorts for the
+            // same reason.
+            false => {
+                self.errors.sort_by_key(|d| d.span.offset);
+                Err(self.errors)
+            }
+        }
+    }
+
+    // -- carrying on after a mistake ---------------------------------------
+
+    /// Throw tokens away until the next declaration could begin.
+    ///
+    /// Only `fn`, `class` and `enum` start one, and only outside braces — a
+    /// `class` keyword cannot appear inside a body, so a brace counter is all
+    /// it takes to tell "the next declaration" from "somewhere in the middle of
+    /// this one".
+    ///
+    /// That counter is also what stops a missing `}` from turning into a
+    /// diagnostic per line for the rest of the file: the count never comes back
+    /// to zero, so everything after it is skipped and the one real mistake is
+    /// the only thing reported.
+    fn recover_to_declaration(&mut self) {
+        self.skip_until(|kind, braces| {
+            braces == 0
+                && matches!(kind, TokenKind::KwFn | TokenKind::KwClass | TokenKind::KwEnum)
+        });
+    }
+
+    /// Throw tokens away until the next statement could begin.
+    ///
+    /// A `;` ends the statement that went wrong, so it is consumed and the next
+    /// one starts clean. A `}` closes the block, and is left for the loop in
+    /// [`Self::block`] to read. Anything that could open a statement stops the
+    /// skipping where it stands, which is what makes a forgotten `;` cost one
+    /// diagnostic rather than one per line after it.
+    fn recover_to_statement(&mut self) {
+        let stopped = self.skip_until(|kind, braces| {
+            braces == 0
+                && matches!(
+                    kind,
+                    TokenKind::Semi
+                        | TokenKind::RBrace
+                        | TokenKind::KwPrint
+                        | TokenKind::KwPrintln
+                        | TokenKind::KwPush
+                        | TokenKind::KwIf
+                        | TokenKind::KwWhile
+                        | TokenKind::KwFor
+                        | TokenKind::KwMatch
+                        | TokenKind::KwReturn
+                        | TokenKind::KwBreak
+                        | TokenKind::KwContinue
+                        | TokenKind::KwInt
+                        | TokenKind::KwString
+                        | TokenKind::KwChar
+                        | TokenKind::KwBool
+                        | TokenKind::Ident(_)
+                )
+        });
+        // The `;` belonged to the statement that failed; a `}` belongs to the
+        // block, and anything else is the next statement's first token.
+        if stopped && matches!(self.peek().kind, TokenKind::Semi) {
+            self.bump();
+        }
+    }
+
+    /// Skip tokens until `stop` accepts one, tracking brace depth on the way.
+    /// Answers whether it stopped at a token rather than at the end of the file.
+    fn skip_until(&mut self, stop: impl Fn(&TokenKind, u32) -> bool) -> bool {
+        let mut braces = 0u32;
+        loop {
+            let kind = &self.peek().kind;
+            if matches!(kind, TokenKind::Eof) {
+                return false;
+            }
+            if stop(kind, braces) {
+                return true;
+            }
+            match kind {
+                TokenKind::LBrace => braces += 1,
+                TokenKind::RBrace => braces = braces.saturating_sub(1),
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
+    /// The one thing recovery must guarantee: that the next attempt starts
+    /// somewhere new.
+    ///
+    /// Everything above stops *before* the token it recognised, so a mistake
+    /// reported at a token that also begins a statement would be read again,
+    /// fail again, and go round for ever. One token is the price of ruling that
+    /// out, and it is paid only when nothing else moved.
+    fn ensure_progress(&mut self, mark: usize) {
+        if self.pos == mark {
+            self.bump();
+        }
     }
 
     /// `class Circle : Shape { int r; fn area(self) -> int { ... } }`
@@ -214,8 +331,11 @@ impl<'a> Parser<'a> {
     /// `a + (b + c)`, and would otherwise be counted as flat — so it charges a
     /// level per node here and releases them together at the end.
     ///
-    /// Nothing releases on the error path, and nothing needs to: the parser
-    /// stops at its first mistake, so no later depth is ever asked about.
+    /// Nothing releases on the error path, and nothing here needs to: the two
+    /// places that carry on after a mistake — [`Parser::run`] and the statement
+    /// loop in [`Parser::block`] — put the counter back to what it held before
+    /// the attempt. That is exact where releasing level by level would not be,
+    /// since a failed parse has no idea how many it charged.
     fn deepen(&mut self) -> PResult<()> {
         self.depth += 1;
         if self.depth > MAX_NESTING {
@@ -572,7 +692,22 @@ impl<'a> Parser<'a> {
                         return Ok(Block { stmts, span: open.to(close) });
                     }
                     TokenKind::Eof => return Err(p.unclosed("block", open)),
-                    _ => stmts.push(p.stmt()?),
+                    _ => {
+                        let (mark, depth) = (p.pos, p.depth);
+                        match p.stmt() {
+                            Ok(stmt) => stmts.push(stmt),
+                            Err(error) => {
+                                p.errors.push(error);
+                                // The levels the failed statement charged are
+                                // released by giving the counter back what it
+                                // held before, since nothing on that path will
+                                // release them itself.
+                                p.depth = depth;
+                                p.recover_to_statement();
+                                p.ensure_progress(mark);
+                            }
+                        }
+                    }
                 }
             }
         })
@@ -1328,6 +1463,77 @@ mod tests {
 
     fn errors_in_main(body: &str) -> Vec<Diagnostic> {
         parse_src(&format!("fn main() {{\n{body}\n}}\n")).unwrap_err()
+    }
+
+    // -- carrying on after a mistake ---------------------------------------
+
+    /// Every mistake in one pass, rather than one recompile each.
+    ///
+    /// The parser cannot *continue* through a mistake — it has no idea what the
+    /// program meant — so it throws tokens away until it reaches somewhere a
+    /// statement could start. What that buys is the difference between fixing
+    /// four things and fixing one thing four times.
+    #[test]
+    fn a_forgotten_semicolon_does_not_hide_the_mistakes_after_it() {
+        let found = errors_in_main("int x = 1\n  int y = 2\n  int z = 3\n  println(x);");
+        assert_eq!(found.len(), 3, "{found:#?}");
+        assert!(found.iter().all(|d| d.message.contains("expected `;`")), "{found:#?}");
+        assert!(found.windows(2).all(|p| p[0].span.offset < p[1].span.offset), "{found:#?}");
+    }
+
+    #[test]
+    fn a_mistake_in_one_function_does_not_hide_one_in_the_next() {
+        let src = "fn a() {\n  int x = 1\n}\nfn b() {\n  int y = 2\n}\nfn main() {\n  a();\n}\n";
+        let found = parse_src(src).unwrap_err();
+        assert_eq!(found.len(), 2, "{found:#?}");
+    }
+
+    /// The guard that keeps one mistake from becoming a message per line.
+    #[test]
+    fn a_missing_brace_is_not_reported_once_per_line_after_it() {
+        // Everything after the unclosed block is swallowed, because the brace
+        // count never comes back to zero and so no `fn` is ever reached.
+        let src = "fn a() {\n  println(1);\n\nfn b() {\n  println(2);\n}\n";
+        let found = parse_src(src).unwrap_err();
+        assert!(found.len() <= 3, "one mistake should not cascade: {found:#?}");
+        assert!(found.iter().any(|d| d.message.contains("unclosed")), "{found:#?}");
+    }
+
+    /// Recovery must always leave the parser somewhere new, or it would read
+    /// the same token, fail the same way, and never finish.
+    #[test]
+    fn nothing_a_program_can_be_makes_the_parser_loop() {
+        for src in [
+            "}",
+            "}}}}",
+            "fn",
+            "fn main( {",
+            "fn main() { ) ) ) }",
+            "fn main() { int = ; }",
+            "fn main() { if }",
+            ";;;;;;",
+            "= = = =",
+            "fn main() { x = ; y = ; z = ; }",
+        ] {
+            let found = parse_src(src).unwrap_err();
+            assert!(!found.is_empty(), "`{src}` should be refused");
+        }
+    }
+
+    /// A statement that failed part way through charged levels of nesting that
+    /// nothing on its path releases. Recovery puts the counter back, or a file
+    /// with a few mistakes near the top would be refused for nesting too deeply
+    /// somewhere near the bottom.
+    #[test]
+    fn recovery_gives_back_the_nesting_a_failed_statement_charged() {
+        let mistake = "int x = ((((1 + 2\n";
+        let src = format!("fn main() {{\n{}  println(1);\n}}\n", mistake.repeat(200));
+        let found = crate::with_compiler_stack(|| parse_src(&src)).unwrap_err();
+        assert!(
+            found.iter().all(|d| !d.message.contains("nests too deeply")),
+            "the levels were not given back: {:#?}",
+            &found[..found.len().min(3)]
+        );
     }
 
     // -- the nesting limit -------------------------------------------------

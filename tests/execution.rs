@@ -1434,3 +1434,281 @@ fn optimising_never_changes_what_a_program_prints() {
         assert_eq!(plain.status.code(), optimised.status.code(), "case {index}: exit status");
     }
 }
+
+/// A list grows where it stands when it can, and moves when it cannot — and
+/// holds the same elements either way.
+///
+/// The arena hands out the bytes after the last ones and never takes any back,
+/// so a block that is still the last it gave can simply be made longer. That
+/// removes the copy and the abandoned block from every doubling of a list built
+/// one push at a time — which is what `read_line` does to every line it reads.
+///
+/// The risk it brings is that the two paths through `tc$rt$list_room` are not
+/// equally exercised by an ordinary program: a loop that only pushes takes the
+/// new one every time and the old one never. So these interleave the two on
+/// purpose, and check the elements rather than the length, because a bad
+/// address gives a wrong *number* here rather than a crash.
+#[test]
+fn a_list_grows_in_place_or_moves_and_holds_the_same_elements_either_way() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 6] = [
+        // Nothing but pushes: every doubling can grow where it stands.
+        (
+            r#"int[] xs = [];
+               for (int i = 0; i < 500; i = i + 1) { push(xs, i * 3); }
+               int total = 0;
+               for (int i = 0; i < len(xs); i = i + 1) { total = total + xs[i]; }
+               println(total * 1000 + xs[499]);"#,
+            "374251497",
+        ),
+        // A string built between two pushes takes the arena's last-block spot,
+        // so the next doubling has to move the elements after all.
+        (
+            r#"int[] xs = [];
+               for (int i = 0; i < 500; i = i + 1) {
+                 push(xs, i * 3);
+                 string spacer = string(i);
+                 if (len(spacer) == 0) { println("unreachable"); }
+               }
+               int total = 0;
+               for (int i = 0; i < len(xs); i = i + 1) { total = total + xs[i]; }
+               println(total * 1000 + xs[499]);"#,
+            "374251497",
+        ),
+        // Two lists grown at once: neither is ever the last block for long, so
+        // they alternate between the paths and must not reach into each other.
+        (
+            r#"int[] a = [];
+               int[] b = [];
+               for (int i = 0; i < 300; i = i + 1) {
+                 push(a, i);
+                 push(b, 0 - i);
+               }
+               int total = 0;
+               for (int i = 0; i < len(a); i = i + 1) { total = total + a[i] + b[i]; }
+               println(total * 100 + len(a) + len(b));"#,
+            "600",
+        ),
+        // A copy taken while the original can still grow in place: growing the
+        // original afterwards must not be visible through the copy.
+        (
+            r#"int[] a = [];
+               for (int i = 0; i < 100; i = i + 1) { push(a, i); }
+               int[] b = a;
+               for (int i = 0; i < 100; i = i + 1) { push(a, i); }
+               println(len(a) * 1000 + len(b) + b[99]);"#,
+            "200199",
+        ),
+        // Objects are wider than a register, so the width the routine is told
+        // is the one the in-place arithmetic has to use.
+        (
+            r#"P[] ps = [];
+               for (int i = 0; i < 200; i = i + 1) { push(ps, P { x: i, y: i * 2 }); }
+               int total = 0;
+               for (int i = 0; i < len(ps); i = i + 1) { total = total + ps[i].y - ps[i].x; }
+               println(total);"#,
+            "19900",
+        ),
+        // Past a chunk, where growing in place stops being possible and every
+        // doubling moves. The answer may not change.
+        (
+            r#"int[] xs = [];
+               for (int i = 0; i < 20000; i = i + 1) { push(xs, i); }
+               println(len(xs) * 100000 + xs[19999]);"#,
+            "2000019999",
+        ),
+    ];
+
+    harness.each_prints_after("grow", "class P { int x; int y; }\n", &cases);
+}
+
+/// An aggregate literal is built where it is going, unless it can read where it
+/// is going.
+///
+/// Filling a field or an element directly costs two instructions instead of
+/// four and reserves no scratch at all. It is only sound where nothing can name
+/// the room being filled — and the target of an *assignment* very much can:
+///
+/// ```text
+/// a = [a[1], a[0]];      // a swap
+/// ```
+///
+/// filled element by element would write `a[1]` into `a[0]` and then read it
+/// straight back out, answering `[2, 2]` for a swap of `[1, 2]`. So an
+/// assignment still builds the literal elsewhere and copies it, and that is
+/// what these cases are for: every one of them answers a *number*, so getting
+/// it wrong is a wrong number rather than a crash.
+#[test]
+fn a_literal_assigned_over_what_it_reads_still_sees_the_old_value() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 8] = [
+        // The swap, which is the whole reason for the rule.
+        (
+            r#"int[2] a = [1, 2];
+               a = [a[1], a[0]];
+               println(a[0] * 10 + a[1]);"#,
+            "21",
+        ),
+        // A rotation, where every element reads one the fill would have
+        // overwritten already.
+        (
+            r#"int[3] a = [1, 2, 3];
+               a = [a[2], a[0], a[1]];
+               println(a[0] * 100 + a[1] * 10 + a[2]);"#,
+            "312",
+        ),
+        // The same through a field rather than a variable.
+        (
+            r#"P p = P { xs: [1, 2] };
+               p.xs = [p.xs[1], p.xs[0]];
+               println(p.xs[0] * 10 + p.xs[1]);"#,
+            "21",
+        ),
+        // And an object literal over an object that its own fields read.
+        (
+            r#"Q q = Q { a: 1, b: 2 };
+               q = Q { a: q.b, b: q.a };
+               println(q.a * 10 + q.b);"#,
+            "21",
+        ),
+        // An element of an array of objects, assigned from itself.
+        (
+            r#"Q[2] qs = [Q { a: 1, b: 2 }, Q { a: 3, b: 4 }];
+               qs[0] = Q { a: qs[0].b, b: qs[0].a };
+               println(qs[0].a * 10 + qs[0].b);"#,
+            "21",
+        ),
+        // Where the room *is* fresh, the answer must be the same — this is the
+        // path that changed.
+        (
+            r#"int[2] a = [1, 2];
+               int[2] b = [a[1], a[0]];
+               println(b[0] * 10 + b[1]);"#,
+            "21",
+        ),
+        (
+            r#"P p = P { xs: [3, 4] };
+               println(p.xs[0] * 10 + p.xs[1]);"#,
+            "34",
+        ),
+        // Nesting three deep, all built in place, none of them copied.
+        (
+            r#"R r = R { p: P { xs: [5, 6] }, n: 7 };
+               println(r.p.xs[0] * 100 + r.p.xs[1] * 10 + r.n);"#,
+            "567",
+        ),
+    ];
+
+    harness.each_prints_after(
+        "inplace",
+        "class P { int[2] xs; }\nclass Q { int a; int b; }\nclass R { P p; int n; }\n",
+        &cases,
+    );
+}
+
+/// Two blocks that cannot run at the same time share their frame.
+///
+/// The room a block took is available again to the block after it, which is
+/// sound for the reason nothing in this language dangles: no address travels
+/// outward, so when a block's names go out of scope so does every way of
+/// reaching what they named. These check that the *sharing* did not make two
+/// live values collide.
+#[test]
+fn blocks_that_share_their_frame_still_hold_their_own_values() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 4] = [
+        // Two arms, one room. The arm that runs must see its own elements.
+        (
+            r#"int n = 0;
+               if (n == 0) { int[3] a = [1, 2, 3]; n = a[0] * 100 + a[2]; }
+               else { int[3] b = [7, 8, 9]; n = b[0]; }
+               println(n);"#,
+            "103",
+        ),
+        // The outer array must survive the inner block that reuses nothing of
+        // its room.
+        (
+            r#"int[2] outer = [4, 5];
+               if (outer[0] == 4) { int[2] inner = [8, 9]; outer[1] = inner[1]; }
+               println(outer[0] * 10 + outer[1]);"#,
+            "49",
+        ),
+        // A block's room is the same room on every turn of a loop, and what is
+        // written into it must not leak from one turn to the next.
+        (
+            r#"int total = 0;
+               for (int i = 0; i < 4; i = i + 1) {
+                 int[2] step = [i, i * 10];
+                 total = total + step[1] - step[0];
+               }
+               println(total);"#,
+            "54",
+        ),
+        // Sibling blocks one after the other, each with its own aggregate.
+        (
+            r#"int total = 0;
+               while (total == 0) { int[2] a = [1, 2]; total = a[1]; }
+               while (total == 2) { int[2] b = [30, 40]; total = total + b[1]; }
+               println(total);"#,
+            "42",
+        ),
+    ];
+
+    harness.each_prints("scoped", &cases);
+}
+
+/// A function that returns an aggregate builds it in the room its caller
+/// passed, rather than somewhere else and then copying.
+///
+/// That room is the last of the four [`Room::Fresh`] cases and the least
+/// obvious: the callee has no name for it — it arrives as a hidden first
+/// argument — so nothing the returned expression reads can be it. The caller
+/// either reserved it fresh or is a declaration whose variable is not in scope
+/// yet.
+#[test]
+fn an_aggregate_returned_is_built_where_the_caller_asked_for_it() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 4] = [
+        // The returned literal reads the parameter, which is a different
+        // object however it is written.
+        (
+            r#"P q = swapped(P { a: 1, b: 2 });
+               println(q.a * 10 + q.b);"#,
+            "21",
+        ),
+        // Assigned rather than declared: the answer lands in fresh room and is
+        // copied over, so the argument and the destination being the same
+        // variable changes nothing.
+        (
+            r#"P q = P { a: 1, b: 2 };
+               q = swapped(q);
+               println(q.a * 10 + q.b);"#,
+            "21",
+        ),
+        // Twice over, which must not leave the first answer behind.
+        (
+            r#"P q = swapped(swapped(P { a: 3, b: 4 }));
+               println(q.a * 10 + q.b);"#,
+            "34",
+        ),
+        // An array rather than an object, and one built from a loop rather
+        // than written out.
+        (
+            r#"int[3] xs = counted();
+               println(xs[0] * 100 + xs[1] * 10 + xs[2]);"#,
+            "123",
+        ),
+    ];
+
+    harness.each_prints_after(
+        "returned",
+        "class P { int a; int b; }\n\
+         fn swapped(P p) -> P {\n  return P { a: p.b, b: p.a };\n}\n\
+         fn counted() -> int[3] {\n  return [1, 2, 3];\n}\n",
+        &cases,
+    );
+}

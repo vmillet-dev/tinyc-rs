@@ -5,8 +5,8 @@ use crate::ir::Program;
 
 use super::asm::Asm;
 use super::runtime::{
-    ABORTS, ARENA_END, ARENA_NEXT, FIRST_READ, INPUT, INPUT_BYTES, INPUT_DONE, INPUT_LEN,
-    INPUT_POS, SCRATCH, SCRATCH_CAP, STACK_LIMIT,
+    ABORTS, ARENA_CHUNK, ARENA_END, ARENA_NEXT, FIRST_READ, INPUT, INPUT_BYTES, INPUT_DONE,
+    INPUT_LEN, INPUT_POS, SCRATCH, SCRATCH_CAP, STACK_LIMIT,
 };
 use super::used::{Used, enum_table, enum_variant_text, text_label, vtable_label};
 use super::{ENTRY_POINT, Platform, symbol};
@@ -20,6 +20,17 @@ pub const FMT_STR: &str = "fmt_str";
 pub const FMT_BOOL: &str = "fmt_bool";
 pub const BOOL_TRUE: &str = "bool_true";
 pub const BOOL_FALSE: &str = "bool_false";
+
+/// What a bare newline is written with, for the two types whose value goes out
+/// through a routine rather than a format of its own.
+pub const NEWLINE: &str = "fmt_newline";
+
+/// The same format with the line ending already in it, for the last value a
+/// `println` writes. One call instead of two, and the second of those used to
+/// hand `printf` a format *and* an argument in order to write one character.
+pub fn line_format(format: &str) -> String {
+    format!("{format}_line")
+}
 
 pub fn header(asm: &mut Asm, platform: &dyn Platform, used: &Used) {
     let abi = platform.abi();
@@ -72,13 +83,29 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     if used.prints(Ty::Int) {
         asm.asm(&format!("{FMT_INT}: db \"%lld\", 0"));
     }
-    if used.prints(Ty::Str) {
+    if used.needs_str_format() {
         asm.asm(&format!("{FMT_STR}: db \"%s\", 0"));
     }
     if used.prints(Ty::Bool) {
         asm.asm(&format!("{FMT_BOOL}: db \"%s\", 0"));
+    }
+    // The two words are needed whichever format picks between them.
+    if used.writes(Ty::Bool) {
         asm.asm(&format!("{BOOL_TRUE}: db \"true\", 0"));
         asm.asm(&format!("{BOOL_FALSE}: db \"false\", 0"));
+    }
+    // The same three, ending the line, and only the ones a `println` reaches.
+    for (ty, format) in [(Ty::Int, FMT_INT), (Ty::Str, FMT_STR), (Ty::Bool, FMT_BOOL)] {
+        if used.ends_a_line(ty) {
+            let spec = match ty {
+                Ty::Int => "%lld",
+                _ => "%s",
+            };
+            asm.asm(&format!("{}: db \"{spec}\", 10, 0", line_format(format)));
+        }
+    }
+    if used.writes_a_bare_newline() {
+        asm.asm(&format!("{NEWLINE}: db 10, 0"));
     }
     // One method table per class that a `New` builds. Its entries are settled
     // at compile time — a subclass's table is its base's with the overridden
@@ -114,7 +141,7 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     }
     if used.aborts {
         // No NUL: `write` is given a length, not a C string.
-        for abort in &ABORTS {
+        for abort in ABORTS.iter().filter(|a| a.reached_by(used)) {
             asm.asm(&format!("{}: db {}", abort.message(), bytes_of(&abort.text())));
         }
     }
@@ -161,6 +188,7 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
         if used.allocates() {
             asm.asm(&format!("{ARENA_NEXT}: resq 1"));
             asm.asm(&format!("{ARENA_END}: resq 1"));
+            asm.asm(&format!("{ARENA_CHUNK}: resq 1"));
         }
         if used.print_str {
             asm.asm(&format!("{SCRATCH}: resq 1"));

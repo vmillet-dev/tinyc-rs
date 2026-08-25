@@ -1,13 +1,13 @@
 //! Stage 1: source text -> tokens.
 //!
 //! The lexer walks `char_indices()` so byte offsets stay valid for UTF-8 input,
-//! and stops at the first malformed token.
+//! and reports every malformed token it can still find its footing after.
 
 use crate::diag::{Diagnostic, Result, Span};
 use crate::token::{StrLit, Token, TokenKind};
 
 pub fn lex(src: &str) -> Result<Vec<Token>> {
-    Lexer::new(src).run().map_err(|d| vec![d])
+    Lexer::new(src).run()
 }
 
 struct Lexer<'a> {
@@ -43,64 +43,102 @@ impl<'a> Lexer<'a> {
         c
     }
 
-    fn run(mut self) -> std::result::Result<Vec<Token>, Diagnostic> {
+    fn run(mut self) -> Result<Vec<Token>> {
         let mut tokens = Vec::new();
+        let mut errors: Vec<Diagnostic> = Vec::new();
         loop {
             self.skip_trivia();
             let start = self.offset();
-            let Some(c) = self.peek() else { break };
+            let Some(_) = self.peek() else { break };
 
-            let kind = match c {
-                '(' => self.single(TokenKind::LParen),
-                ')' => self.single(TokenKind::RParen),
-                '{' => self.single(TokenKind::LBrace),
-                '}' => self.single(TokenKind::RBrace),
-                ';' => self.single(TokenKind::Semi),
-                '[' => self.single(TokenKind::LBracket),
-                ']' => self.single(TokenKind::RBracket),
-                // Two-character operators are recognised before their prefixes.
-                // `=` is the one with two of them, so it does not fit
-                // [`Self::one_or_two`].
-                '=' => {
-                    self.bump();
-                    match self.peek() {
-                        Some('=') => self.single(TokenKind::EqEq),
-                        Some('>') => self.single(TokenKind::FatArrow),
-                        _ => TokenKind::Eq,
+            match self.token(start) {
+                Ok(kind) => {
+                    tokens.push(Token { kind, span: Span::new(start, self.offset() - start) })
+                }
+                Err(error) => {
+                    errors.push(error);
+                    // How far it got says where it is safe to start again. One
+                    // character means a stray one — `@`, or a `&` with nothing
+                    // beside it — and the very next character is a token like
+                    // any other. More than one means it stopped somewhere
+                    // *inside* something: an unclosed quote, an escape that
+                    // names nothing. There is no telling what the rest of that
+                    // was meant to be, so the rest of the line goes with it
+                    // rather than being read as tokens nobody wrote.
+                    match self.offset() - start {
+                        0 => self.bump().map(|_| ()).unwrap_or_default(),
+                        1 => {}
+                        _ => self.skip_line(),
                     }
                 }
-                ':' => self.one_or_two(':', TokenKind::ColonColon, TokenKind::Colon),
-                '.' => self.single(TokenKind::Dot),
-                '<' => self.one_or_two('=', TokenKind::Le, TokenKind::Lt),
-                '>' => self.one_or_two('=', TokenKind::Ge, TokenKind::Gt),
-                '!' => self.one_or_two('=', TokenKind::BangEq, TokenKind::Bang),
-                // These two exist only doubled: TinyC has no bitwise `&` or `|`
-                // for the lone character to mean instead.
-                '&' => self.only_doubled('&', TokenKind::AmpAmp, start)?,
-                '|' => self.only_doubled('|', TokenKind::PipePipe, start)?,
-                '+' => self.single(TokenKind::Plus),
-                '-' => self.one_or_two('>', TokenKind::Arrow, TokenKind::Minus),
-                '*' => self.single(TokenKind::Star),
-                '/' => self.single(TokenKind::Slash),
-                '%' => self.single(TokenKind::Percent),
-                ',' => self.single(TokenKind::Comma),
-                '"' => self.string()?,
-                '\'' => self.character()?,
-                c if c.is_ascii_digit() => self.number()?,
-                c if is_ident_start(c) => self.ident(),
-                c => {
-                    self.bump();
-                    return Err(Diagnostic::new(
-                        format!("unexpected character `{c}`"),
-                        Span::new(start, self.offset() - start),
-                    ));
-                }
-            };
-            tokens.push(Token { kind, span: Span::new(start, self.offset() - start) });
+            }
         }
 
         tokens.push(Token { kind: TokenKind::Eof, span: Span::new(self.src.len(), 0) });
-        Ok(tokens)
+        match errors.is_empty() {
+            true => Ok(tokens),
+            false => Err(errors),
+        }
+    }
+
+    /// Read one token, having already skipped whatever came before it.
+    fn token(&mut self, start: usize) -> std::result::Result<TokenKind, Diagnostic> {
+        let c = self.peek().expect("the caller checked there is a character here");
+        let kind = match c {
+            '(' => self.single(TokenKind::LParen),
+            ')' => self.single(TokenKind::RParen),
+            '{' => self.single(TokenKind::LBrace),
+            '}' => self.single(TokenKind::RBrace),
+            ';' => self.single(TokenKind::Semi),
+            '[' => self.single(TokenKind::LBracket),
+            ']' => self.single(TokenKind::RBracket),
+            // Two-character operators are recognised before their prefixes.
+            // `=` is the one with two of them, so it does not fit
+            // [`Self::one_or_two`].
+            '=' => {
+                self.bump();
+                match self.peek() {
+                    Some('=') => self.single(TokenKind::EqEq),
+                    Some('>') => self.single(TokenKind::FatArrow),
+                    _ => TokenKind::Eq,
+                }
+            }
+            ':' => self.one_or_two(':', TokenKind::ColonColon, TokenKind::Colon),
+            '.' => self.single(TokenKind::Dot),
+            '<' => self.one_or_two('=', TokenKind::Le, TokenKind::Lt),
+            '>' => self.one_or_two('=', TokenKind::Ge, TokenKind::Gt),
+            '!' => self.one_or_two('=', TokenKind::BangEq, TokenKind::Bang),
+            // These two exist only doubled: TinyC has no bitwise `&` or `|`
+            // for the lone character to mean instead.
+            '&' => self.only_doubled('&', TokenKind::AmpAmp, start)?,
+            '|' => self.only_doubled('|', TokenKind::PipePipe, start)?,
+            '+' => self.single(TokenKind::Plus),
+            '-' => self.one_or_two('>', TokenKind::Arrow, TokenKind::Minus),
+            '*' => self.single(TokenKind::Star),
+            '/' => self.single(TokenKind::Slash),
+            '%' => self.single(TokenKind::Percent),
+            ',' => self.single(TokenKind::Comma),
+            '"' => self.string()?,
+            '\'' => self.character()?,
+            c if c.is_ascii_digit() => self.number()?,
+            c if is_ident_start(c) => self.ident(),
+            c => {
+                self.bump();
+                return Err(Diagnostic::new(
+                    format!("unexpected character `{c}`"),
+                    Span::new(start, self.offset() - start),
+                ));
+            }
+        };
+        Ok(kind)
+    }
+
+    /// Throw away what is left of the line, which is where a token that went
+    /// wrong part way through stops being worth reading.
+    fn skip_line(&mut self) {
+        while !matches!(self.peek(), Some('\n') | None) {
+            self.bump();
+        }
     }
 
     fn single(&mut self, kind: TokenKind) -> TokenKind {
@@ -384,9 +422,19 @@ mod tests {
         StrLit::from(text)
     }
 
+    /// Every diagnostic a malformed source produces, in order.
+    fn errors(src: &str) -> Vec<Diagnostic> {
+        lex(src).unwrap_err()
+    }
+
     /// The single diagnostic a malformed source produces.
+    ///
+    /// Most of these sources hold one mistake, and asserting that they produce
+    /// one diagnostic is half of what the test is saying: the lexer carries on
+    /// after a bad token, so a second message would mean it had invented a
+    /// second mistake out of the first.
     fn error(src: &str) -> Diagnostic {
-        let errors = lex(src).unwrap_err();
+        let errors = errors(src);
         assert_eq!(errors.len(), 1, "expected exactly one error, got {errors:#?}");
         errors.into_iter().next().expect("just asserted there is one")
     }
@@ -973,8 +1021,59 @@ mod tests {
     #[test]
     fn a_string_literal_may_not_run_past_the_end_of_its_line() {
         // A real newline ends it; `\n` is how one is put *in* it.
-        assert!(error("\"a\nb\"").message.contains("unterminated string literal"));
+        let found = errors("\"a\nb\"");
+        assert!(found[0].message.contains("unterminated string literal"), "{found:#?}");
+        // Two, and both are real: the quote on the second line opens a literal
+        // that is not closed either. That the lexer reads the second line at all
+        // is the recovery working.
+        assert_eq!(found.len(), 2, "{found:#?}");
         assert_eq!(kinds(r#""a\nb""#), vec![TokenKind::Str(chars("a\nb")), TokenKind::Eof]);
+    }
+
+    // -- carrying on after a bad token -------------------------------------
+
+    /// Every mistake in one pass, rather than one recompile each.
+    #[test]
+    fn a_bad_token_does_not_hide_the_ones_after_it() {
+        let found = errors("int a = 1 @ 2;\nbool b = true & false;\nint c = 99999999999999999999;");
+        let messages: Vec<&str> = found.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "unexpected character `@`",
+                "unexpected character `&`",
+                "integer literal is too large",
+            ],
+            "{found:#?}"
+        );
+        // In source order, which is the order they were made in.
+        assert!(found.windows(2).all(|p| p[0].span.offset < p[1].span.offset), "{found:#?}");
+    }
+
+    /// A stray character costs the character, and a broken token costs its line.
+    ///
+    /// The difference is the whole of the recovery rule: one character consumed
+    /// means the lexer never got *into* anything, so the next character is a
+    /// token like any other. More than one means it stopped somewhere inside,
+    /// and what follows is not worth reading as tokens nobody wrote.
+    #[test]
+    fn what_a_mistake_costs_depends_on_how_far_it_got() {
+        // The `2` after the `@` is still lexed, on the same line.
+        assert_eq!(errors("@ 2\n@ 3").len(), 2);
+        // Where an unclosed literal takes the rest of its line with it, so the
+        // `@` hiding behind the quote is never reported.
+        let swallowed = errors("\"unclosed @ @ @\nint x = 1;");
+        assert_eq!(swallowed.len(), 1, "{swallowed:#?}");
+        assert!(swallowed[0].message.contains("unterminated"), "{swallowed:#?}");
+    }
+
+    #[test]
+    fn a_file_of_nothing_but_mistakes_still_ends() {
+        // Every one is a character the lexer consumed, so this cannot fail to
+        // make progress — but it is the shape that would loop for ever if it
+        // ever stopped consuming, so it is worth a test of its own.
+        let found = errors("@#$^~`?@#$^~`?");
+        assert_eq!(found.len(), 14, "{found:#?}");
     }
 
     // -- trivia the lexer does not have ------------------------------------

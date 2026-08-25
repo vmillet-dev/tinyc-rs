@@ -42,17 +42,23 @@ pub const ABORT_REPORT: &str = "tc$rt$abort";
 /// reports. They are kept together so that adding a way to fail means adding
 /// one row rather than touching four places.
 pub const ABORTS: [Abort; 11] = [
-    Abort::new(ABORT_DIV_ZERO, "division by zero"),
-    Abort::new(ABORT_DIV_OVERFLOW, "division overflows an int"),
-    Abort::new(ABORT_OVERFLOW, "arithmetic overflows an int"),
-    Abort::new(ABORT_BOUNDS, "index out of bounds"),
-    Abort::new(ABORT_OOM, "out of memory"),
-    Abort::new(ABORT_BAD_CHAR, "this number is not a character"),
-    Abort::new(ABORT_NO_INPUT, "there is no more input to read"),
-    Abort::new(ABORT_BAD_UTF8, "the input is not valid UTF-8"),
-    Abort::new(ABORT_INPUT_FAILED, "the input could not be read"),
-    Abort::new(ABORT_NOT_A_NUMBER, "this text is not a number an int can hold"),
-    Abort::new(ABORT_STACK, "the stack is exhausted, so this call cannot be made"),
+    Abort::new(ABORT_DIV_ZERO, "division by zero", |u| u.div_zero),
+    Abort::new(ABORT_DIV_OVERFLOW, "division overflows an int", |u| u.div_overflow),
+    Abort::new(ABORT_OVERFLOW, "arithmetic overflows an int", |u| u.overflow),
+    Abort::new(ABORT_BOUNDS, "index out of bounds", |u| u.bounds),
+    Abort::new(ABORT_OOM, "out of memory", Used::allocates),
+    Abort::new(ABORT_BAD_CHAR, "this number is not a character", |u| u.check_char),
+    // Only a `read_line` past the end reports this; `eof()` is the question
+    // that avoids it, and asking it can never be the thing that stops.
+    Abort::new(ABORT_NO_INPUT, "there is no more input to read", |u| u.read_line),
+    Abort::new(ABORT_BAD_UTF8, "the input is not valid UTF-8", Used::reads_text),
+    Abort::new(ABORT_INPUT_FAILED, "the input could not be read", Used::reads_text),
+    // `is_int(s)` is the same routine asked a different way, and it answers
+    // rather than stopping — so only the conversion reaches this.
+    Abort::new(ABORT_NOT_A_NUMBER, "this text is not a number an int can hold", |u| u.str_int),
+    Abort::new(ABORT_STACK, "the stack is exhausted, so this call cannot be made", |u| {
+        u.checks_stack
+    }),
 ];
 
 /// One way a program can stop rather than answer wrongly.
@@ -61,11 +67,24 @@ pub struct Abort {
     label: &'static str,
     /// What went wrong, as the program reports it.
     what: &'static str,
+    /// What in the program makes this one reachable.
+    ///
+    /// It travels in the row rather than in a `match` somewhere else for the
+    /// same reason the message does: adding a way to fail should be adding a
+    /// line here and nothing anywhere. Without it the whole table went into
+    /// every program that could fail at all — a `hello.tc` that indexes nothing
+    /// and allocates nothing still carried 483 bytes of messages about both.
+    reached: fn(&Used) -> bool,
 }
 
 impl Abort {
-    const fn new(label: &'static str, what: &'static str) -> Abort {
-        Abort { label, what }
+    const fn new(label: &'static str, what: &'static str, reached: fn(&Used) -> bool) -> Abort {
+        Abort { label, what, reached }
+    }
+
+    /// Whether this program can reach this way of failing.
+    pub fn reached_by(&self, used: &Used) -> bool {
+        (self.reached)(used)
     }
 
     /// The label of this failure's text in `.data`, derived from its own so
@@ -104,6 +123,13 @@ pub const STACK_MARGIN: u32 = 64 * 1024;
 
 pub const ARENA_NEXT: &str = "tc$rt$arena_next";
 pub const ARENA_END: &str = "tc$rt$arena_end";
+/// Where the chunk [`ARENA_NEXT`] is bumping through begins.
+///
+/// Only [`LIST_ROOM`] reads it, and only to be sure of something it could
+/// otherwise nearly prove: that the block it is about to extend really is the
+/// last one this chunk handed out, rather than an older one that happens to end
+/// where the bump pointer now stands. "Nearly" is not the standard here.
+pub const ARENA_CHUNK: &str = "tc$rt$arena_chunk";
 pub const ALLOC: &str = "tc$rt$alloc";
 
 /// Bytes the arena asks the C runtime for at a time.
@@ -175,17 +201,21 @@ pub const REFILL_LOCALS: [&str; 3] = ["rbx", "r12", "r13"];
 /// addition can fail, would be nearly all of them — the report builds its own
 /// out of thin air. It can: it never returns, so `rsp` is not worth preserving,
 /// and neither are the callee-saved registers it takes for itself.
-pub fn abort_stubs(asm: &mut Asm, abi: &Abi) {
+pub fn abort_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
     asm.blank();
     asm.comment("runtime failures: report on stderr, then leave with a non-zero status");
 
-    for (at, abort) in ABORTS.iter().enumerate() {
+    // Only the ones this program can reach, so a program that never indexes
+    // carries nothing about an index — the same bargain every other routine
+    // here is emitted under.
+    let reached: Vec<&Abort> = ABORTS.iter().filter(|a| a.reached_by(used)).collect();
+    for (at, abort) in reached.iter().enumerate() {
         asm.line(&format!("{}:", abort.label));
         asm.asm(&format!("lea  {}, [{}]", abi.arg(1), abort.message()));
         asm.asm(&format!("mov  {}, {}", half(abi.arg(2)), abort.text().len()));
         // The last one falls straight through into the report rather than
         // jumping to the instruction after itself.
-        if at + 1 < ABORTS.len() {
+        if at + 1 < reached.len() {
             asm.asm(&format!("jmp  {ABORT_REPORT}"));
         }
     }
@@ -266,6 +296,7 @@ pub fn arena(asm: &mut Asm, abi: &Abi) {
     asm.asm("call malloc");
     asm.asm(&format!("test {RAX}, {RAX}"));
     asm.asm(&format!("jz   {ABORT_OOM}"));
+    asm.asm(&format!("mov  [{ARENA_CHUNK}], {RAX}    ; where this chunk begins"));
     asm.asm(&format!("lea  r10, [{RAX}+r12]"));
     asm.asm(&format!("mov  [{ARENA_END}], r10"));
     asm.asm(&format!("lea  r10, [{RAX}+rbx]"));
@@ -527,8 +558,43 @@ pub fn list_stubs(asm: &mut Asm, abi: &Abi, used: &Used) {
         asm.asm("mov  r14, [r12-16]   ; capacity");
         asm.asm("cmp  rbx, r14");
         asm.asm("jb   .room");
-        asm.comment("full: twice the room, and the old block is left where it is");
-        asm.asm("lea  r14, [r14*2]");
+
+        asm.comment("Full. The arena only ever hands out the bytes after the last");
+        asm.comment("ones, so a block that is *still* the last it gave can simply be");
+        asm.comment("made longer where it stands: no second block, no copy, and");
+        asm.comment("nothing abandoned. That is the whole of what a bump pointer can");
+        asm.comment("give back, and it is what a list built one push at a time — a");
+        asm.comment("line of input, say — does on every doubling.");
+        asm.comment("");
+        asm.comment("Two things have to hold, and a `no` to either costs a copy and");
+        asm.comment("never an answer: the block ends exactly where the next one would");
+        asm.comment("begin, and it lies in the chunk that pointer is bumping through");
+        asm.comment("rather than in an older one that happens to end there.");
+        asm.asm("mov  r10, r14");
+        asm.asm("imul r10, r13");
+        asm.asm("add  r10, 16+15    ; the header, and the arena's rounding");
+        asm.asm("and  r10, -16");
+        asm.asm("lea  r10, [r12+r10-16]    ; where this block ends");
+        asm.asm("lea  r14, [r14*2]    ; the room wanted, from here on");
+        asm.asm(&format!("cmp  r10, [{ARENA_NEXT}]"));
+        asm.asm("jne  .move    ; something has been handed out since");
+        asm.asm("lea  r10, [r12-16]");
+        asm.asm(&format!("cmp  r10, [{ARENA_CHUNK}]"));
+        asm.asm("jb   .move    ; an older chunk's block, ending by coincidence");
+        asm.asm("mov  r11, r14");
+        asm.asm("imul r11, r13");
+        asm.asm("add  r11, 16+15");
+        asm.asm("and  r11, -16");
+        asm.asm("lea  r11, [r12+r11-16]    ; where it would end");
+        asm.asm(&format!("cmp  r11, [{ARENA_END}]"));
+        asm.asm("ja   .move    ; this chunk has no room for the rest");
+        asm.asm(&format!("mov  [{ARENA_NEXT}], r11"));
+        asm.asm("mov  [r12-16], r14    ; grown where it stands");
+        asm.asm("jmp  .room");
+
+        asm.line(".move:");
+        asm.comment("something else has been handed out since, so the elements move");
+        asm.comment("and the old block is left where it is");
         asm.asm(&format!("mov  {a0}, r14"));
         asm.asm(&format!("imul {a0}, r13"));
         asm.asm(&format!("add  {a0}, 16"));

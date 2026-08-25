@@ -9,12 +9,15 @@
 //! business.
 
 use crate::ast::{ClassId, EnumId, Ty};
-use crate::ir::{Instr, Program, Runtime};
+use crate::ir::{DivGuards, Instr, Program, Runtime};
 
 use super::{ENTRY_POINT, format_index};
 
 pub struct Used {
     formats: [bool; 3],
+    /// The same three, for a value that *ends* a line. A program that prints
+    /// without ever calling `println` carries no format that ends one.
+    lines: [bool; 3],
     /// Which enums have a value printed, and so need their table of variant
     /// names emitted. An enum used only in a `match` needs none: matching is
     /// arithmetic on the tag, and never asks what the tag is called.
@@ -22,7 +25,17 @@ pub struct Used {
     /// Which classes are ever instantiated, and so need their method table
     /// emitted. A class nothing builds has no objects to dispatch on.
     pub vtables: Vec<bool>,
+    /// Whether anything at all can stop this program, and so whether the report
+    /// that says what happened is needed. Derived from the four below and from
+    /// everything the runtime can fail at.
     pub aborts: bool,
+    /// Which ways of failing the program's own instructions reach. Each answers
+    /// one row of [`super::runtime::ABORTS`], which is what keeps a program that
+    /// never divides from carrying a message about division.
+    pub div_zero: bool,
+    pub div_overflow: bool,
+    pub overflow: bool,
+    pub bounds: bool,
     /// Whether any prologue guards against running out of stack, and so whether
     /// the entry point has to find out where the stack ends.
     ///
@@ -59,9 +72,14 @@ impl Used {
     pub fn of(program: &Program) -> Used {
         let mut used = Used {
             formats: [false; 3],
+            lines: [false; 3],
             enums: vec![false; program.table.enums.len()],
             vtables: vec![false; program.vtables.len()],
             aborts: false,
+            div_zero: false,
+            div_overflow: false,
+            overflow: false,
+            bounds: false,
             // Dead functions are gone by now, so anything left beside the entry
             // point is something the program really calls.
             checks_stack: program.functions.iter().any(|f| f.name != ENTRY_POINT),
@@ -85,8 +103,11 @@ impl Used {
         };
         for instr in program.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instrs) {
             match instr {
-                Instr::Print { ty, .. } => {
-                    used.formats[format_index(*ty)] = true;
+                Instr::Print { ty, newline, .. } => {
+                    // One or the other, never both: a program that only ever
+                    // writes whole lines carries only the format that ends one.
+                    used.formats[format_index(*ty)] |= !*newline;
+                    used.lines[format_index(*ty)] |= *newline;
                     match ty {
                         Ty::Enum(id) => used.enums[id.0 as usize] = true,
                         Ty::Str => used.print_str = true,
@@ -102,7 +123,19 @@ impl Used {
                 }
                 Instr::VTable { class, .. } => used.vtables[class.0 as usize] = true,
                 other => {
-                    used.aborts |= other.can_fail();
+                    // Which way it can fail, not merely that it can: the two
+                    // questions used to be one, and the answer to the narrow
+                    // one is what decides which messages the file carries.
+                    match other {
+                        Instr::Bin { op, lhs, rhs, .. } if op.divides() => {
+                            let guards = DivGuards::of(lhs, rhs);
+                            used.div_zero |= guards.zero;
+                            used.div_overflow |= guards.overflow;
+                        }
+                        Instr::Bin { .. } => used.overflow = true,
+                        Instr::Elem { .. } => used.bounds |= other.can_fail(),
+                        _ => {}
+                    }
                     if let Instr::RtCall { callee, .. } = other {
                         match callee {
                             Runtime::Concat => used.concat = true,
@@ -131,14 +164,51 @@ impl Used {
         used.list_new |= used.list_clone | used.read_line;
         used.list_push |= used.read_line;
         used.chars_str |= used.read_line;
-        // Asking the arena for memory is a way to fail like any other, and so
-        // is asking for a frame there is no room for.
-        used.aborts |= used.allocates() | used.checks_stack;
+        // Whether *anything* can stop the program is now the same question as
+        // whether any row of the abort table is reached — asked in one place so
+        // the report and the messages it reads can never disagree about it.
+        used.aborts = super::runtime::ABORTS.iter().any(|abort| abort.reached_by(&used));
         used
     }
 
     pub fn prints(&self, ty: Ty) -> bool {
         self.formats[format_index(ty)]
+    }
+
+    /// Whether a value of this type ever ends a line, and so whether the format
+    /// that ends one is needed.
+    pub fn ends_a_line(&self, ty: Ty) -> bool {
+        self.lines[format_index(ty)]
+    }
+
+    /// Whether the plain `%s` is needed.
+    ///
+    /// Not the same question as `prints(Ty::Str)` any more, and the difference
+    /// is a routine: the two that write a string and a character reach for this
+    /// format themselves, and go on doing so when a `println` ends the line
+    /// afterwards with a newline of its own.
+    pub fn needs_str_format(&self) -> bool {
+        self.prints(Ty::Str) || self.print_str || self.print_char
+    }
+
+    /// Whether a value of this type is ever written at all, whichever of the
+    /// two formats it goes out through.
+    ///
+    /// The two questions came apart when a `println` stopped needing a second
+    /// call, and they are not the same one: a `bool` needs the words `true` and
+    /// `false` either way, and only the *format* depends on which.
+    pub fn writes(&self, ty: Ty) -> bool {
+        self.prints(ty) || self.ends_a_line(ty)
+    }
+
+    /// Whether a newline is ever written on its own.
+    ///
+    /// A string and a character go out through a routine rather than a format
+    /// of their own, so a `println` of one still ends its line separately —
+    /// with one call and one argument now, rather than a format and an
+    /// argument to write a single character.
+    pub fn writes_a_bare_newline(&self) -> bool {
+        self.ends_a_line(Ty::Str) && (self.print_str || self.print_char)
     }
 
     /// Whether the routine `int(s)` and `is_int(s)` are both wrappers around is

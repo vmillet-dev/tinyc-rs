@@ -14,7 +14,7 @@ use crate::ir::{
 };
 
 use super::asm::Asm;
-use super::data::{BOOL_FALSE, BOOL_TRUE, FMT_BOOL, FMT_INT, FMT_STR};
+use super::data::{BOOL_FALSE, BOOL_TRUE, FMT_BOOL, FMT_INT, FMT_STR, NEWLINE, line_format};
 use super::runtime::{
     ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_OVERFLOW, ABORT_STACK, PRINT_CHAR,
     PRINT_STR, STACK_LIMIT, STACK_MARGIN,
@@ -596,7 +596,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             // `printf`, because what they hold has to be encoded first. The
             // routine ends in the same `printf` all the same, so everything
             // still reaches one buffered stream and nothing interleaves.
-            Instr::Print { ty: ty @ (Ty::Str | Ty::Char), val } => {
+            Instr::Print { ty: ty @ (Ty::Str | Ty::Char), val, newline } => {
                 let value = self.value(val);
                 let arg0 = self.arg(0);
                 self.asm.mov(arg0, &value);
@@ -605,8 +605,18 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                     _ => PRINT_CHAR,
                 };
                 self.asm.asm(&format!("call {routine}"));
+                // These two go out through a routine rather than a format of
+                // their own, so ending the line is still a call — but one that
+                // hands `printf` the newline itself rather than a `%s` and a
+                // pointer to it.
+                if *newline {
+                    let arg0 = self.arg(0);
+                    self.asm.asm(&format!("lea  {arg0}, [{NEWLINE}]"));
+                    self.asm.variadic(self.abi);
+                    self.asm.asm("call printf");
+                }
             }
-            Instr::Print { ty, val } => {
+            Instr::Print { ty, val, newline } => {
                 // Load the value first: the format string is a constant, so it
                 // can never be clobbered by the argument move.
                 let value = self.value(val);
@@ -635,6 +645,12 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                     Ty::Bool => FMT_BOOL,
                     // A string and a character left through the arm above.
                     _ => FMT_STR,
+                };
+                // The last value a `println` writes ends the line itself, which
+                // is one call rather than two.
+                let format = match newline {
+                    true => line_format(format),
+                    false => format.to_string(),
                 };
                 self.asm.asm(&format!("lea  {arg0}, [{format}]"));
                 self.asm.variadic(self.abi);

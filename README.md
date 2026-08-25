@@ -52,7 +52,10 @@ rather than answering wrongly.
   rather than the `0xC00000FD` or `SIGSEGV` a stack overflow otherwise is.
 * **Diagnostics point at a line and a column**, with a window of the source and
   a caret, sorted into source order, one message per mistake, and columns
-  counted in characters so accents do not shift them.
+  counted in characters so accents do not shift them. **Every stage reports
+  every mistake it can still find its footing after**, so four things wrong in
+  a file is one recompile and not four — and a missing `}` is still one
+  message, not one per line after it.
 
 **The compiler**
 
@@ -198,7 +201,9 @@ go wrong with it, and each is answered where it can be:
 * **A frame no stack would hold** is refused while the program is built.
   Lowering is the only stage that knows how much room a function's locals take,
   so it is the stage that checks — the number that goes into `sub rsp` is the
-  number tested.
+  number tested. It reserves what is needed at once rather than everything ever
+  needed: a block gives its room back when it ends, and a literal is built
+  where it is going rather than beside it and copied.
 * **A frame bigger than a page** is taken a page at a time. A stack only
   reaches as far as it has been written to, so a single `sub rsp` past the next
   page down skips the one whose being touched is what makes the rest exist.
