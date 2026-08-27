@@ -1,0 +1,5 @@
+fn main() {
+  int n = 3;
+  float f = 1.5;
+  println(n + f);
+}

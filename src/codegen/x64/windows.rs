@@ -25,6 +25,10 @@ static ABI: Abi = Abi {
     ],
     shadow_space: 32,
     variadic_in_al: false,
+    // Numbered by position: the value follows the format string, so it is
+    // argument 1 in both files of registers at once.
+    vector_arg: "xmm1",
+    vector_arg_shadowed: true,
     // The Microsoft C runtime spells the POSIX names with a leading underscore.
     write: "_write",
     read: "_read",

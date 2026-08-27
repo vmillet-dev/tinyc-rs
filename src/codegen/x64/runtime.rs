@@ -33,6 +33,7 @@ pub const ABORT_NO_INPUT: &str = "tc$rt$no_input";
 pub const ABORT_BAD_UTF8: &str = "tc$rt$bad_utf8";
 pub const ABORT_INPUT_FAILED: &str = "tc$rt$input_failed";
 pub const ABORT_NOT_A_NUMBER: &str = "tc$rt$not_a_number";
+pub const ABORT_NO_INT: &str = "tc$rt$no_int";
 pub const ABORT_STACK: &str = "tc$rt$stack_exhausted";
 pub const ABORT_REPORT: &str = "tc$rt$abort";
 
@@ -41,7 +42,7 @@ pub const ABORT_REPORT: &str = "tc$rt$abort";
 /// Each is a label the failing instruction jumps to, paired with the text it
 /// reports. They are kept together so that adding a way to fail means adding
 /// one row rather than touching four places.
-pub const ABORTS: [Abort; 11] = [
+pub const ABORTS: [Abort; 12] = [
     Abort::new(ABORT_DIV_ZERO, "division by zero", |u| u.div_zero),
     Abort::new(ABORT_DIV_OVERFLOW, "division overflows an int", |u| u.div_overflow),
     Abort::new(ABORT_OVERFLOW, "arithmetic overflows an int", |u| u.overflow),
@@ -56,6 +57,11 @@ pub const ABORTS: [Abort; 11] = [
     // `is_int(s)` is the same routine asked a different way, and it answers
     // rather than stopping — so only the conversion reaches this.
     Abort::new(ABORT_NOT_A_NUMBER, "this text is not a number an int can hold", |u| u.str_int),
+    // The same sentence about the other conversion that can be asked for a
+    // number there is not: a float too large, or a NaN, has no `int`.
+    Abort::new(ABORT_NO_INT, "this float is not a number an int can hold", |u| {
+        u.float_to_int
+    }),
     Abort::new(ABORT_STACK, "the stack is exhausted, so this call cannot be made", |u| {
         u.checks_stack
     }),

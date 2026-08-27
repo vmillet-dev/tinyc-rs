@@ -159,6 +159,7 @@ pub static SPELLED: &[Spelled] = &[
     Spelled::new("STRING_KW", TokenKind::KwString, Role::Type),
     Spelled::new("CHAR_KW", TokenKind::KwChar, Role::Type),
     Spelled::new("BOOL_KW", TokenKind::KwBool, Role::Type),
+    Spelled::new("FLOAT_KW", TokenKind::KwFloat, Role::Type),
     Spelled::new("IF_KW", TokenKind::KwIf, Role::Control),
     Spelled::new("ELSE_KW", TokenKind::KwElse, Role::Control),
     Spelled::new("WHILE_KW", TokenKind::KwWhile, Role::Control),
@@ -227,9 +228,10 @@ pub fn keyword(word: &str) -> Option<TokenKind> {
 ///
 /// A comment is deliberately absent: the lexer skips one as trivia and makes no
 /// token, so it is the editor's business and not the language's.
-fn valued() -> [(&'static str, TokenKind); 4] {
+fn valued() -> [(&'static str, TokenKind); 5] {
     [
         ("INT_LITERAL", TokenKind::Int(0)),
+        ("FLOAT_LITERAL", TokenKind::Float(0.0)),
         ("STRING_LITERAL", TokenKind::Str(StrLit::default())),
         ("CHAR_LITERAL", TokenKind::Char(' ')),
         ("IDENTIFIER", TokenKind::Ident(String::new())),
@@ -365,7 +367,7 @@ mod tests {
         // *and* bumping this number, which is the moment to notice the row.
         assert_eq!(
             SPELLED.len(),
-            49,
+            50,
             "a token was added or removed; the table and this count both move"
         );
         for (_, kind) in valued() {
@@ -447,6 +449,42 @@ mod tests {
         let names: Vec<&str> = Role::ALL.iter().map(|role| role.name()).collect();
         for (at, name) in names.iter().enumerate() {
             assert!(!names[at + 1..].contains(name), "two roles are called `{name}`");
+        }
+    }
+
+    /// The tokens in [`Role::Type`] are exactly the types in [`Prim::ALL`].
+    ///
+    /// The two tables are written apart and cannot be merged: one is the
+    /// language's list of primitive types, the other is what an editor colours
+    /// by, and only this holds them together. Without it, adding a type is a
+    /// program the compiler accepts and the editor renders as an undeclared
+    /// name — a drift nobody sees for weeks, because nothing in the compiler
+    /// reads the plugin's table.
+    ///
+    /// Both directions matter. A `Prim` with no row is a keyword the editor
+    /// does not know; a `Role::Type` row that is no `Prim` is a keyword the
+    /// editor colours as a type and the compiler will not accept as one.
+    #[test]
+    fn the_type_keywords_are_exactly_the_primitive_types() {
+        for prim in Prim::ALL {
+            let row = SPELLED.iter().find(|spelled| spelled.kind == prim.keyword());
+            let row = row.unwrap_or_else(|| {
+                panic!("`{}` is a type with no row in SPELLED; the editor cannot see it", prim.name())
+            });
+            assert_eq!(
+                row.role,
+                Role::Type,
+                "`{}` is a type and {} is not in the type role",
+                prim.name(),
+                row.name
+            );
+        }
+        for spelled in SPELLED.iter().filter(|s| s.role == Role::Type) {
+            assert!(
+                Prim::of_keyword(&spelled.kind).is_some(),
+                "{} is coloured as a type and names none",
+                spelled.name
+            );
         }
     }
 

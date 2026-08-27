@@ -221,6 +221,20 @@ fn arithmetic_on_a_character_points_at_the_character() {
     assert_error_at("char_arithmetic.tc", "3:9");
 }
 
+/// The left operand settles which kind of number the expression is, so what is
+/// underlined is the operand that disagreed with it.
+#[test]
+fn mixing_an_int_and_a_float_points_at_the_second_operand() {
+    assert_error_at("mixing_int_and_float.tc", "4:15");
+}
+
+/// A `match` on a float is refused at the *scrutinee*: the arms are not the
+/// mistake, and one of them would be underlined for the wrong reason.
+#[test]
+fn matching_on_a_float_points_at_the_value_being_matched() {
+    assert_error_at("match_on_a_float.tc", "3:10");
+}
+
 #[test]
 fn a_conversion_that_does_not_exist_points_at_the_whole_conversion() {
     assert_error_at("no_conversion.tc", "2:9");

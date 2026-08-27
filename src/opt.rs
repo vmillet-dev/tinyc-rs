@@ -131,8 +131,15 @@ fn evaluate(instr: &Instr, facts: &Facts) -> Known {
     let answer = match instr {
         Instr::Const { val, .. } => Some(*val),
         Instr::Copy { src, .. } => return known(src, facts),
-        Instr::Bin { op, lhs, rhs, .. } => fold_bin(*op, operand(lhs), operand(rhs)),
-        Instr::Cmp { op, lhs, rhs, .. } => fold_cmp(*op, operand(lhs), operand(rhs)),
+        // `num` travels with the instruction for exactly this reason: the bits
+        // of two doubles added as integers are not the sum of anything, and
+        // nothing downstream would notice — the answer would simply be wrong.
+        Instr::Bin { num, op, lhs, rhs, .. } => fold_bin(*num, *op, operand(lhs), operand(rhs)),
+        Instr::Cmp { num, op, lhs, rhs, .. } => fold_cmp(*num, *op, operand(lhs), operand(rhs)),
+        // Both directions are folded where lowering could see the operand; what
+        // reaches here is a constant only this pass discovered, and it is worth
+        // no second copy of the rules that decide when a float has an `int`.
+        Instr::Cast { .. } => None,
         // Everything else produces an address, a length, or whatever a callee
         // decided — none of them answerable here.
         _ => None,

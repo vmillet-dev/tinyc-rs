@@ -27,6 +27,7 @@ token	INT_KW	int	type
 token	STRING_KW	string	type
 token	CHAR_KW	char	type
 token	BOOL_KW	bool	type
+token	FLOAT_KW	float	type
 token	IF_KW	if	control
 token	ELSE_KW	else	control
 token	WHILE_KW	while	control
@@ -76,6 +77,7 @@ token	OR_OR	||	operator
 # The tokens that carry a value, and so are spelled every way rather
 # than one. An editor still needs to tell them apart to colour them.
 valued	INT_LITERAL	integer literal
+valued	FLOAT_LITERAL	float literal
 valued	STRING_LITERAL	string literal
 valued	CHAR_LITERAL	character literal
 valued	IDENTIFIER	identifier
@@ -87,6 +89,7 @@ builtin	is_int	string	bool
 
 # What a `%` in a format string may be followed by.
 spec	d	an int
+spec	f	a float
 spec	c	a char
 spec	s	a string
 spec	b	a bool

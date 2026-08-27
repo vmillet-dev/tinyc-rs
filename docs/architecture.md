@@ -122,7 +122,7 @@ field   := type IDENT ";"
 fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 params  := param ("," param)*
 param   := type IDENT | "self"
-type    := ("int" | "string" | "char" | "bool" | IDENT) ("[" INT? "]")?
+type    := ("int" | "float" | "string" | "char" | "bool" | IDENT) ("[" INT? "]")?
 stmt    := decl | assign | print | push | if | while | for | match | return
          | break | continue | call ";"
 decl    := type IDENT "=" expr ";"
@@ -146,14 +146,14 @@ sum     := term (("+" | "-") term)*
 term    := unary (("*" | "/" | "%") unary)*
 unary   := ("-" | "!") unary | primary
 primary := atom postfix*
-atom    := INT | STRING | CHAR | BOOL | IDENT | variant | call | match | array
-         | object | len | convert | "(" expr ")"
+atom    := INT | FLOAT | STRING | CHAR | BOOL | IDENT | variant | call | match
+         | array | object | len | convert | "(" expr ")"
 postfix := "[" expr "]" | "." IDENT | "." IDENT "(" args? ")"
 variant := IDENT "::" IDENT ("(" (expr ("," expr)*)? ")")?
 array   := "[" (expr ("," expr)*)? "]"
 object  := IDENT "{" (IDENT ":" expr ("," IDENT ":" expr)*)? "}"
 len     := "len" "(" expr ")"
-convert := ("int" | "char" | "string" | "bool") "(" expr ")"
+convert := ("int" | "float" | "char" | "string" | "bool") "(" expr ")"
 call    := IDENT "(" (expr ("," expr)*)? ")"
 match   := "match" "(" expr ")" "{" arm* "}"
 arm     := pattern "=>" (expr ","? | block ","?)
@@ -161,14 +161,15 @@ pattern := IDENT "::" IDENT ("(" IDENT ("," IDENT)* ")")?
          | "-"? INT | STRING | CHAR | BOOL | "_"
 ```
 
-`int` is a 64-bit signed integer, `string` is a run of characters, `char` is one
-Unicode character, `bool` is `true` or `false`, an `enum` declares a type of its
-own with a fixed set of values, a `class` declares one with fields and methods,
-`int[3]` is a fixed-length array of them and `int[]` a list whose length the
-program decides. Arithmetic is `int`-only, `+` also
-joins two strings, `&&`, `||` and `!` are `bool`-only, `//` starts a comment, and
-a variable keeps the type it was declared with — assigning a `string` to an
-`int` is an error.
+`int` is a 64-bit signed integer, `float` an IEEE-754 double, `string` is a run
+of characters, `char` is one Unicode character, `bool` is `true` or `false`, an
+`enum` declares a type of its own with a fixed set of values, a `class` declares
+one with fields and methods, `int[3]` is a fixed-length array of them and
+`int[]` a list whose length the program decides. Arithmetic is on two numbers of
+the same kind — an `int` and a `float` do not mix, and `%` is `int`-only — `+`
+also joins two strings, `&&`, `||` and `!` are `bool`-only, `//` starts a
+comment, and a variable keeps the type it was declared with — assigning a
+`string` to an `int` is an error.
 
 Three functions come with the language rather than being declared —
 `read_line() -> string`, `eof() -> bool` and `is_int(string) -> bool`, see
@@ -679,17 +680,26 @@ exists to answer. Two *strings* are not ordered: where `é` sorts is a question
 about a language, not about characters, so `<` on strings is refused rather than
 quietly answered wrongly.
 
-There is no arithmetic on a character and no implicit widening. The way across
-is written out, and these four conversions are the whole list:
+There is no arithmetic on a character and no implicit widening — not between a
+character and a number, and not between the two numbers either. The way across
+is written out, and these conversions are the whole list:
 
 | Written | Gives | Fails when |
 |---|---|---|
 | `int(c)` | a character's code point | never |
 | `int(s)` | the number a string spells | the text is not a number an `int` can hold — ask `is_int(s)` first |
+| `int(f)` | the float with its fraction dropped, toward zero | the float has no `int` — too large, or not a number at all. Checked at compile time when it is a constant, at run time otherwise |
+| `float(n)` | the nearest float to that number | never — though above `2^53` the nearest one is not the number itself |
 | `char(n)` | the character with that code point | `n` names none — checked at compile time when it is a constant, at run time otherwise |
 | `string(c)` | a string of that one character | never |
 | `string(n)` | a number written out in decimal | never |
 | `string(cs)` | the characters of a `char[]`, sealed into a string | never |
+
+There is deliberately no `string(f)`. Writing a float out is `print`'s job —
+`println(f)` and `%f` in a format both do it — and a conversion would have to
+settle, once and in one place, how many digits a float turns into. That is a
+decision with no good default, so the language does not pretend to have made
+one.
 
 A string is **read-only**: `s[i] = c` is a compile error, and `+` produces a
 third string rather than changing either operand. That is what makes sharing one

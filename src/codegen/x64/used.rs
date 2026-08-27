@@ -9,18 +9,18 @@
 //! business.
 
 use crate::ast::{ClassId, EnumId, Ty, TypeTable};
-use crate::ir::{DivGuards, Instr, Program, Runtime};
+use crate::ir::{DivGuards, Instr, Num, Program, Runtime};
 
-use super::{ENTRY_POINT, format_index};
+use super::{ENTRY_POINT, FORMATS, format_index};
 
 pub struct Used {
     /// Which `printf` format each shape of value goes out through, indexed by
     /// [`super::format_index`]. The last slot is a string or a character,
     /// which go out through no format at all — they are written by length.
-    formats: [bool; 4],
-    /// The same four, for a value that *ends* a line. A program that prints
+    formats: [bool; FORMATS],
+    /// The same again, for a value that *ends* a line. A program that prints
     /// without ever calling `println` carries no format that ends one.
-    lines: [bool; 4],
+    lines: [bool; FORMATS],
     /// Which enums have a value printed, and so need their table of variant
     /// names emitted. An enum used only in a `match` needs none: matching is
     /// arithmetic on the tag, and never asks what the tag is called.
@@ -39,6 +39,9 @@ pub struct Used {
     pub div_overflow: bool,
     pub overflow: bool,
     pub bounds: bool,
+    /// Whether any `int(f)` is made, and so whether the report about a float
+    /// with no `int` is needed.
+    pub float_to_int: bool,
     /// Whether any prologue guards against running out of stack, and so whether
     /// the entry point has to find out where the stack ends.
     ///
@@ -87,8 +90,8 @@ pub struct Used {
 impl Used {
     pub fn of(program: &Program) -> Used {
         let mut used = Used {
-            formats: [false; 4],
-            lines: [false; 4],
+            formats: [false; FORMATS],
+            lines: [false; FORMATS],
             enums: vec![false; program.table.enums.len()],
             vtables: vec![false; program.vtables.len()],
             aborts: false,
@@ -96,6 +99,7 @@ impl Used {
             div_overflow: false,
             overflow: false,
             bounds: false,
+            float_to_int: false,
             // Dead functions are gone by now, so anything left beside the entry
             // point is something the program really calls.
             checks_stack: program.functions.iter().any(|f| f.name != ENTRY_POINT),
@@ -146,6 +150,10 @@ impl Used {
                     // questions used to be one, and the answer to the narrow
                     // one is what decides which messages the file carries.
                     match other {
+                        // Float arithmetic refuses nothing: too large is an
+                        // infinity and zero into zero is a NaN. So it reaches
+                        // no message and needs no guard.
+                        Instr::Bin { num: Num::Float, .. } => {}
                         Instr::Bin { op, lhs, rhs, .. } if op.divides() => {
                             let guards = DivGuards::of(lhs, rhs);
                             used.div_zero |= guards.zero;
@@ -153,6 +161,9 @@ impl Used {
                         }
                         Instr::Bin { .. } => used.overflow = true,
                         Instr::Elem { .. } => used.bounds |= other.can_fail(),
+                        // Only one direction can fail: every `int` has a
+                        // `float` nearest it.
+                        Instr::Cast { to: Num::Int, .. } => used.float_to_int = true,
                         _ => {}
                     }
                     if let Instr::RtCall { callee, .. } = other {
@@ -245,6 +256,7 @@ impl Used {
     /// and nothing else out of the C library's output half.
     pub fn needs_printf(&self) -> bool {
         self.writes(Ty::Int)
+            || self.writes(Ty::Float)
             || self.writes(Ty::Bool)
             || self.prints_enum()
             || self.lines[super::enum_slot()]

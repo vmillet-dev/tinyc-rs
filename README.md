@@ -17,9 +17,14 @@ rather than answering wrongly.
 
 **The language**
 
-* `int` (64-bit signed), `bool`, `char` (one Unicode character) and `string` — a
-  run of characters, so `len` counts characters, `s[i]` is one, and UTF-8 exists
-  only at the edges.
+* `int` (64-bit signed), `float` (IEEE-754 double), `bool`, `char` (one Unicode
+  character) and `string` — a run of characters, so `len` counts characters,
+  `s[i]` is one, and UTF-8 exists only at the edges.
+* Nothing widens on its own: an `int` and a `float` do not mix in one
+  expression, and `float(n)` and `int(f)` say which direction was meant. Float
+  arithmetic is IEEE's, infinities and NaNs included, so it is the one
+  arithmetic here that never stops the program
+  ([`examples/float.tc`](examples/float.tc)).
 * Fixed arrays whose length is part of the type (`int[3]`), and growable lists
   whose length is a fact about the data (`int[]`).
 * Classes with fields, methods, single inheritance and virtual dispatch — plus
@@ -46,9 +51,9 @@ rather than answering wrongly.
   it may *move* what it grows: `push` onto a parameter is refused, with the
   copy to make instead. See [Assignment copies, a parameter
   borrows](docs/architecture.md#assignment-copies-a-parameter-borrows).
-* No implicit conversions at all — `string(n)`, `int(c)` and `char(n)` are
-  written out, so a message with a number in it says where the number became
-  text.
+* No implicit conversions at all — `string(n)`, `int(c)`, `char(n)`, `float(n)`
+  and `int(f)` are written out, so a message with a number in it says where the
+  number became text, and an average says where it stopped being whole.
 * `print` writes, `println` ends the line, and a string literal in first
   position is a **format**: `println("Grade: %c for %s", g, name)`. The `%`s are
   split and checked while the program is compiled, so a wrong letter, a missing
@@ -59,7 +64,10 @@ rather than answering wrongly.
 **Safety**
 
 * **Arithmetic never answers wrongly.** Overflow, division by zero and
-  `i64::MIN / -1` stop the program with a message instead of wrapping.
+  `i64::MIN / -1` stop the program with a message instead of wrapping. A
+  `float` has an answer for all three — an infinity, a NaN — so it stops for
+  none of them, and `int(f)` is the one place a float can: not every float has
+  an `int`.
 * **Every index is checked.** One the compiler can work out is checked before
   the program is built; only one it cannot see costs anything at run time.
 * **Running out of stack is a message, not a crash.** A function whose locals
@@ -123,8 +131,8 @@ knows where the C library is and which startup object calls `main`.
 
 The C library is linked in either case because writing anything out compiles
 into a call to `printf`. A TinyC format never reaches it: the compiler splits
-one into its pieces, so `printf` is only ever handed `%lld` or `%s` and one
-value to go with it.
+one into its pieces, so `printf` is only ever handed `%lld`, `%f` or `%s` and
+one value to go with it.
 
 ### Two targets
 
@@ -244,6 +252,7 @@ The whole story, including why guessing was not good enough, is in
 | Programs | What they show |
 |----------|----------------|
 | [`hello.tc`](examples/hello.tc), [`arith.tc`](examples/arith.tc), [`bool.tc`](examples/bool.tc), [`reassign.tc`](examples/reassign.tc) | variables, arithmetic, printing |
+| [`float.tc`](examples/float.tc) | IEEE-754 arithmetic, and the four places it is not an `int` |
 | [`format.tc`](examples/format.tc) | `print` and `println`, and every specifier a format takes |
 | [`control_flow.tc`](examples/control_flow.tc), [`functions.tc`](examples/functions.tc) | branches, loops, calls, recursion |
 | [`classes.tc`](examples/classes.tc), [`composition.tc`](examples/composition.tc), [`enums.tc`](examples/enums.tc) | objects, dispatch, matching |

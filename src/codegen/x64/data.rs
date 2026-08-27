@@ -21,6 +21,11 @@ use super::{ENTRY_POINT, Platform, symbol};
 pub const FMT_INT: &str = "fmt_int";
 pub const FMT_STR: &str = "fmt_str";
 pub const FMT_BOOL: &str = "fmt_bool";
+/// `%f` rather than `%g`, so that a float always *looks* like one: `%g` writes
+/// `4` for `4.0`, which reads as an `int` and is the one thing the rendering
+/// must not do. What it costs is the six decimals `%f` always writes, which are
+/// also exactly what `%f` means in the format strings the language already has.
+pub const FMT_FLOAT: &str = "fmt_float";
 pub const BOOL_TRUE: &str = "bool_true";
 pub const BOOL_FALSE: &str = "bool_false";
 
@@ -105,18 +110,25 @@ pub fn data_section(asm: &mut Asm, platform: &dyn Platform, program: &Program, u
     if used.prints(Ty::Bool) {
         asm.asm(&format!("{FMT_BOOL}: db \"%s\", 0"));
     }
+    if used.prints(Ty::Float) {
+        asm.asm(&format!("{FMT_FLOAT}: db \"%f\", 0"));
+    }
     // The two words are needed whichever format picks between them.
     if used.writes(Ty::Bool) {
         asm.asm(&format!("{BOOL_TRUE}: db \"true\", 0"));
         asm.asm(&format!("{BOOL_FALSE}: db \"false\", 0"));
     }
-    // The same three, ending the line, and only the ones a `println` reaches.
-    for (ty, format) in
-        [(Ty::Int, FMT_INT), (Ty::Enum(EnumId(0)), FMT_STR), (Ty::Bool, FMT_BOOL)]
-    {
+    // The same four, ending the line, and only the ones a `println` reaches.
+    for (ty, format) in [
+        (Ty::Int, FMT_INT),
+        (Ty::Float, FMT_FLOAT),
+        (Ty::Enum(EnumId(0)), FMT_STR),
+        (Ty::Bool, FMT_BOOL),
+    ] {
         if used.ends_a_line(ty) {
             let spec = match ty {
                 Ty::Int => "%lld",
+                Ty::Float => "%f",
                 _ => "%s",
             };
             asm.asm(&format!("{}: db \"{spec}\", 10, 0", line_format(format)));

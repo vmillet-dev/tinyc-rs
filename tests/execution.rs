@@ -473,6 +473,205 @@ fn a_division_that_cannot_be_performed_reports_and_exits() {
     harness.each_stops_with("abort", &cases);
 }
 
+/// Float arithmetic never stops the program, and `int(f)` is the one thing
+/// about a float that can.
+///
+/// The value comes back from a call in every case, so nothing here is settled
+/// at compile time: what is being checked is the guard the backend emits, and
+/// the guard has a corner — the machine answers `i64::MIN` both for a float it
+/// could not name *and* for the one float that really is `i64::MIN`. Getting
+/// that backwards either refuses a legal conversion or lets a wrong number
+/// through, and only running it tells which.
+#[test]
+fn a_float_with_no_int_reports_and_exits() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases = [
+        // Past the top of the range, past the bottom, and no number at all.
+        (
+            "fn big() -> float {\n  return 100000000000000000000.0;\n}\n\
+             fn main() {\n  println(int(big()));\n}",
+            "an int can hold",
+        ),
+        (
+            "fn big() -> float {\n  return 100000000000000000000.0;\n}\n\
+             fn main() {\n  println(int(-big()));\n}",
+            "an int can hold",
+        ),
+        (
+            "fn none() -> float {\n  float zero = 0.0;\n  return zero / zero;\n}\n\
+             fn main() {\n  println(int(none()));\n}",
+            "an int can hold",
+        ),
+        // An infinity is a value everywhere else and still has no `int`.
+        (
+            "fn far() -> float {\n  float zero = 0.0;\n  return 1.0 / zero;\n}\n\
+             fn main() {\n  println(int(far()));\n}",
+            "an int can hold",
+        ),
+    ];
+
+    harness.each_stops_with("no_int", &cases);
+}
+
+/// `-x` really is negation and not `0.0 - x`, which is the one place the two
+/// differ and the difference is invisible until it is not.
+///
+/// `0.0 - 0.0` is `+0.0`, so a compiler that lowered unary minus that way would
+/// answer `+0.0` for `-z` where `z` is zero. Nothing catches it by comparing:
+/// the two zeroes are *equal*. It shows up one operation later, in the sign of
+/// the infinity you get for dividing by it — which is what the second column
+/// asks. The subtraction is from **negative** zero, and this is why.
+#[test]
+fn negating_a_float_keeps_the_sign_of_zero() {
+    let Some(harness) = Harness::find() else { return };
+
+    let prelude = "fn zero() -> float {\n  return 0.0;\n}\n";
+    let cases: [(&str, &str); 3] = [
+        // Equal, and still not the same number.
+        ("float z = zero();\nfloat neg = -z;\nprintln(\"%b %b\", z == neg, 1.0 / neg < 0.0);", "true true"),
+        // The other direction, so a sign flip in the wrong place fails too.
+        ("float z = zero();\nprintln(\"%b %b\", z == 0.0, 1.0 / z > 0.0);", "true true"),
+        // And negating twice comes back.
+        ("float z = zero();\nfloat back = -(-z);\nprintln(1.0 / back > 0.0);", "true"),
+    ];
+
+    harness.each_prints_after("float_zero", prelude, &cases);
+}
+
+/// The other side of that guard: the conversions that *do* have an answer, and
+/// the arithmetic that never stops at all.
+///
+/// `i64::MIN` is the corner. It is the only float whose truncation is the value
+/// the machine also uses to mean "I could not", so a guard that read the answer
+/// instead of the source would refuse this program.
+#[test]
+fn the_conversions_a_float_does_have_are_made() {
+    let Some(harness) = Harness::find() else { return };
+
+    // Every value comes back from a call, so the optimiser cannot settle any of
+    // these and what runs is the emitted guard.
+    let prelude = "fn least() -> float {\n  return 0.0 - 9223372036854775808.0;\n}\n\
+                   fn part() -> float {\n  return 2.75;\n}\n\
+                   fn zero() -> float {\n  return 0.0;\n}\n";
+    let cases: [(&str, &str); 6] = [
+        // Exactly `-2^63`: in range, and the one float whose answer the machine
+        // also uses to mean "I could not".
+        ("println(int(least()));", "-9223372036854775808"),
+        // Truncation is toward zero, not rounding, in both directions.
+        ("println(int(part()));", "2"),
+        ("println(int(-part()));", "-2"),
+        // Every `int` has a `float`, so this direction never stops — not even
+        // for one that no `float` names exactly.
+        ("int n = 9007199254740993;\nprintln(float(n) > 0.0);", "true"),
+        // Dividing by zero answers rather than stopping, which is the whole
+        // reason the backend emits no guard for a float division.
+        ("println(1.0 / zero() > 0.0);", "true"),
+        // And a NaN compares false against everything, itself included.
+        ("float n = zero() / zero();\nprintln(n == n || n < n || n > n);", "false"),
+    ];
+
+    harness.each_prints_after("float_answers", prelude, &cases);
+}
+
+/// A float that does not fit in a register still computes.
+///
+/// The one thing carrying a float in an ordinary machine word buys is that
+/// spilling one needs no code of its own — and the one way to find out that it
+/// does is to run out of registers and check the answer. Twenty live floats is
+/// past what either platform has to hand out, so most of these operands are
+/// read from the frame with `movq xmm0, qword [rsp+n]` and most of these
+/// results are written back to it.
+///
+/// Every value here is a dyadic rational small enough to be exact in binary —
+/// halves, quarters, eighths — so the total is provable rather than observed:
+/// `1..=12` sums to 78, and the eight derived values to 179.
+#[test]
+fn a_float_spilled_to_the_frame_computes_the_same_answer() {
+    let Some(harness) = Harness::find() else { return };
+
+    let cases: [(&str, &str); 3] = [
+        (
+            "float a = 1.0;  float b = 2.0;  float c = 3.0;  float d = 4.0;\n\
+             float e = 5.0;  float f = 6.0;  float g = 7.0;  float h = 8.0;\n\
+             float i = 9.0;  float j = 10.0; float k = 11.0; float l = 12.0;\n\
+             float m = a + b; float n = c * d; float o = e - f; float p = g / h;\n\
+             float q = i + j; float r = k * l; float s = m + n; float t = o - p;\n\
+             println(a + b + c + d + e + f + g + h + i + j + k + l\n\
+                     + m + n + o + p + q + r + s + t);",
+            "257.000000",
+        ),
+        // The same pressure with the comparisons, whose answer travels through
+        // a byte register while the operands come out of the frame.
+        (
+            "float a = 1.0;  float b = 2.0;  float c = 3.0;  float d = 4.0;\n\
+             float e = 5.0;  float f = 6.0;  float g = 7.0;  float h = 8.0;\n\
+             float i = 9.0;  float j = 10.0; float k = 11.0; float l = 12.0;\n\
+             float m = a + b; float n = c * d; float o = e - f; float p = g / h;\n\
+             float q = i + j; float r = k * l; float s = m + n; float t = o - p;\n\
+             println(\"%b %b %b %b\", a < l, s > t, m == m, q != r);\n\
+             println(s + t + q + r);",
+            // s = 15, t = -1.875, q = 19, r = 132.
+            "true true true true\n164.125000",
+        ),
+        // And a conversion under the same pressure, in both directions.
+        (
+            "float a = 1.0;  float b = 2.0;  float c = 3.0;  float d = 4.0;\n\
+             float e = 5.0;  float f = 6.0;  float g = 7.0;  float h = 8.0;\n\
+             float i = 9.0;  float j = 10.0; float k = 11.0; float l = 12.0;\n\
+             int n1 = int(a + b + c + d); int n2 = int(e + f + g + h);\n\
+             float back = float(n1) + float(n2) + i + j + k + l;\n\
+             println(\"%d %d %f\", n1, n2, back);",
+            "10 26 78.000000",
+        ),
+    ];
+
+    harness.each_prints("float_spill", &cases);
+}
+
+/// The whole truth table of float comparison, run rather than read.
+///
+/// This is the corner of the change most easily got wrong and least easily
+/// seen: `ucomisd` reports "unordered" as the same flags as "below or equal",
+/// so `<` is emitted as an `above` with its operands the other way round, and
+/// `==` is two conditions combined. A `setb` where a `seta` belongs, or a
+/// forgotten parity check, is a comparison that answers wrongly only about a
+/// NaN — and only a program that runs one says so.
+///
+/// Every operand comes back from a call, so nothing here folds.
+#[test]
+fn every_float_comparison_answers_what_ieee_says() {
+    let Some(harness) = Harness::find() else { return };
+
+    let prelude = "fn one() -> float {\n  return 1.0;\n}\n\
+                   fn two() -> float {\n  return 2.0;\n}\n\
+                   fn none() -> float {\n  float zero = 0.0;\n  return zero / zero;\n}\n";
+    // `%b` six times, in the order `<`, `<=`, `>`, `>=`, `==`, `!=`.
+    let row = "println(\"%b %b %b %b %b %b\", a < b, a <= b, a > b, a >= b, a == b, a != b);";
+    let cases: [(&str, &str); 4] = [
+        (
+            &format!("float a = one();\nfloat b = two();\n{row}"),
+            "true true false false false true",
+        ),
+        (
+            &format!("float a = two();\nfloat b = one();\n{row}"),
+            "false false true true false true",
+        ),
+        (
+            &format!("float a = one();\nfloat b = one();\n{row}"),
+            "false true false true true false",
+        ),
+        // A NaN is *unordered* with everything, itself included: only `!=` is
+        // true, and it is true even against itself.
+        (
+            &format!("float a = none();\nfloat b = one();\n{row}"),
+            "false false false false false true",
+        ),
+    ];
+
+    harness.each_prints_after("float_cmp", prelude, &cases);
+}
+
 /// Short circuiting and loop jumps are the two features whose whole point is
 /// what a program *does not* do, which no amount of reading assembly proves.
 ///
@@ -1423,6 +1622,12 @@ fn optimising_never_changes_what_a_program_prints() {
         // An index the pass can work out, past the end of an array whose
         // length it also knows.
         "fn main() {\n  int i = 5;\n  int[3] xs = [1, 2, 3];\n  println(xs[i]);\n}",
+        // A float with no `int`, reached by an arithmetic the pass can do and
+        // the source does not spell out.
+        "fn main() {\n  float big = 9000000000000000000.0;\n  float ten = 10.0;\n  \
+         println(int(big * ten));\n}",
+        // The other way a float has no `int`: it is not a number at all.
+        "fn main() {\n  float zero = 0.0;\n  println(int(zero / zero));\n}",
     ];
     for (index, source) in stoppers.iter().enumerate() {
         let optimised = harness.build_and_run(&format!("stop{index}_opt"), source, b"");

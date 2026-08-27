@@ -1,0 +1,66 @@
+// What a `float` is, and the four places it does not behave like an `int`.
+//
+// A float is an IEEE-754 double, and it travels in an ordinary machine register
+// like everything else — what changes is only the arithmetic read out of it.
+// See `Num` in `src/ir.rs`, where that trade is written down once.
+//
+//   tinyc examples/float.tc --emit ir --no-optimise    # `add.f`, `cmp.f`
+//   tinyc examples/float.tc --emit ir                  # folded, in f64
+//
+// The optimiser folds these in double precision rather than on the bits, so
+// `--emit ir` and running the program agree about every line below.
+fn main() {
+  float a = 6.5;
+  float b = 2.0;
+
+  println(a + b);
+  println(a - b);
+  println(a * b);
+  println(a / b);
+  println(-a);
+
+  // Nothing widens on its own: `1 + 1.5` is refused. This is how it is written
+  // instead, in both directions, and each direction says which it is.
+  int n = 7;
+  println(float(n) / b);     // 3.5 — where `7 / 2` would answer 3
+  println(int(a));           // 6 — the fraction is dropped, not rounded
+
+  // Ordering is IEEE's, which is *almost* the ordering an `int` has. The gap is
+  // the last line: a NaN is neither equal to, less than nor greater than
+  // anything, itself included — so `!(x < y)` and `x >= y` are two different
+  // questions here, and only here.
+  float none = 0.0 / 0.0;
+  println("%b %b %b", a > b, a == 6.5, a != a);
+  println("%b %b %b", none == none, none != none, none < none);
+
+  // A float is a value like any other, and that is the point of carrying one
+  // in an ordinary machine word: it goes in an array and a list, in a field,
+  // through a parameter and back out of a function, with no code of its own
+  // for any of it.
+  float[3] xs = [1.5, 2.25, 3.0];
+  float total = 0.0;
+  int i = 0;
+  while (i < 3) {
+    total = total + xs[i];
+    i = i + 1;
+  }
+  println("%f is half of %f", halved(total), total);
+
+  Reading r = Reading { at: 0.5, value: 20.25 };
+  r.value = r.value + 1.0;
+  println("%f at %f", r.value, r.at);
+
+  float[] grew = [];
+  push(grew, halved(1.0));
+  push(grew, halved(3.0));
+  println("%f %f %d", grew[0], grew[1], len(grew));
+}
+
+fn halved(float x) -> float {
+  return x / 2.0;
+}
+
+class Reading {
+  float at;
+  float value;
+}

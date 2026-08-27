@@ -1,0 +1,7 @@
+fn main() {
+  float f = 1.5;
+  match (f) {
+    1.5 => { println("one and a half"); }
+    _ => { }
+  }
+}

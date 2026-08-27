@@ -2,6 +2,7 @@
 name = "TinyC"
 version = "0.1.0"
 edition = "2024"
+default-run = "tinyc"
 
 [lib]
 name = "tinyc"
@@ -13,15 +14,9 @@ path = "src/main.rs"
 
 # Writes `grammar/vocabulary.txt`, which the IntelliJ plugin's token table is
 # generated from. Not part of compiling anything: see `src/vocabulary.rs`.
-#
-# It lives in `tools/` rather than in `src/bin/`, which would have got it
-# discovered automatically *as well as* declared here — and would have put a
-# crate root called `vocabulary.rs` in the same tree as the library module of
-# that name. Cargo sees through both; an IDE resolving `tinyc::vocabulary` from
-# inside it does not have to.
 [[bin]]
 name = "export-vocabulary"
 path = "tools/export_vocabulary.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6.6", features = ["derive"] }

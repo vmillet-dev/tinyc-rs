@@ -9,7 +9,7 @@
 //! fn_decl := "fn" IDENT "(" params? ")" ("->" type)? block
 //! params  := param ("," param)*
 //! param   := type IDENT
-//! type    := ("int" | "string" | "char" | "bool" | IDENT) ("[" INT "]")?
+//! type    := (PRIM | IDENT) ("[" INT "]")?    -- PRIM is `ast::Prim::ALL`
 //! stmt    := decl | assign | print | if | while | for | match | return
 //!          | break | continue
 //! decl    := type IDENT "=" expr ";"
@@ -37,12 +37,12 @@
 //! array   := "[" (expr ("," expr)*)? "]"
 //! index   := IDENT "[" expr "]"
 //! len     := "len" "(" expr ")"
-//! convert := ("int" | "char" | "string" | "bool") "(" expr ")"
+//! convert := PRIM "(" expr ")"
 //! call    := IDENT "(" (expr ("," expr)*)? ")"
 //! match   := "match" "(" expr ")" "{" arm* "}"
 //! arm     := pattern "=>" (expr ","? | block ","?)
 //! pattern := IDENT "::" IDENT ("(" IDENT ("," IDENT)* ")")?
-//!          | "-"? INT | STRING | CHAR | BOOL | "_"
+//!          | "-"? INT | STRING | CHAR | BOOL | FLOAT | "_"
 //! ```
 //!
 //! A `match` is a primary expression, and a statement only in the way a call is
@@ -165,26 +165,23 @@ impl<'a> Parser<'a> {
     fn recover_to_statement(&mut self) {
         let stopped = self.skip_until(|kind, braces| {
             braces == 0
-                && matches!(
-                    kind,
-                    TokenKind::Semi
-                        | TokenKind::RBrace
-                        | TokenKind::KwPrint
-                        | TokenKind::KwPrintln
-                        | TokenKind::KwPush
-                        | TokenKind::KwIf
-                        | TokenKind::KwWhile
-                        | TokenKind::KwFor
-                        | TokenKind::KwMatch
-                        | TokenKind::KwReturn
-                        | TokenKind::KwBreak
-                        | TokenKind::KwContinue
-                        | TokenKind::KwInt
-                        | TokenKind::KwString
-                        | TokenKind::KwChar
-                        | TokenKind::KwBool
-                        | TokenKind::Ident(_)
-                )
+                && (Prim::of_keyword(kind).is_some()
+                    || matches!(
+                        kind,
+                        TokenKind::Semi
+                            | TokenKind::RBrace
+                            | TokenKind::KwPrint
+                            | TokenKind::KwPrintln
+                            | TokenKind::KwPush
+                            | TokenKind::KwIf
+                            | TokenKind::KwWhile
+                            | TokenKind::KwFor
+                            | TokenKind::KwMatch
+                            | TokenKind::KwReturn
+                            | TokenKind::KwBreak
+                            | TokenKind::KwContinue
+                            | TokenKind::Ident(_)
+                    ))
         });
         // The `;` belonged to the statement that failed; a `}` belongs to the
         // block, and anything else is the next statement's first token.
@@ -368,10 +365,12 @@ impl<'a> Parser<'a> {
     /// type exists.
     fn expect_type(&mut self, what: &str) -> PResult<TypeRef> {
         let token = self.peek();
+        // A keyword names a type of the language's, an identifier one of the
+        // program's, and the note lists the first set rather than repeating it:
+        // a type added to `Prim` and forgotten here would otherwise be a type
+        // the compiler accepts and the diagnostic denies.
         let name = match &token.kind {
-            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwChar | TokenKind::KwBool => {
-                token.kind.text().to_string()
-            }
+            kind if Prim::of_keyword(kind).is_some() => kind.text().to_string(),
             TokenKind::Ident(name) => name.clone(),
             _ => {
                 return Err(Diagnostic::new(
@@ -379,7 +378,13 @@ impl<'a> Parser<'a> {
                     token.span,
                 )
                 .with_label(format!("{what} needs a type here"))
-                .with_note("the types are `int`, `string`, `char`, `bool` and any declared enum or class", None));
+                .with_note(
+                    format!(
+                        "the types are {} and any declared enum or class",
+                        Prim::all_quoted()
+                    ),
+                    None,
+                ));
             }
         };
         let span = self.bump().span;
@@ -420,8 +425,10 @@ impl<'a> Parser<'a> {
     /// type's length is a literal, and what follows the `]` is a name in a
     /// declaration and an `=` in an assignment.
     fn starts_declaration(&self) -> bool {
+        if Prim::of_keyword(&self.peek().kind).is_some() {
+            return true;
+        }
         match self.peek().kind {
-            TokenKind::KwInt | TokenKind::KwString | TokenKind::KwChar | TokenKind::KwBool => true,
             TokenKind::Ident(_) => match self.peek_at(1).kind {
                 TokenKind::Ident(_) => true,
                 TokenKind::LBracket => match self.peek_at(2).kind {
@@ -716,6 +723,7 @@ impl<'a> Parser<'a> {
         let span = token.span;
         let pattern = match &token.kind {
             TokenKind::Int(v) => Pattern::Int(*v),
+            TokenKind::Float(v) => Pattern::Float(*v),
             TokenKind::Char(c) => Pattern::Char(*c),
             TokenKind::Str(lit) => Pattern::Str(lit.chars.clone()),
             TokenKind::Bool(v) => Pattern::Bool(*v),
@@ -1268,19 +1276,15 @@ impl<'a> Parser<'a> {
         let span = token.span;
         let kind = match &token.kind {
             TokenKind::Int(v) => ExprKind::Int(*v),
+            TokenKind::Float(v) => ExprKind::Float(*v),
             TokenKind::Str(lit) => ExprKind::Str(lit.chars.clone()),
             TokenKind::Char(c) => ExprKind::Char(*c),
             TokenKind::Bool(v) => ExprKind::Bool(*v),
             // `int(c)` — a conversion, written as the type it produces. A type
             // keyword in expression position can be nothing else: a declaration
             // is a *statement*, and statements are told apart before this point.
-            TokenKind::KwInt | TokenKind::KwChar | TokenKind::KwString | TokenKind::KwBool => {
-                let to = match token.kind {
-                    TokenKind::KwInt => Prim::Int,
-                    TokenKind::KwChar => Prim::Char,
-                    TokenKind::KwString => Prim::Str,
-                    _ => Prim::Bool,
-                };
+            kind if Prim::of_keyword(kind).is_some() => {
+                let to = Prim::of_keyword(kind).expect("just matched");
                 let keyword = self.bump().span;
                 let open = self.expect(TokenKind::LParen)?.span;
                 let value = self.expr()?;

@@ -50,6 +50,10 @@ static ABI: Abi = Abi {
     // epilogue cannot forget to give back.
     shadow_space: 0,
     variadic_in_al: true,
+    // Numbered by class: the format string is an integer argument and does not
+    // count, so the value is the first vector one.
+    vector_arg: "xmm0",
+    vector_arg_shadowed: false,
     write: "write",
     read: "read",
 };

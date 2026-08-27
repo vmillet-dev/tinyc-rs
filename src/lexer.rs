@@ -213,42 +213,86 @@ impl<'a> Lexer<'a> {
         crate::vocabulary::keyword(word).unwrap_or_else(|| TokenKind::Ident(word.to_string()))
     }
 
+    /// A number, which is an `int` unless a `.` with a digit behind it makes it
+    /// a `float`.
+    ///
+    /// The digits are not accumulated here — they are handed to `str::parse`,
+    /// which is the one thing in reach that rounds a decimal literal to the
+    /// nearest `f64` **once**. Building the value out of an integer part and a
+    /// fraction goes wrong twice over: the fraction cannot hold more digits
+    /// than a `u64` has room for, so π written to thirty places is refused for
+    /// being *too large* when it is merely precise; and the two halves are
+    /// rounded separately and then again when they are added, which lands about
+    /// one literal in a thousand on the `f64` next to the right one.
     fn number(&mut self) -> std::result::Result<TokenKind, Diagnostic> {
         let start = self.offset();
-        let mut value: i64 = 0;
-        let mut overflowed = false;
-        while let Some(c) = self.peek() {
-            let Some(digit) = c.to_digit(10) else { break };
+        self.digits();
+
+        // A `.` starts a fraction, and TinyC puts a `.` after a number for no
+        // other reason — so a `.` with no digit behind it is a mistake with a
+        // name rather than an `int` followed by a field access naming no object.
+        let is_float = self.peek() == Some('.');
+        if is_float {
             self.bump();
-            value = match value.checked_mul(10).and_then(|v| v.checked_add(digit as i64)) {
-                Some(v) => v,
-                None => {
-                    overflowed = true;
-                    0
-                }
-            };
+            if !self.peek().is_some_and(|c| c.is_ascii_digit()) {
+                return Err(Diagnostic::new(
+                    "a floating-point literal needs a digit after the `.`",
+                    Span::new(start, self.offset() - start),
+                )
+                .with_label("`1.0` rather than `1.`"));
+            }
+            self.digits();
         }
 
-        // `123abc` is a malformed literal, not a literal followed by a name.
+        let (noun, contents) = match is_float {
+            true => ("floating-point", "digits and one `.`"),
+            false => ("integer", "digits"),
+        };
+
+        // `123abc` and `1.5f` are malformed literals, not a literal followed by
+        // a name. An exponent lands here too: TinyC has no `1e9`.
         if self.peek().is_some_and(is_ident_continue) {
             while self.peek().is_some_and(is_ident_continue) {
                 self.bump();
             }
             return Err(Diagnostic::new(
-                "invalid suffix on integer literal",
+                format!("invalid suffix on {noun} literal"),
                 Span::new(start, self.offset() - start),
             )
-            .with_label("integer literals may only contain digits"));
+            .with_label(format!("{noun} literals may only contain {contents}")));
         }
 
-        if overflowed {
-            return Err(Diagnostic::new(
-                "integer literal is too large",
-                Span::new(start, self.offset() - start),
-            )
-            .with_label(format!("`int` values must fit in {}..={}", i64::MIN, i64::MAX)));
+        let span = Span::new(start, self.offset() - start);
+        let text = &self.src[start..self.offset()];
+        if !is_float {
+            // Nothing here carries a sign, so `i64::MIN` is not writable as a
+            // literal: it is `-` applied to a value one past the largest one.
+            return text.parse::<i64>().map(TokenKind::Int).map_err(|_| {
+                Diagnostic::new("integer literal is too large", span).with_label(format!(
+                    "`int` values must fit in {}..={}",
+                    i64::MIN,
+                    i64::MAX
+                ))
+            });
         }
-        Ok(TokenKind::Int(value))
+
+        let value: f64 = text.parse().expect("digits, one `.` and digits parse as a float");
+        // `parse` answers an infinity for a literal past the largest `float`
+        // there is. Nothing in the language can *write* an infinity, so letting
+        // one in this way would make a row of zeroes mean a value the program
+        // never named and cannot have meant.
+        if !value.is_finite() {
+            return Err(Diagnostic::new("floating-point literal is too large", span)
+                .with_label(format!("`float` values must fit in ±{:e}", f64::MAX)));
+        }
+        Ok(TokenKind::Float(value))
+    }
+
+    /// Run past a stretch of decimal digits, however many there are.
+    fn digits(&mut self) {
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.bump();
+        }
     }
 
     /// A string literal, decoded into the characters it stands for.
@@ -433,6 +477,56 @@ mod tests {
                 TokenKind::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn lexes_a_float_declaration() {
+        assert_eq!(
+            kinds("float x = 4.5;"),
+            vec![
+                TokenKind::KwFloat,
+                TokenKind::Ident("x".into()),
+                TokenKind::Eq,
+                TokenKind::Float(4.5),
+                TokenKind::Semi,
+                TokenKind::Eof,
+            ]
+        );
+    }
+
+    /// The literal is rounded to the nearest `float` **once**, and however many
+    /// digits it takes to say which one that is.
+    ///
+    /// The digits past what an `f64` can hold are the whole point here, so the
+    /// lint that would trim them is off: `rustc` rounds the Rust literal by the
+    /// same rule the lexer must, and the test is that the two agree.
+    #[test]
+    #[allow(clippy::excessive_precision)]
+    fn a_float_literal_is_rounded_once() {
+        assert_eq!(kinds("0.1")[0], TokenKind::Float(0.1));
+        assert_eq!(kinds("10564161.55614565165161")[0], TokenKind::Float(10564161.55614565165161));
+        // Rounding an integer part and a fraction apart and adding them rounds
+        // three times, and lands one step below the right answer here.
+        assert_eq!(kinds("3.691709654685621")[0], TokenKind::Float(3.691709654685621));
+        assert_ne!(kinds("3.691709654685621")[0], TokenKind::Float(3.6917096546856207));
+        // And more fraction digits than a `u64` could hold is precision, not
+        // size: π to thirty places is a number, not a mistake.
+        assert_eq!(
+            kinds("3.141592653589793238462643383279")[0],
+            TokenKind::Float(std::f64::consts::PI)
+        );
+    }
+
+    /// The two ways a number can be malformed, and the one way it can be too
+    /// large to name. Each says which kind of literal it was reading.
+    #[test]
+    fn a_malformed_number_says_what_was_wrong() {
+        assert_eq!(error("1.").message, "a floating-point literal needs a digit after the `.`");
+        assert_eq!(error("1.5f").message, "invalid suffix on floating-point literal");
+        assert_eq!(error("1e9").message, "invalid suffix on integer literal");
+        assert_eq!(error("99999999999999999999").message, "integer literal is too large");
+        let huge = format!("{}.0", "9".repeat(400));
+        assert_eq!(error(&huge).message, "floating-point literal is too large");
     }
 
     #[test]
@@ -693,11 +787,12 @@ mod tests {
     #[test]
     fn lexes_every_keyword() {
         assert_eq!(
-            kinds("int string bool print if else while for fn return break continue enum match"),
+            kinds("int string bool float print if else while for fn return break continue enum match"),
             vec![
                 TokenKind::KwInt,
                 TokenKind::KwString,
                 TokenKind::KwBool,
+                TokenKind::KwFloat,
                 TokenKind::KwPrint,
                 TokenKind::KwIf,
                 TokenKind::KwElse,

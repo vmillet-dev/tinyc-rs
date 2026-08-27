@@ -12,10 +12,11 @@
 //! | shadow space | 32 bytes, reserved by the caller | none |
 //! | callee-saved | `rbx`, `rsi`, `rdi`, `rbp`, `r12`-`r15` | `rbx`, `rbp`, `r12`-`r15` |
 //! | a variadic call | says nothing | sets `al` to the vector registers used |
+//! | a `double` in one | `xmm`*n* **and** the integer register for *n* | `xmm0`, counted apart from the integer arguments |
 //! | write, read | `_write`, `_read` | `write`, `read` |
 //! | the console | has a code page, and it is not UTF-8 | is a byte stream already |
 //!
-//! Everything else in this directory is written against those six rows and
+//! Everything else in this directory is written against those seven rows and
 //! never asks which platform it is emitting for.
 //!
 //! ## Register policy
@@ -128,8 +129,21 @@ const RDX: &str = "rdx";
 const SCRATCH0: &str = "r10";
 /// Holds an immediate or divisor that cannot be an instruction operand.
 const SCRATCH1: &str = "r11";
-/// The low byte of [`SCRATCH1`], which is where `setcc` deposits its result.
+/// The low bytes of the two, which is where `setcc` deposits its result.
+const SCRATCH0_8: &str = "r10b";
 const SCRATCH1_8: &str = "r11b";
+
+/// The two vector registers float arithmetic borrows, and the reason the
+/// allocator never hears about a float at all.
+///
+/// A float travels in a general register like everything else — see
+/// [`crate::ir::Num`] — so these hold an operand only for the instant between
+/// the `movq` that brings it in and the one that takes the answer back out.
+/// Nothing lives here across an instruction, which is what lets them be
+/// hard-wired rather than allocated: `xmm0`-`xmm5` are destroyed by a call on
+/// both platforms, and no value of ours is in one when a call happens.
+const XMM0: &str = "xmm0";
+const XMM1: &str = "xmm1";
 
 /// How many arguments a TinyC function may take, on every platform.
 ///
@@ -202,6 +216,22 @@ pub struct Abi {
     /// Whether a variadic call has to announce how many vector registers it
     /// passes. System V reads `al`; Windows does not look.
     pub variadic_in_al: bool,
+    /// Where the `double` that follows a format string travels, and whether the
+    /// integer register for that position has to carry it as well.
+    ///
+    /// The two conventions number vector registers differently, and this is the
+    /// whole of the difference as far as this backend is concerned — it makes
+    /// exactly one variadic call, `printf`, with at most one double in it.
+    ///
+    /// Windows numbers them by argument *position*: the format string is
+    /// argument 0 and the value is argument 1, so the value goes in `xmm1` —
+    /// and in `rdx` too, because the callee of a variadic function is free to
+    /// read either and `printf` reads whichever its format told it to expect.
+    /// System V numbers them by *class*: the format string is an integer
+    /// argument and the double is the first vector one whatever preceded it, so
+    /// it goes in `xmm0` and nothing else carries it.
+    pub vector_arg: &'static str,
+    pub vector_arg_shadowed: bool,
     /// `write(2)`, under the name this platform's C library exports it as.
     pub write: &'static str,
     /// `read(2)`, likewise.
@@ -476,6 +506,31 @@ fn setcc(op: CmpOp) -> &'static str {
     }
 }
 
+/// How a float comparison is made: which way round `ucomisd` takes its
+/// operands, and which condition reads the flags it leaves.
+///
+/// `ucomisd` writes CF, ZF and PF, and reports "unordered" — either operand is
+/// a NaN — as **all three set**, which is also what "below or equal" looks
+/// like. So the conditions here are the *unsigned* ones, and every ordering
+/// question is asked as `above`: `seta` and `setae` are the two that are false
+/// when the flags say unordered, which is what IEEE asks for. `a < b` gets
+/// there by comparing `b` against `a` rather than by reaching for `setb`,
+/// which would answer true for a NaN.
+///
+/// Equality is the one that cannot be a single `setcc`: `sete` reads ZF, and
+/// unordered sets it. `NaN == NaN` has to be false, so the answer is combined
+/// with PF — see the `Cmp` arm, which is the only caller.
+fn float_setcc(op: CmpOp) -> (bool, &'static str) {
+    match op {
+        CmpOp::Eq => (false, "sete"),
+        CmpOp::Ne => (false, "setne"),
+        CmpOp::Lt => (true, "seta"),
+        CmpOp::Le => (true, "setae"),
+        CmpOp::Gt => (false, "seta"),
+        CmpOp::Ge => (false, "setae"),
+    }
+}
+
 /// Which format string a type is printed with.
 ///
 /// An enum goes out through `%s`: printing a value of one means printing the
@@ -487,6 +542,12 @@ fn setcc(op: CmpOp) -> &'static str {
 /// length, through [`runtime::WRITE_TEXT`]. They keep a slot here so that
 /// [`Used::ends_a_line`] can still be asked about them; nothing reads a format
 /// out of it.
+///
+/// A `float` has a slot of its own and not the `int`'s. Sharing one is what the
+/// two halves of this backend used to do about it, and they did not agree: the
+/// table of formats to emit was told an `int` had been printed while the code
+/// asked for the string one, and the program failed to assemble over a symbol
+/// nothing had defined.
 fn format_index(ty: Ty) -> usize {
     match ty {
         Ty::Int => 0,
@@ -495,8 +556,12 @@ fn format_index(ty: Ty) -> usize {
         // Listed rather than left to a wildcard, so that a new type has to be
         // thought about here instead of quietly getting `%s` applied to it.
         Ty::Str | Ty::Char | Ty::Array(_) | Ty::List(_) | Ty::Class(_) => 3,
+        Ty::Float => 4,
     }
 }
+
+/// How many formats there are, which is what [`Used`] keeps one flag each of.
+const FORMATS: usize = 5;
 
 /// The slot an enum's format lives in, for the questions asked about it by
 /// name rather than about a value in hand.

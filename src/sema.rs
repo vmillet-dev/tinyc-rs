@@ -27,7 +27,7 @@ use crate::ast::{
     ExprKind, FieldInfo, FieldInit, FnDecl, MatchArm, MethodInfo, NodeId, Pattern, Place, Prim,
     VariantInfo,
     PrintPart,
-    Program, Spec, Stmt, Ty, TypeRef, TypeTable, is_scalar_value,
+    Program, Spec, Stmt, Ty, TypeRef, TypeTable, fits_in_an_int, is_scalar_value,
 };
 use crate::diag::{Diagnostic, Result, Span};
 
@@ -810,20 +810,24 @@ fn layout_order(declared: &Declared) -> Vec<ClassId> {
 /// `None` means the name does not name a type at all — reported here, so a
 /// caller can fall back on the recovery type without saying anything further.
 fn resolve_type(declared: &mut Declared, ty: &TypeRef, errors: &mut Vec<Diagnostic>) -> Option<Ty> {
-    let element = match ty.name.as_str() {
-        "int" => Some(Ty::Int),
-        "string" => Some(Ty::Str),
-        "char" => Some(Ty::Char),
-        "bool" => Some(Ty::Bool),
-        name => declared
-            .enum_id(name)
+    // A name the *language* spells first, then one the program declared. The
+    // list is `Prim`'s rather than written out here, and so is the note: this
+    // one used to say the built-in types were `int`, `string`, `char` and
+    // `bool` long after there were five of them.
+    let element = match Prim::of_name(&ty.name) {
+        Some(prim) => Some(prim.ty()),
+        None => declared
+            .enum_id(&ty.name)
             .map(Ty::Enum)
-            .or_else(|| declared.class_id(name).map(Ty::Class))
+            .or_else(|| declared.class_id(&ty.name).map(Ty::Class))
             .or_else(|| {
                 errors.push(
-                    Diagnostic::new(format!("unknown type `{name}`"), ty.span)
+                    Diagnostic::new(format!("unknown type `{}`", ty.name), ty.span)
                         .with_label("no built-in type, enum or class goes by this name")
-                        .with_note("the built-in types are `int`, `string`, `char` and `bool`", None),
+                        .with_note(
+                            format!("the built-in types are {}", Prim::all_quoted()),
+                            None,
+                        ),
                 );
                 None
             }),
@@ -885,8 +889,8 @@ struct Binding {
 ///
 /// It is a short list on purpose: nothing converts on its own, so this is also
 /// the complete answer to "how do I turn this into that".
-const CONVERSIONS: &str = "the conversions are `int(c)`, `int(s)`, `char(n)`, `string(c)`, \
-                           `string(n)`, and `string(cs)` for a `char[]`";
+const CONVERSIONS: &str = "the conversions are `int(c)`, `int(s)`, `int(f)`, `float(n)`, \
+                           `char(n)`, `string(c)`, `string(n)`, and `string(cs)` for a `char[]`";
 
 /// Why a particular number is not a character, which is a different sentence
 /// depending on where it lands.
@@ -1254,6 +1258,31 @@ fn const_int(expr: &Expr) -> Option<i64> {
         ExprKind::Int(v) => Some(*v),
         ExprKind::Neg(operand) => const_int(operand)?.checked_neg(),
         ExprKind::Bin { op, lhs, rhs } => op.apply(const_int(lhs)?, const_int(rhs)?),
+        _ => None,
+    }
+}
+
+/// The same question about a float, and the answer is never `None` for a
+/// reason of arithmetic: every float operation has an answer, so what stops
+/// this is only ever an operand this stage cannot see.
+///
+/// It does not look through `%`: `sema` has already refused that program, and
+/// the arm below would have to invent an answer for an operation TinyC does not
+/// have.
+fn const_float(expr: &Expr) -> Option<f64> {
+    match &expr.kind {
+        ExprKind::Float(v) => Some(*v),
+        ExprKind::Neg(operand) => Some(-const_float(operand)?),
+        ExprKind::Bin { op, lhs, rhs } => {
+            let (a, b) = (const_float(lhs)?, const_float(rhs)?);
+            match op {
+                BinOp::Add => Some(a + b),
+                BinOp::Sub => Some(a - b),
+                BinOp::Mul => Some(a * b),
+                BinOp::Div => Some(a / b),
+                BinOp::Rem => None,
+            }
+        }
         _ => None,
     }
 }
@@ -1815,17 +1844,30 @@ impl<'a, 'c> FnChecker<'a, 'c> {
 
         let ty = self.expr(scrutinee);
         let Some(domain) = self.domain_of(ty) else {
+            // A float is refused for a different reason from the rest, and says
+            // so: the others cannot be compared at all, while a float can be
+            // compared and should not be — a pattern is an equality test, and
+            // an equality test is the one question about a float that almost
+            // never means what it looks like.
+            let (label, note) = match ty {
+                Ty::Float => (
+                    "a pattern asks whether two floats are exactly equal",
+                    "`0.1 + 0.2` is not `0.3`, and a NaN is equal to nothing at all; \
+                     compare with `<` and `>` instead",
+                ),
+                _ => (
+                    "a match needs a value that can be compared to a pattern",
+                    "an enum, an `int`, a `char`, a `string` or a `bool`; a run of values \
+                     and an object are neither",
+                ),
+            };
             self.error(
                 Diagnostic::new(
                     format!("cannot match on {}", self.ty_article(ty)),
                     scrutinee.span,
                 )
-                .with_label("a match needs a value that can be compared to a pattern")
-                .with_note(
-                    "an enum, an `int`, a `char`, a `string` or a `bool`; a run of values \
-                     and an object are neither",
-                    None,
-                ),
+                .with_label(label)
+                .with_note(note, None),
             );
             // The arms are still checked: their own mistakes are worth
             // reporting whatever the scrutinee turned out to be.
@@ -2477,6 +2519,25 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             // Nothing is guessed: an optional `-`, then digits, and the program
             // stops on anything else rather than settling for a zero.
             (Ty::Str, Ty::Int) => {}
+            // The two numbers, in both directions, and neither happens on its
+            // own. `float(n)` is exact for every `int` up to 2^53 and rounds
+            // above it; `int(f)` throws the fraction away rather than rounding,
+            // and stops the program where the float has no `int` at all.
+            (Ty::Int, Ty::Float) => {}
+            (Ty::Float, Ty::Int) => {
+                // A constant is settled here, exactly as a constant character
+                // is: what reaches the emitted code is only ever a value the
+                // running program alone knows.
+                if let Some(at) = const_float(value)
+                    && !fits_in_an_int(at)
+                {
+                    self.error(
+                        Diagnostic::new(format!("`{at}` has no `int`"), value.span).with_label(
+                            format!("`int` values must fit in {}..={}", i64::MIN, i64::MAX),
+                        ),
+                    );
+                }
+            }
             // Into a string: a character on its own, or a number written out in
             // decimal. Both exist because `+` converts nothing, so a message
             // with a value in it has to say where the value became text.
@@ -2515,6 +2576,16 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                 );
             }
             _ => {
+                // Writing a float out is `print`'s job, and the note says so
+                // rather than leaving a reader to conclude from a list that a
+                // float cannot be written at all. A conversion would have to
+                // settle how many digits a float turns into, once and for the
+                // whole language, and there is no good answer to that.
+                let note = match (from, target) {
+                    (Ty::Float, Ty::Str) => "a float is written by `print` — `println(f)`, or \
+                                             `%f` inside a format",
+                    _ => CONVERSIONS,
+                };
                 self.error(
                     Diagnostic::new(
                         format!(
@@ -2525,7 +2596,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                         span,
                     )
                     .with_label(format!("this is {}", self.ty_article(from)))
-                    .with_note(CONVERSIONS, None),
+                    .with_note(note, None),
                 );
             }
         }
@@ -2685,6 +2756,12 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             // A run of values and an object cannot even be compared for
             // equality, so there is nothing a pattern could ask of one.
             Ty::Array(_) | Ty::List(_) | Ty::Class(_) => None,
+            // A float can be compared, and that is the problem: a pattern is
+            // equality, and equality on floats does not mean what writing one
+            // down suggests. `0.1 + 0.2` is not `0.3`, `-0.0` and `0.0` are one
+            // number spelled two ways, and a NaN selects no arm at all — not
+            // even `NaN`. So none of them is offered.
+            Ty::Float => None,
         }
     }
 
@@ -3060,6 +3137,7 @@ impl<'a, 'c> FnChecker<'a, 'c> {
             ExprKind::Str(_) => Ty::Str,
             ExprKind::Char(_) => Ty::Char,
             ExprKind::Bool(_) => Ty::Bool,
+            ExprKind::Float(_) => Ty::Float,
             ExprKind::Var(name) => match self.lookup(name) {
                 Some((ty, _)) => ty,
                 None => {
@@ -3071,18 +3149,24 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     Ty::Int
                 }
             },
+            // Unary minus keeps the type it was given, which is what makes
+            // `-1.5` a float literal in every way that matters.
             ExprKind::Neg(operand) => {
                 let inner = self.expr(operand);
-                if inner != Ty::Int {
+                if !matches!(inner, Ty::Int | Ty::Float) {
                     self.error(
                         Diagnostic::new(
                             format!("cannot apply `-` to {} value", self.ty_article(inner)),
                             operand.span,
                         )
-                        .with_label(format!("expected int, found {}", self.ty_name(inner))),
+                        .with_label(format!(
+                            "expected int or float, found {}",
+                            self.ty_name(inner)
+                        )),
                     );
+                    return self.record(expr.id, Ty::Int);
                 }
-                Ty::Int
+                inner
             }
             ExprKind::Not(operand) => {
                 let inner = self.expr(operand);
@@ -3134,33 +3218,89 @@ impl<'a, 'c> FnChecker<'a, 'c> {
                     return self.record(expr.id, Ty::Str);
                 }
 
-                // Everything else is int-only; report the offending operand.
+                // Everything else is arithmetic on two numbers of the *same*
+                // kind. Nothing widens on its own, so the left operand settles
+                // which kind this is and the right one has to agree; report
+                // whichever does not.
+                let expected = match lhs_ty {
+                    Ty::Int | Ty::Float => lhs_ty,
+                    _ => Ty::Int,
+                };
                 for (ty, operand) in [(lhs_ty, lhs), (rhs_ty, rhs)] {
-                    if ty != Ty::Int {
-                        let mut diagnostic = Diagnostic::new(
-                            format!(
-                                "cannot apply `{}` to `{}` and `{}`",
-                                op.symbol(),
-                                self.ty_name(lhs_ty),
-                                self.ty_name(rhs_ty)
-                            ),
-                            operand.span,
-                        )
-                        .with_label(format!("expected int, found {}", self.ty_name(ty)));
-                        // A character is a character, not a small number. The
-                        // way to do arithmetic on one is to say so.
-                        if ty == Ty::Char {
-                            diagnostic = diagnostic.with_note(
-                                "`int(c)` is a character's code point, and `char(n)` goes back",
-                                None,
-                            );
-                        }
-                        self.error(diagnostic);
+                    if ty == expected {
+                        continue;
                     }
+                    let mut diagnostic = Diagnostic::new(
+                        format!(
+                            "cannot apply `{}` to `{}` and `{}`",
+                            op.symbol(),
+                            self.ty_name(lhs_ty),
+                            self.ty_name(rhs_ty)
+                        ),
+                        operand.span,
+                    )
+                    .with_label(format!(
+                        "expected {}, found {}",
+                        self.ty_name(expected),
+                        self.ty_name(ty)
+                    ));
+                    // A character is a character, not a small number. The
+                    // way to do arithmetic on one is to say so.
+                    if ty == Ty::Char {
+                        diagnostic = diagnostic.with_note(
+                            "`int(c)` is a character's code point, and `char(n)` goes back",
+                            None,
+                        );
+                    }
+                    // The same bargain one type along: an `int` and a `float`
+                    // are both numbers and still do not mix, because a
+                    // conversion that happened on its own would be the one
+                    // place in the language where precision went quietly.
+                    if matches!(ty, Ty::Int | Ty::Float) {
+                        diagnostic = diagnostic.with_note(
+                            "`float(n)` makes a float out of an int, and `int(f)` goes back",
+                            None,
+                        );
+                    }
+                    self.error(diagnostic);
                 }
 
-                self.check_arithmetic(expr, *op, lhs, rhs);
-                Ty::Int
+                // `%` is what the *other* half of an `idiv` answers, and a
+                // float division has no other half. C spells the operation
+                // `fmod` and calls it a function rather than an operator, which
+                // is the honest name for it: TinyC says it has none instead of
+                // quietly meaning something else by `%`.
+                if expected == Ty::Float && *op == BinOp::Rem {
+                    self.error(
+                        Diagnostic::new("`%` has no meaning on `float`", expr.span)
+                            .with_label("a remainder counts whole divisors")
+                            .with_note(
+                                "`%` is an `int` operator; there is no floating-point \
+                                 remainder in TinyC",
+                                None,
+                            ),
+                    );
+                }
+
+                // Only an `int` can overflow, and only an `int` has a division
+                // with no answer at all. Float arithmetic answers an infinity
+                // or a NaN rather than refusing, so there is nothing here to
+                // reject — and nothing for the backend to guard.
+                if expected == Ty::Int {
+                    self.check_arithmetic(expr, *op, lhs, rhs);
+                }
+
+                // Where the operands agreed, this is their type. Where they did
+                // not, it is a guess made only so that the rest of the checking
+                // stays about the rest of the program: a mixed pair was meant
+                // to be the float one, because that is the operand a `float(n)`
+                // would have been written around. Guessing the other way would
+                // report the same mistake twice — once here and once at the
+                // declaration it was written into.
+                match lhs_ty == Ty::Float || rhs_ty == Ty::Float {
+                    true => Ty::Float,
+                    false => expected,
+                }
             }
             ExprKind::Cmp { op, lhs, rhs } => {
                 let lhs_ty = self.expr(lhs);
@@ -5336,5 +5476,148 @@ print(len(n));")[0].message.contains("`len` needs"));
     fn every_value_in_a_format_is_checked() {
         let errors = errors_in_main("println(\"%d %d %d\", \"a\", 1, true);");
         assert_eq!(errors.len(), 2, "{errors:?}");
+    }
+
+    // -- the primitive table, end to end ------------------------------------
+
+    /// Every type in [`Prim::ALL`] is a type the whole front end agrees about.
+    ///
+    /// A parameter and a return type is enough to exercise the lot without
+    /// naming a single literal: the parser has to accept the keyword where a
+    /// type goes, twice; `resolve_type` has to know the name; and the return
+    /// check has to compare the type against itself. So a row added to
+    /// `Prim::ALL` without the type being wired up fails **here**, rather than
+    /// in the first program someone writes with it.
+    ///
+    /// It is deliberately free of any per-type table of its own. One would be
+    /// exactly the thing this refactor removed, put back in the test.
+    #[test]
+    fn every_primitive_type_declares_a_parameter_and_a_return() {
+        for prim in Prim::ALL {
+            let name = prim.name();
+            let src = format!("fn same({name} x) -> {name} {{\n  return x;\n}}\nfn main() {{\n}}\n");
+            if let Err(errors) = check_src(&src) {
+                panic!("`{name}` does not work as a type: {errors:#?}");
+            }
+        }
+    }
+
+    /// And every one of them is read as a conversion where a value goes, which
+    /// is the other half of what `Prim::of_keyword` is asked.
+    ///
+    /// Only that it *parses*: `x` is undeclared and several of these
+    /// conversions do not exist, so `sema` has plenty to say. A keyword the
+    /// parser did not recognise would not get that far — it would be "expected
+    /// an expression", before any of this ran.
+    #[test]
+    fn every_primitive_type_is_read_as_a_conversion() {
+        for prim in Prim::ALL {
+            let src = format!("fn main() {{\n  print({}(x));\n}}\n", prim.name());
+            let parsed = parse(&lex(&src).expect("it lexes"));
+            assert!(parsed.is_ok(), "`{}(x)` is not read as a conversion", prim.name());
+        }
+    }
+
+    /// The keyword cannot be taken as a variable name either — the other thing
+    /// being in [`Prim::ALL`] is supposed to guarantee.
+    #[test]
+    fn no_primitive_type_can_be_used_as_a_name() {
+        for prim in Prim::ALL {
+            let src = format!("fn main() {{\n  int {} = 1;\n}}\n", prim.name());
+            assert!(check_src(&src).is_err(), "`{}` was accepted as a name", prim.name());
+        }
+    }
+
+    // -- float --------------------------------------------------------------
+
+    /// Everything an `int` does arithmetically, a `float` does too, and unary
+    /// minus keeps the type rather than answering an `int`.
+    #[test]
+    fn a_float_does_arithmetic_and_comparison() {
+        assert!(errors_in_main_none(
+            "float a = 1.5;\nfloat b = 2.0;\n\
+             float c = a + b - a * b / a;\nfloat d = -c;\n\
+             bool ordered = d < c && d <= c && c > d && c >= d;\n\
+             bool same = c == d || c != d;\nprintln(\"%f %b %b\", c, ordered, same);"
+        ));
+    }
+
+    /// Nothing widens on its own, and the message says how to write what was
+    /// meant rather than only that it was not written.
+    #[test]
+    fn an_int_and_a_float_do_not_mix() {
+        for body in ["float f = 1.5 + 1;", "float f = 1 + 1.5;"] {
+            let errors = errors_in_main(body);
+            assert_eq!(errors.len(), 1, "{body}: {errors:#?}");
+            assert!(errors[0].message.starts_with("cannot apply `+`"), "{errors:#?}");
+            assert!(
+                errors[0].note.as_ref().unwrap().0.contains("`float(n)`"),
+                "{body}: {errors:#?}"
+            );
+        }
+    }
+
+    /// A declaration does not widen either: the two are separate types, not two
+    /// widths of one.
+    #[test]
+    fn a_float_variable_refuses_an_int() {
+        assert_eq!(errors_in_main("float f = 1;").len(), 1);
+        assert_eq!(errors_in_main("int n = 1.0;").len(), 1);
+    }
+
+    /// `%` is `idiv`'s other answer, and a float division has no other half.
+    #[test]
+    fn a_float_has_no_remainder() {
+        let errors = errors_in_main("float f = 5.5 % 2.0;");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert_eq!(errors[0].message, "`%` has no meaning on `float`");
+    }
+
+    /// Both directions are written out, and both are accepted.
+    #[test]
+    fn a_float_and_an_int_convert_when_asked() {
+        assert!(errors_in_main_none("int n = 3;\nfloat f = float(n);\nprintln(int(f) + n);"));
+    }
+
+    /// There is no `string(f)`, and the message points at what does write one
+    /// rather than leaving a list of conversions to be read as a refusal.
+    #[test]
+    fn a_float_is_written_rather_than_stringified() {
+        let errors = errors_in_main("float f = 1.5;\nstring s = string(f);");
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert_eq!(errors[0].message, "there is no conversion from `float` to `string`");
+        assert!(errors[0].note.as_ref().unwrap().0.contains("%f"), "{errors:#?}");
+    }
+
+    /// A constant that has no `int` is settled here, exactly as a constant
+    /// character with no scalar value is.
+    #[test]
+    fn a_constant_float_with_no_int_is_refused() {
+        for body in ["int n = int(100000000000000000000.0);", "int n = int(1.0 / 0.0);"] {
+            let errors = errors_in_main(body);
+            assert_eq!(errors.len(), 1, "{body}: {errors:#?}");
+            assert!(errors[0].message.contains("has no `int`"), "{body}: {errors:#?}");
+        }
+        // The two ends of the range, which do have one. Truncation is toward
+        // zero, so the bottom is exact and the top is one step short of `2^63`.
+        assert!(errors_in_main_none("int n = int(0.0 - 9223372036854775808.0);"));
+        assert!(errors_in_main_none("int n = int(9223372036854775295.0);"));
+    }
+
+    /// A `match` is an equality test, and equality is the one question about a
+    /// float that almost never means what it looks like.
+    #[test]
+    fn a_float_cannot_be_matched_on() {
+        let errors = errors_in_main("float f = 1.5;\nmatch (f) {\n  1.5 => { }\n}");
+        assert_eq!(errors[0].message, "cannot match on a `float`");
+        assert!(errors[0].note.as_ref().unwrap().0.contains("NaN"), "{errors:#?}");
+    }
+
+    /// And a float *pattern* against something else is the ordinary mismatch,
+    /// which is why the pattern still exists.
+    #[test]
+    fn a_float_pattern_is_refused_against_an_int() {
+        let errors = errors_in_main("int n = 1;\nmatch (n) {\n  1.5 => { }\n  _ => { }\n}");
+        assert!(!errors.is_empty(), "a float pattern says nothing about an int");
     }
 }

@@ -41,16 +41,21 @@ impl Asm {
         }
     }
 
-    /// Announce that no vector register is being passed, where the convention
-    /// asks. System V reads `al` at a variadic call to decide how much of the
-    /// register save area to fill; Windows does not look, so this is nothing
-    /// there.
+    /// Announce how many vector registers a variadic call is passing, where the
+    /// convention asks. System V reads `al` to decide how much of the register
+    /// save area to fill; Windows does not look, so this is nothing there.
     ///
-    /// Every variadic call this backend makes is to `printf`, and it passes
-    /// integers only — so the answer is always zero.
-    pub fn variadic(&mut self, abi: &Abi) {
-        if abi.variadic_in_al {
-            self.asm("xor  eax, eax    ; no vector register is passed");
+    /// Every variadic call this backend makes is to `printf`, and `vectors` is
+    /// one exactly when the value being written is a `float`. Answering zero
+    /// for one is not a smaller lie than answering one for none: `printf` would
+    /// read `%f`'s argument out of a save area nothing had filled.
+    pub fn variadic(&mut self, abi: &Abi, vectors: usize) {
+        if !abi.variadic_in_al {
+            return;
+        }
+        match vectors {
+            0 => self.asm("xor  eax, eax    ; no vector register is passed"),
+            n => self.asm(&format!("mov  eax, {n}    ; vector registers passed")),
         }
     }
 }

@@ -34,6 +34,15 @@
 //! [`crate::codegen::regalloc`], which computes them with a dataflow analysis.
 //!
 //! Temporaries are still written exactly once each.
+//!
+//! ## Why a virtual register has no type
+//!
+//! It holds a machine word, and what the word *means* is the business of the
+//! instruction reading it: an `int` is two's complement, a `char` is a code
+//! point, a `bool` is 0 or 1, a `float` is the bits of an IEEE-754 double, and
+//! a string, list or object is an address. Only the instructions that do
+//! arithmetic on a word have to be told which — see [`Num`], where that trade
+//! and what it saves are written down.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,7 +51,7 @@ use crate::ast::{
     ArmBody, BinOp, Block as AstBlock, Builtin, ClassId, CmpOp, EnumId, Expr, ExprKind, FnDecl,
     LogicOp,
     MatchArm, Pattern, Place, Prim, PrintPart, Program as Ast, Stmt, Ty, TypeTable,
-    is_scalar_value,
+    fits_in_an_int, is_scalar_value,
 };
 use crate::diag::{Diagnostic, Result};
 use crate::sema::Types;
@@ -94,10 +103,60 @@ pub struct BlockId(pub u32);
 pub struct FuncId(pub u32);
 
 /// An instruction operand: either an immediate or a virtual register.
+///
+/// The immediate is an `i64` whatever it stands for. A `float` travels as the
+/// *bits* of its double — see [`Num`] — so this is a machine word rather than a
+/// number, and only the instruction reading it knows which.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Value {
     Const(i64),
     Reg(VReg),
+}
+
+/// Which arithmetic an instruction reads its operands as.
+///
+/// **This is the whole of how `float` is carried.** Every value in the IR is a
+/// machine word: an `int` is its two's complement and a `float` is the bits of
+/// its IEEE-754 double. Nothing about the word says which, so the two
+/// instructions that *interpret* one say so themselves.
+///
+/// The price of the alternative is what makes this worth it. Giving a float its
+/// own kind of virtual register would mean a second register class in
+/// [`crate::codegen::regalloc`], a second set of spill slots, a second argument
+/// convention and a prologue that saves both — and it would buy nothing here,
+/// because a double is eight bytes and so is everything else. Copying, storing,
+/// spilling, passing, returning and holding a float in an array are all the
+/// same code as for an `int`, and stay that way.
+///
+/// What it costs instead is a `movq` at each end of every float instruction:
+/// the operands come out of general registers into the two vector registers the
+/// backend keeps as scratch, and the answer goes back. That is the trade, and
+/// it is written down here because nothing else in the compiler should have to
+/// rediscover it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Num {
+    Int,
+    Float,
+}
+
+impl Num {
+    /// How a value of this type is read. Everything that is not a `float` is a
+    /// whole number of some width: a character's code point, an enum's tag, a
+    /// bool's 0 or 1, an address.
+    pub fn of(ty: Ty) -> Num {
+        match ty {
+            Ty::Float => Num::Float,
+            _ => Num::Int,
+        }
+    }
+
+    /// What the dump calls it, which is nothing at all for the ordinary case.
+    fn suffix(self) -> &'static str {
+        match self {
+            Num::Int => "",
+            Num::Float => ".f",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -108,10 +167,20 @@ pub enum Instr {
     StrAddr { dst: VReg, id: StrId },
     /// `dst = src`
     Copy { dst: VReg, src: Value },
-    /// `dst = lhs op rhs`
-    Bin { op: BinOp, dst: VReg, lhs: Value, rhs: Value },
+    /// `dst = lhs op rhs`, with `num` saying how the operands are read.
+    Bin { num: Num, op: BinOp, dst: VReg, lhs: Value, rhs: Value },
     /// `dst = (lhs op rhs)`, producing 0 or 1.
-    Cmp { op: CmpOp, dst: VReg, lhs: Value, rhs: Value },
+    Cmp { num: Num, op: CmpOp, dst: VReg, lhs: Value, rhs: Value },
+    /// `dst = src`, read as one kind of number and written as the other.
+    ///
+    /// The only instruction that changes a word's *meaning* rather than its
+    /// value, and the reason `float(n)` and `int(f)` are written out: nothing
+    /// converts on its own, so nowhere else does a word change what it is.
+    ///
+    /// `to` is the direction, because there are only two. One of them can fail
+    /// — a float too large, or no number at all, has no `int` — which is the
+    /// same asymmetry `char(n)` has.
+    Cast { dst: VReg, to: Num, src: Value },
     /// `dst = &frame[offset]`: the address of a run of bytes this function owns.
     ///
     /// The first instruction in TinyC that is about *memory*. Everything else
@@ -486,6 +555,7 @@ impl Instr {
             | Instr::VariantAddr { .. }
             | Instr::VTable { .. } => {}
             Instr::Copy { src, .. }
+            | Instr::Cast { src, .. }
             | Instr::Load { addr: src, .. }
             | Instr::LoadChar { addr: src, .. }
             | Instr::Count { of: src, .. } => reg(src),
@@ -526,6 +596,7 @@ impl Instr {
             Instr::Const { dst, .. }
             | Instr::StrAddr { dst, .. }
             | Instr::Copy { dst, .. }
+            | Instr::Cast { dst, .. }
             | Instr::Bin { dst, .. }
             | Instr::Param { dst, .. }
             | Instr::Frame { dst, .. }
@@ -564,10 +635,19 @@ impl Instr {
             Instr::Elem { index, len, .. } => {
                 !matches!((index, len), (Value::Const(_), Value::Const(_)))
             }
+            // Float arithmetic answers whatever it is given: too large is an
+            // infinity and zero into zero is a NaN, both of which are values.
+            // There is nothing to refuse, so there is nothing to guard and
+            // nothing keeping a float computation nobody reads alive.
+            Instr::Bin { num: Num::Float, .. } => false,
             Instr::Bin { op, lhs, rhs, .. } if op.divides() => DivGuards::of(lhs, rhs).any(),
             // `add`, `sub` and `imul` are all guarded; a folded result never
             // reaches an instruction in the first place.
             Instr::Bin { .. } => true,
+            // The other direction cannot: every `int` has a `float` nearest it,
+            // while a float too large, or no number at all, has no `int`.
+            Instr::Cast { to: Num::Int, .. } => true,
+            Instr::Cast { .. } => false,
             // Every runtime routine can fail: the two that allocate run out of
             // memory, and the one that checks a character refuses.
             Instr::RtCall { .. } => true,
@@ -592,6 +672,7 @@ impl Instr {
             | Instr::VariantAddr { .. }
             | Instr::VTable { .. } => {}
             Instr::Copy { src: value, .. }
+            | Instr::Cast { src: value, .. }
             | Instr::Load { addr: value, .. }
             | Instr::LoadChar { addr: value, .. }
             | Instr::Count { of: value, .. }
@@ -734,9 +815,20 @@ impl Function {
     }
 
     fn value_name(&self, value: &Value) -> String {
-        match value {
-            Value::Const(c) => c.to_string(),
-            Value::Reg(r) => format!("%{}", self.name_of(*r)),
+        self.value_name_as(Num::Int, value)
+    }
+
+    /// The same, for an operand whose instruction says how to read it.
+    ///
+    /// A float constant is the bits of a double, and `4620974692658839552` in
+    /// the dump beside a `printf` says nothing a reader could check. Written
+    /// back out as `8.5` it does — and the `f` on the end says the number is
+    /// what the word means rather than what it holds.
+    fn value_name_as(&self, num: Num, value: &Value) -> String {
+        match (num, value) {
+            (Num::Float, Value::Const(c)) => format!("{}f", f64::from_bits(*c as u64)),
+            (_, Value::Const(c)) => c.to_string(),
+            (_, Value::Reg(r)) => format!("%{}", self.name_of(*r)),
         }
     }
 
@@ -835,19 +927,37 @@ impl Program {
             Instr::Copy { dst, src } => {
                 format!("%{} = copy {}", function.name_of(*dst), value(src))
             }
-            Instr::Bin { op, dst, lhs, rhs } => format!(
-                "%{} = {} {}, {}",
+            Instr::Bin { num, op, dst, lhs, rhs } => format!(
+                "%{} = {}{} {}, {}",
                 function.name_of(*dst),
                 op_name(*op),
-                value(lhs),
-                value(rhs)
+                num.suffix(),
+                function.value_name_as(*num, lhs),
+                function.value_name_as(*num, rhs)
             ),
-            Instr::Cmp { op, dst, lhs, rhs } => format!(
-                "%{} = cmp {} {}, {}",
+            Instr::Cmp { num, op, dst, lhs, rhs } => format!(
+                "%{} = cmp{} {} {}, {}",
                 function.name_of(*dst),
+                num.suffix(),
                 op.symbol(),
-                value(lhs),
-                value(rhs)
+                function.value_name_as(*num, lhs),
+                function.value_name_as(*num, rhs)
+            ),
+            // Named as the conversion the program wrote — `int(f)`, `float(n)`
+            // — rather than with a word of the dump's own, and the operand is
+            // read the *other* way round from what the instruction produces.
+            Instr::Cast { dst, to, src } => format!(
+                "%{} = {} {}",
+                function.name_of(*dst),
+                match to {
+                    Num::Int => Prim::Int,
+                    Num::Float => Prim::Float,
+                }
+                .name(),
+                match to {
+                    Num::Int => function.value_name_as(Num::Float, src),
+                    Num::Float => function.value_name_as(Num::Int, src),
+                }
             ),
             Instr::Param { dst, index } => {
                 format!("%{} = param {index}", function.name_of(*dst))
@@ -926,7 +1036,7 @@ impl Program {
                     false => "",
                 },
                 ty.name(&self.table),
-                value(val)
+                function.value_name_as(Num::of(*ty), val)
             ),
             Instr::PrintText { id } => {
                 format!("print text{} {:?}", id.0, self.texts[id.0 as usize])
@@ -1876,12 +1986,23 @@ impl Lowering<'_> {
             Pattern::Char(c) => i64::from(u32::from(*c)),
             Pattern::Bool(v) => i64::from(*v),
             Pattern::Str(_) => unreachable!("handled above"),
+            // Matching is equality on a machine word, and equality on a float
+            // is not that: `-0.0` and `0.0` are the same number written two
+            // ways, and a NaN is equal to nothing at all. So `sema` refuses to
+            // match on one rather than have this quietly mean something else.
+            Pattern::Float(_) => unreachable!("sema rejects matching on a float"),
             // A catch-all is the last arm, and the last arm is the one control
             // simply runs into — so nothing ever asks it a question.
             Pattern::Wildcard => unreachable!("sema puts `_` last, where nothing is tested"),
         };
         let dst = self.fresh_temp();
-        self.emit(Instr::Cmp { op: CmpOp::Eq, dst, lhs: value, rhs: Value::Const(wanted) });
+        self.emit(Instr::Cmp {
+            num: Num::Int,
+            op: CmpOp::Eq,
+            dst,
+            lhs: value,
+            rhs: Value::Const(wanted),
+        });
         Value::Reg(dst)
     }
 
@@ -2186,6 +2307,7 @@ impl Lowering<'_> {
         let same = self.fresh_temp();
         self.emit(Instr::RtCall { dst: Some(same), callee: Runtime::StrEq, args });
         self.emit(Instr::Cmp {
+            num: Num::Int,
             op: CmpOp::Eq,
             dst,
             lhs: Value::Reg(same),
@@ -2206,6 +2328,29 @@ impl Lowering<'_> {
         // A constant `sema` has already accepted needs no check at run time,
         // which is the same bargain a constant index strikes.
         let settled = matches!(src, Value::Const(c) if is_scalar_value(c));
+
+        // Between `int` and `float` the word itself changes, so this is the one
+        // conversion that is neither a routine nor a move. A constant is
+        // settled here for the same reason a constant character is: what is
+        // left to check at run time is only ever a value the running program
+        // alone knows.
+        let cast = match (from, to) {
+            (Ty::Int, Prim::Float) => Some(Num::Float),
+            (Ty::Float, Prim::Int) => Some(Num::Int),
+            _ => None,
+        };
+        if let Some(to) = cast {
+            match (to, src) {
+                (Num::Float, Value::Const(c)) => {
+                    self.emit(Instr::Const { dst, val: (c as f64).to_bits() as i64 })
+                }
+                (Num::Int, Value::Const(c)) if fits_in_an_int(f64::from_bits(c as u64)) => {
+                    self.emit(Instr::Const { dst, val: f64::from_bits(c as u64) as i64 })
+                }
+                _ => self.emit(Instr::Cast { dst, to, src }),
+            }
+            return;
+        }
 
         let callee = match (from, to) {
             (Ty::Int, Prim::Char) if !settled => Runtime::CheckChar,
@@ -2501,6 +2646,7 @@ impl Lowering<'_> {
     fn expr_into(&mut self, dst: VReg, expr: &Expr) {
         match &expr.kind {
             ExprKind::Int(v) => self.emit(Instr::Const { dst, val: *v }),
+            ExprKind::Float(v) => self.emit(Instr::Const { dst, val: v.to_bits() as i64 }),
             ExprKind::Bool(v) => self.emit(Instr::Const { dst, val: i64::from(*v) }),
             ExprKind::Variant { args, .. } => self.variant_into(dst, expr, args),
             // The array's room is reserved first, then filled: an element's
@@ -2590,38 +2736,45 @@ impl Lowering<'_> {
                 self.string_op_into(dst, expr)
             }
             ExprKind::Bin { op, lhs, rhs } => {
+                let num = self.num_of(expr);
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                match fold_bin(*op, lhs, rhs) {
+                match fold_bin(num, *op, lhs, rhs) {
                     Some(val) => self.emit(Instr::Const { dst, val }),
-                    None => self.emit(Instr::Bin { op: *op, dst, lhs, rhs }),
+                    None => self.emit(Instr::Bin { num, op: *op, dst, lhs, rhs }),
                 }
             }
+            // A comparison answers a bool whatever it compared, so what says
+            // how to read the operands is an *operand's* type and not this
+            // expression's.
             ExprKind::Cmp { op, lhs, rhs } => {
+                let num = self.num_of(lhs);
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                match fold_cmp(*op, lhs, rhs) {
+                match fold_cmp(num, *op, lhs, rhs) {
                     Some(val) => self.emit(Instr::Const { dst, val }),
-                    None => self.emit(Instr::Cmp { op: *op, dst, lhs, rhs }),
+                    None => self.emit(Instr::Cmp { num, op: *op, dst, lhs, rhs }),
                 }
             }
             ExprKind::Neg(operand) => {
+                let num = self.num_of(expr);
                 let val = self.expr(operand);
                 match val {
-                    Value::Const(c) => self.emit(Instr::Const { dst, val: c.wrapping_neg() }),
+                    Value::Const(c) => self.emit(Instr::Const { dst, val: negate_const(num, c) }),
                     val => self.emit(Instr::Bin {
+                        num,
                         op: BinOp::Sub,
                         dst,
-                        lhs: Value::Const(0),
+                        lhs: zero_to_subtract_from(num),
                         rhs: val,
                     }),
                 }
             }
             ExprKind::Not(operand) => {
-                let (op, lhs, rhs) = self.negated(operand);
-                match fold_cmp(op, lhs, rhs) {
+                let (num, op, lhs, rhs) = self.negated(operand);
+                match fold_cmp(num, op, lhs, rhs) {
                     Some(val) => self.emit(Instr::Const { dst, val }),
-                    None => self.emit(Instr::Cmp { op, dst, lhs, rhs }),
+                    None => self.emit(Instr::Cmp { num, op, dst, lhs, rhs }),
                 }
             }
             ExprKind::Logic { op, lhs, rhs } => self.logic_into(dst, *op, lhs, rhs),
@@ -2729,13 +2882,20 @@ impl Lowering<'_> {
     /// operand is itself a comparison the negation goes one better and inverts
     /// it in place, so `!(a < b)` costs the single `cmp` that `a >= b` does
     /// instead of a comparison followed by a comparison against its result.
-    fn negated(&mut self, operand: &Expr) -> (CmpOp, Value, Value) {
+    fn negated(&mut self, operand: &Expr) -> (Num, CmpOp, Value, Value) {
         if let ExprKind::Cmp { op, lhs, rhs } = &operand.kind {
+            let num = self.num_of(lhs);
             let lhs = self.expr(lhs);
             let rhs = self.expr(rhs);
-            return (op.negate(), lhs, rhs);
+            return (num, op.negate(), lhs, rhs);
         }
-        (CmpOp::Eq, self.expr(operand), Value::Const(0))
+        // Anything else `!` can be applied to is a bool, and `!b` is `b == 0`.
+        (Num::Int, CmpOp::Eq, self.expr(operand), Value::Const(0))
+    }
+
+    /// How an expression's value is read, which is a question about its type.
+    fn num_of(&self, expr: &Expr) -> Num {
+        Num::of(self.types.of(expr.id))
     }
 
     /// Lower an expression used as an operand, producing a value to read.
@@ -2744,6 +2904,9 @@ impl Lowering<'_> {
             // Literals stay immediates so the backend can fold them into the
             // instruction that consumes them.
             ExprKind::Int(v) => Value::Const(*v),
+            // The bits of the double, which is what a `float` is everywhere
+            // past this point — see [`Num`].
+            ExprKind::Float(v) => Value::Const(v.to_bits() as i64),
             ExprKind::Bool(v) => Value::Const(i64::from(*v)),
             ExprKind::Var(name) => Value::Reg(self.lookup(name)),
             // A variant of an enum that carries nothing anywhere *is* its tag,
@@ -2787,54 +2950,61 @@ impl Lowering<'_> {
                 }
                 Value::Reg(dst)
             }
-            ExprKind::Neg(operand) => match self.expr(operand) {
-                // An operand that is already a literal folds, and so does the
-                // whole tree above it: `-(2 * 3)` never reaches an instruction.
-                Value::Const(c) => Value::Const(c.wrapping_neg()),
-                val => {
-                    let dst = self.fresh_temp();
-                    self.emit(Instr::Bin {
-                        op: BinOp::Sub,
-                        dst,
-                        lhs: Value::Const(0),
-                        rhs: val,
-                    });
-                    Value::Reg(dst)
+            ExprKind::Neg(operand) => {
+                let num = self.num_of(expr);
+                match self.expr(operand) {
+                    // An operand that is already a literal folds, and so does
+                    // the whole tree above it: `-(2 * 3)` never reaches an
+                    // instruction.
+                    Value::Const(c) => Value::Const(negate_const(num, c)),
+                    val => {
+                        let dst = self.fresh_temp();
+                        self.emit(Instr::Bin {
+                            num,
+                            op: BinOp::Sub,
+                            dst,
+                            lhs: zero_to_subtract_from(num),
+                            rhs: val,
+                        });
+                        Value::Reg(dst)
+                    }
                 }
-            },
+            }
             ExprKind::Bin { .. } | ExprKind::Cmp { .. } if self.is_string_op(expr) => {
                 let dst = self.fresh_temp();
                 self.string_op_into(dst, expr);
                 Value::Reg(dst)
             }
             ExprKind::Bin { op, lhs, rhs } => {
+                let num = self.num_of(expr);
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                if let Some(val) = fold_bin(*op, lhs, rhs) {
+                if let Some(val) = fold_bin(num, *op, lhs, rhs) {
                     return Value::Const(val);
                 }
                 let dst = self.fresh_temp();
-                self.emit(Instr::Bin { op: *op, dst, lhs, rhs });
+                self.emit(Instr::Bin { num, op: *op, dst, lhs, rhs });
                 Value::Reg(dst)
             }
             ExprKind::Cmp { op, lhs, rhs } => {
+                let num = self.num_of(lhs);
                 let lhs = self.expr(lhs);
                 let rhs = self.expr(rhs);
-                if let Some(val) = fold_cmp(*op, lhs, rhs) {
+                if let Some(val) = fold_cmp(num, *op, lhs, rhs) {
                     return Value::Const(val);
                 }
                 let dst = self.fresh_temp();
-                self.emit(Instr::Cmp { op: *op, dst, lhs, rhs });
+                self.emit(Instr::Cmp { num, op: *op, dst, lhs, rhs });
                 Value::Reg(dst)
             }
             // `!` is a comparison, so it takes the same path as one.
             ExprKind::Not(operand) => {
-                let (op, lhs, rhs) = self.negated(operand);
-                if let Some(val) = fold_cmp(op, lhs, rhs) {
+                let (num, op, lhs, rhs) = self.negated(operand);
+                if let Some(val) = fold_cmp(num, op, lhs, rhs) {
                     return Value::Const(val);
                 }
                 let dst = self.fresh_temp();
-                self.emit(Instr::Cmp { op, dst, lhs, rhs });
+                self.emit(Instr::Cmp { num, op, dst, lhs, rhs });
                 Value::Reg(dst)
             }
             // A left operand that settles the answer leaves nothing to branch
@@ -3202,6 +3372,7 @@ impl Owned<'_> {
             }
             ExprKind::Field { object, .. } => self.expr(object, Kept::No),
             ExprKind::Int(_)
+            | ExprKind::Float(_)
             | ExprKind::Str(_)
             | ExprKind::Char(_)
             | ExprKind::Bool(_)
@@ -3263,6 +3434,7 @@ fn mentions(expr: &Expr, name: &str) -> bool {
     match &expr.kind {
         ExprKind::Var(other) => return other == name,
         ExprKind::Int(_)
+        | ExprKind::Float(_)
         | ExprKind::Str(_)
         | ExprKind::Char(_)
         | ExprKind::Bool(_)
@@ -3320,9 +3492,51 @@ fn builds_its_own(expr: &Expr) -> bool {
 /// the same constants through the same [`BinOp::apply`]. What reaches here is
 /// what sema could not see, such as an operand that only became a constant
 /// during lowering.
-pub(crate) fn fold_bin(op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
+/// What `-x` subtracts `x` from, which is the zero of whichever kind of number
+/// it is.
+///
+/// A float's is **negative** zero, and that is not a flourish: `-0.0 - x` is
+/// exactly `-x` for every value there is, while `0.0 - x` answers `+0.0` where
+/// `x` was `+0.0` and `-0.0` was meant. The two zeroes compare equal, so the
+/// difference is invisible until something divides by the result — and then it
+/// is the difference between `+∞` and `-∞`.
+fn zero_to_subtract_from(num: Num) -> Value {
+    match num {
+        Num::Int => Value::Const(0),
+        Num::Float => Value::Const((-0.0f64).to_bits() as i64),
+    }
+}
+
+/// The same negation, done here because the operand was already known.
+fn negate_const(num: Num, value: i64) -> i64 {
+    match num {
+        // `-i64::MIN` does not fit, and wrapping is what the machine does with
+        // it — where `sema` has not already refused the program for it.
+        Num::Int => value.wrapping_neg(),
+        Num::Float => (-f64::from_bits(value as u64)).to_bits() as i64,
+    }
+}
+
+/// A float folds by the same arithmetic the machine would do — IEEE-754 in
+/// double precision, which is exactly what Rust's `f64` is — so folding one
+/// cannot come to a different answer from running it. It never refuses: too
+/// large is an infinity and zero into zero is a NaN, and both are values.
+pub(crate) fn fold_bin(num: Num, op: BinOp, lhs: Value, rhs: Value) -> Option<i64> {
     let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else { return None };
-    op.apply(a, b)
+    match num {
+        Num::Int => op.apply(a, b),
+        Num::Float => {
+            let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+            let answer = match op {
+                BinOp::Add => a + b,
+                BinOp::Sub => a - b,
+                BinOp::Mul => a * b,
+                BinOp::Div => a / b,
+                BinOp::Rem => unreachable!("sema rejects `%` on a float"),
+            };
+            Some(answer.to_bits() as i64)
+        }
+    }
 }
 
 /// What a short-circuiting operator answers when its left operand alone decides.
@@ -3340,15 +3554,33 @@ fn fold_logic(op: LogicOp, lhs: Value) -> Option<i64> {
 }
 
 /// The same for a comparison, whose result is the 0 or 1 a `bool` is.
-pub(crate) fn fold_cmp(op: CmpOp, lhs: Value, rhs: Value) -> Option<i64> {
+///
+/// Comparing two floats is **not** comparing their bits: `-0.0` and `0.0` are
+/// equal and spelled differently, and a NaN is equal to nothing including
+/// itself. Rust's `f64` operators say exactly that, which is also what the
+/// machine's `ucomisd` says, so the two agree by construction.
+pub(crate) fn fold_cmp(num: Num, op: CmpOp, lhs: Value, rhs: Value) -> Option<i64> {
     let (Value::Const(a), Value::Const(b)) = (lhs, rhs) else { return None };
-    let answer = match op {
-        CmpOp::Eq => a == b,
-        CmpOp::Ne => a != b,
-        CmpOp::Lt => a < b,
-        CmpOp::Le => a <= b,
-        CmpOp::Gt => a > b,
-        CmpOp::Ge => a >= b,
+    let answer = match num {
+        Num::Int => match op {
+            CmpOp::Eq => a == b,
+            CmpOp::Ne => a != b,
+            CmpOp::Lt => a < b,
+            CmpOp::Le => a <= b,
+            CmpOp::Gt => a > b,
+            CmpOp::Ge => a >= b,
+        },
+        Num::Float => {
+            let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+            match op {
+                CmpOp::Eq => a == b,
+                CmpOp::Ne => a != b,
+                CmpOp::Lt => a < b,
+                CmpOp::Le => a <= b,
+                CmpOp::Gt => a > b,
+                CmpOp::Ge => a >= b,
+            }
+        }
     };
     Some(i64::from(answer))
 }
@@ -4337,7 +4569,7 @@ mod tests {
             (BinOp::Rem, i64::MIN, -1),
         ] {
             assert_eq!(
-                fold_bin(op, Value::Const(a), Value::Const(b)),
+                fold_bin(Num::Int, op, Value::Const(a), Value::Const(b)),
                 None,
                 "{} {a}, {b}",
                 op.symbol()
@@ -4358,7 +4590,7 @@ mod tests {
             (BinOp::Sub, i64::MIN + 1, 1, i64::MIN),
         ] {
             assert_eq!(
-                fold_bin(op, Value::Const(a), Value::Const(b)),
+                fold_bin(Num::Int, op, Value::Const(a), Value::Const(b)),
                 Some(expected),
                 "{} {a}, {b}",
                 op.symbol()
@@ -5109,5 +5341,90 @@ mod tests {
         let ir = lower_main("string s = \"hi\";\nprint(\"hi\");\nprint(s);");
         assert_eq!(ir.texts, vec!["hi".to_string()]);
         assert_eq!(ir.strings, vec![vec!['h', 'i']]);
+    }
+
+    // -- float ---------------------------------------------------------------
+
+    /// A float literal becomes the bits of its double, and the instructions
+    /// that read those bits say so. Nothing else in the IR changes shape.
+    #[test]
+    fn a_float_travels_as_the_bits_of_its_double() {
+        let ir = lower_main("float a = 1.5;\nfloat b = a * 2.0;\nprintln(b < a);");
+        assert_eq!(
+            body_dump(&ir),
+            concat!(
+                "entry0:\n",
+                "  0  %a = const 4609434218613702656\n",
+                "  1  %b = mul.f %a, 2f\n",
+                "  2  %t2 = cmp.f < %b, %a\n",
+                "  3  println bool %t2\n",
+                "  4  return\n",
+            )
+        );
+        assert_eq!(f64::from_bits(4609434218613702656u64), 1.5);
+    }
+
+    /// Folding a float is done in `f64`, not on the bits, so the compiler and
+    /// the machine cannot come to different answers.
+    #[test]
+    fn float_constants_fold_as_floats() {
+        let ir = lower_main("println(1.5 + 2.25);");
+        assert_eq!(body_dump(&ir), "entry0:\n  0  println float 3.75f\n  1  return\n");
+
+        // Adding the two bit patterns as integers would answer this instead,
+        // which is what makes the `num` on the instruction load-bearing.
+        let wrong = f64::to_bits(1.5) + f64::to_bits(2.25);
+        assert_ne!(wrong, f64::to_bits(3.75));
+    }
+
+    /// `-x` is a subtraction from **negative** zero. `0.0 - x` would answer
+    /// `+0.0` where `x` was `+0.0`, and the difference is invisible until
+    /// something divides by the result.
+    #[test]
+    fn negating_a_float_subtracts_from_negative_zero() {
+        let ir = lower_main("float a = 0.0;\nfloat b = -a;\nprintln(b);");
+        assert!(body_dump(&ir).contains("%b = sub.f -0f, %a"), "{}", body_dump(&ir));
+        assert_eq!(negate_const(Num::Float, 0.0f64.to_bits() as i64), (-0.0f64).to_bits() as i64);
+    }
+
+    /// A conversion that can be settled here is, and the one that cannot stays
+    /// an instruction — the same bargain `char(n)` strikes.
+    #[test]
+    fn a_constant_conversion_is_settled_where_it_can_be() {
+        // Both fold to a `const`, and neither leaves an instruction that could
+        // stop the program.
+        let up = body_dump(&lower_main("float f = float(3);\nprintln(f);"));
+        assert!(up.contains("%f = const 4613937818241073152"), "{up}");
+        let down = body_dump(&lower_main("int n = int(3.75);\nprintln(n);"));
+        assert!(down.contains("%n = const 3"), "{down}");
+
+        // What only the running program knows stays an instruction, and only in
+        // the direction that can fail.
+        let ir = lower_main("int n = 3;\nfloat f = float(n) / 2.0;\nprintln(int(f));");
+        let dump = body_dump(&ir);
+        assert!(dump.contains(" = int %"), "{dump}");
+    }
+
+    /// Float arithmetic answers whatever it is given — an infinity, a NaN — so
+    /// there is nothing to guard and nothing keeping a result nobody reads.
+    #[test]
+    fn float_arithmetic_cannot_fail() {
+        let division = |num| Instr::Bin {
+            num,
+            op: BinOp::Div,
+            dst: VReg(0),
+            lhs: Value::Reg(VReg(1)),
+            rhs: Value::Reg(VReg(2)),
+        };
+        assert!(!division(Num::Float).can_fail());
+        assert!(
+            division(Num::Int).can_fail(),
+            "an int division still has a zero divisor to worry about"
+        );
+
+        // Only one direction of the conversion can.
+        let cast = |to| Instr::Cast { dst: VReg(0), to, src: Value::Reg(VReg(1)) };
+        assert!(cast(Num::Int).can_fail());
+        assert!(!cast(Num::Float).can_fail());
     }
 }

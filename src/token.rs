@@ -69,7 +69,7 @@ impl From<&str> for StrLit {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TokenKind {
     // Literals and names.
     Int(i64),
@@ -78,6 +78,7 @@ pub enum TokenKind {
     Str(StrLit),
     /// A character literal, `'a'` — exactly one character.
     Char(char),
+    Float(f64),
     Bool(bool),
     Ident(String),
 
@@ -86,6 +87,7 @@ pub enum TokenKind {
     KwString,
     KwChar,
     KwBool,
+    KwFloat,
     KwPrint,
     KwPrintln,
     KwIf,
@@ -175,6 +177,7 @@ impl TokenKind {
             TokenKind::KwString => "string",
             TokenKind::KwChar => "char",
             TokenKind::KwBool => "bool",
+            TokenKind::KwFloat => "float",
             TokenKind::KwPrint => "print",
             TokenKind::KwPrintln => "println",
             TokenKind::KwIf => "if",
@@ -230,6 +233,7 @@ impl TokenKind {
             TokenKind::Str(_) => "string literal",
             TokenKind::Char(_) => "character literal",
             TokenKind::Bool(_) => "boolean literal",
+            TokenKind::Float(_) => "float literal",
             TokenKind::Ident(_) => "identifier",
             TokenKind::Eof => "end of file",
         }

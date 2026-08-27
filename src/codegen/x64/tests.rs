@@ -13,9 +13,10 @@
 //! hold for *every* target, named or not, is in `tests/targets.rs`, which walks
 //! `Target::names()` and never mentions one.
 
-use super::data::{BOOL_TRUE, FMT_BOOL, FMT_INT, NEWLINE, line_format};
+use super::data::{BOOL_TRUE, FMT_BOOL, FMT_FLOAT, FMT_INT, NEWLINE, line_format};
 use super::runtime::{
-    ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_NOT_A_NUMBER, ABORT_OOM, ABORT_REPORT,
+    ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_NOT_A_NUMBER, ABORT_NO_INT,
+    ABORT_OOM, ABORT_OVERFLOW, ABORT_REPORT,
     ABORT_STACK, ALLOC, ARENA_CHUNK, ARENA_END, ARENA_NEXT, INPUT, LIST_ROOM, PARSE_INT,
     PRINT_CHAR, READY, REFILL, STACK_LIMIT, UTF8, UTF8_DECODE, WRITE_TEXT,
 };
@@ -1375,4 +1376,89 @@ fn a_stub_frame_leaves_the_stack_aligned_on_every_platform() {
             }
         }
     }
+}
+
+// -- float ------------------------------------------------------------------
+
+/// A float goes out through a format of its own, and the value travels in a
+/// vector register.
+///
+/// The two halves of the backend used to disagree about the first half: `Used`
+/// was told an `int` had been printed while the code asked for the string
+/// format, and the program failed to assemble over a symbol nothing defined.
+/// So both are asserted here — the reference *and* the definition.
+#[test]
+fn a_float_is_printed_through_its_own_format() {
+    let asm = compile("float f = 1.5;\nprintln(f);");
+    assert!(asm.contains(&format!("lea  rcx, [{}]", line_format(FMT_FLOAT))), "{asm}");
+    assert!(asm.contains(&format!("{}: db \"%f\", 10, 0", line_format(FMT_FLOAT))), "{asm}");
+    // Windows numbers vector registers by argument position, so the value that
+    // follows the format string is `xmm1` — and `rdx` as well, because a
+    // variadic callee is free to read either.
+    assert!(asm.contains("movq xmm1, r10"), "{asm}");
+    assert!(asm.contains("mov  rdx, r10"), "{asm}");
+    // Nothing an `int` prints is dragged in with it.
+    assert!(!asm.contains(FMT_INT), "{asm}");
+}
+
+/// Each operator becomes the one instruction that means it, and none of them
+/// is guarded: float arithmetic has an answer for everything.
+#[test]
+fn float_arithmetic_is_unguarded_vector_arithmetic() {
+    for (source, mnemonic) in
+        [("a + b", "addsd"), ("a - b", "subsd"), ("a * b", "mulsd"), ("a / b", "divsd")]
+    {
+        let asm = compile(&format!(
+            "float a = 1.5;\nfloat b = 2.0;\nfloat c = a * b;\nfloat d = {source};\nprintln(d);"
+        ));
+        assert!(asm.contains(mnemonic), "{source}: {asm}");
+        assert!(!asm.contains(ABORT_OVERFLOW), "{source} needs no overflow guard: {asm}");
+        assert!(!asm.contains(ABORT_DIV_ZERO), "{source} needs no divisor guard: {asm}");
+    }
+}
+
+/// A comparison is `ucomisd` and an *unsigned* condition, because unordered —
+/// either operand is a NaN — looks exactly like "below or equal" in the flags.
+///
+/// `<` and `<=` get there by comparing the other way round rather than by
+/// reaching for `setb`, which would answer true for a NaN.
+#[test]
+fn a_float_comparison_is_unsigned_and_rules_out_a_nan() {
+    let ordered = compile("float a = 1.5;\nfloat b = 2.0;\nprintln(a < b);");
+    assert!(ordered.contains("ucomisd"), "{ordered}");
+    assert!(ordered.contains("seta"), "{ordered}");
+    assert!(!ordered.contains("setl"), "a signed condition means the int path: {ordered}");
+
+    // Equality is the one that cannot be a single `setcc`: unordered sets the
+    // zero flag, so `sete` alone would say a NaN equals itself.
+    let equal = compile("float a = 1.5;\nfloat b = 2.0;\nprintln(a == b);");
+    assert!(equal.contains("setnp"), "{equal}");
+    assert!(equal.contains("and  r11b, r10b"), "{equal}");
+
+    let unequal = compile("float a = 1.5;\nfloat b = 2.0;\nprintln(a != b);");
+    assert!(unequal.contains("setp"), "{unequal}");
+    assert!(unequal.contains("or   r11b, r10b"), "{unequal}");
+}
+
+/// A float comparison never fuses into the branch that reads it, so an `if` on
+/// one materialises the bool and tests it. See `fusable_compare`.
+#[test]
+fn a_float_condition_is_not_folded_into_its_branch() {
+    let asm = compile("float a = 1.5;\nfloat b = 2.0;\nif (a < b) {\n  println(1);\n}");
+    assert!(asm.contains("movzx"), "the bool is materialised: {asm}");
+    assert!(asm.contains("test"), "and then tested: {asm}");
+}
+
+/// `int(f)` is guarded and `float(n)` is not, which is the same asymmetry
+/// `char(n)` has: every `int` has a nearest `float`, and a float too large —
+/// or no number at all — has no `int`.
+#[test]
+fn only_one_direction_of_the_conversion_is_guarded() {
+    let down = compile("float f = 1.5;\nfloat g = f * 2.0;\nprintln(int(g));");
+    assert!(down.contains("cvttsd2si"), "{down}");
+    assert!(down.contains(ABORT_NO_INT), "{down}");
+
+    let up = compile("int n = 3;\nfloat f = float(n) / 2.0;\nprintln(f);");
+    assert!(up.contains("cvtsi2sd"), "{up}");
+    assert!(!up.contains(ABORT_NO_INT), "this direction cannot fail: {up}");
 }

@@ -7,22 +7,24 @@
 //! come from [`Abi`]; the entry point's one platform-specific duty comes from
 //! [`Platform::entry_setup`].
 
-use crate::ast::{BinOp, Ty};
+use crate::ast::{BinOp, CmpOp, Ty};
 use crate::codegen::{Allocation, Location, RegisterFile};
 use crate::ir::{
-    Block, DivGuards, Function, Instr, Program, STR_HEADER, Terminator, VReg, Value,
+    Block, DivGuards, Function, Instr, Num, Program, STR_HEADER, Terminator, VReg, Value,
 };
 
 use super::asm::Asm;
-use super::data::{BOOL_FALSE, BOOL_TRUE, FMT_BOOL, FMT_INT, FMT_STR, NEWLINE, line_format};
+use super::data::{
+    BOOL_FALSE, BOOL_TRUE, FMT_BOOL, FMT_FLOAT, FMT_INT, FMT_STR, NEWLINE, line_format,
+};
 use super::runtime::{
-    ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_OVERFLOW, ABORT_STACK, PRINT_CHAR,
-    FIXUP, PRINT_STR, STACK_LIMIT, STACK_MARGIN, WRITE_TEXT,
+    ABORT_BOUNDS, ABORT_DIV_OVERFLOW, ABORT_DIV_ZERO, ABORT_NO_INT, ABORT_OVERFLOW, ABORT_STACK,
+    PRINT_CHAR, FIXUP, PRINT_STR, STACK_LIMIT, STACK_MARGIN, WRITE_TEXT,
 };
 use super::used::{Used, enum_table, text_label, variant_value, vtable_label};
 use super::{
-    Abi, ENTRY_POINT, PAGE_BYTES, Platform, RAX, RDX, SCRATCH0, SCRATCH1, SCRATCH1_8,
-    half, jump_if_false, narrow, runtime_symbol, setcc, symbol,
+    Abi, ENTRY_POINT, PAGE_BYTES, Platform, RAX, RDX, SCRATCH0, SCRATCH0_8, SCRATCH1, SCRATCH1_8,
+    XMM0, XMM1, float_setcc, half, jump_if_false, narrow, runtime_symbol, setcc, symbol,
 };
 
 pub struct FnEmitter<'a, 'o> {
@@ -283,10 +285,16 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
     /// nothing writes it any more. Fixing that would mean deciding the fusion
     /// before allocation, which would put x86's flags register into the
     /// target-independent half of the compiler.
+    /// A float comparison is never fused, and that is deliberate. `ucomisd`
+    /// reports "either operand is a NaN" in a flag of its own, so `==` and `!=`
+    /// are two conditions combined rather than one — there is no single `jcc`
+    /// that means either of them. Materialising the 0 or 1 costs an instruction
+    /// and makes the four orderings and the two equalities one shape instead of
+    /// two, one of which would have to invent a label to jump around.
     fn fusable_compare(&self, block: &Block) -> Option<usize> {
         let Terminator::Branch { cond: Value::Reg(cond), .. } = &block.term else { return None };
         let at = block.instrs.len().checked_sub(1)?;
-        let Instr::Cmp { dst, .. } = &block.instrs[at] else { return None };
+        let Instr::Cmp { num: Num::Int, dst, .. } = &block.instrs[at] else { return None };
         (dst == cond && self.reads(*dst) == 1).then_some(at)
     }
 
@@ -400,18 +408,72 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             // 0 or 1 byte, and `movzx` widens it to the 64-bit value a bool is.
             // A comparison that only feeds a branch never gets here — see
             // `fusable_compare`.
-            Instr::Cmp { op, dst, lhs, rhs } => {
+            Instr::Cmp { num: Num::Int, op, dst, lhs, rhs } => {
                 self.compare(lhs, rhs);
                 self.asm.asm(&format!("{} {SCRATCH1_8}", setcc(*op)));
                 self.produce(*dst, |e, work| {
                     e.asm.asm(&format!("movzx {work}, {SCRATCH1_8}"));
                 });
             }
+            // The same shape, with the answer still arriving in `SCRATCH1_8`,
+            // and two things `cmp` never has to do: the operands come out of
+            // general registers into the vector ones, and a NaN has to be
+            // ruled out by hand. See `float_setcc` for why the conditions are
+            // the unsigned ones.
+            Instr::Cmp { num: Num::Float, op, dst, lhs, rhs } => {
+                let (swap, setcc) = float_setcc(*op);
+                let (first, second) = match swap {
+                    true => (rhs, lhs),
+                    false => (lhs, rhs),
+                };
+                self.load_vector(first, XMM0);
+                self.load_vector(second, XMM1);
+                self.asm.asm(&format!("ucomisd {XMM0}, {XMM1}"));
+                self.asm.asm(&format!("{setcc} {SCRATCH1_8}"));
+                // `ucomisd` sets the parity flag when either operand is a NaN,
+                // and sets ZF along with it — so `sete` alone would answer that
+                // a NaN equals itself, and `setne` that it does not differ from
+                // anything. Combining with PF is what makes both false, which
+                // is what IEEE-754 asks for. The orderings need none of this:
+                // `seta` and `setae` are already false when PF is set.
+                match op {
+                    CmpOp::Eq => {
+                        self.asm.asm(&format!("setnp {SCRATCH0_8}"));
+                        self.asm.asm(&format!("and  {SCRATCH1_8}, {SCRATCH0_8}"));
+                    }
+                    CmpOp::Ne => {
+                        self.asm.asm(&format!("setp {SCRATCH0_8}"));
+                        self.asm.asm(&format!("or   {SCRATCH1_8}, {SCRATCH0_8}"));
+                    }
+                    _ => {}
+                }
+                self.produce(*dst, |e, work| {
+                    e.asm.asm(&format!("movzx {work}, {SCRATCH1_8}"));
+                });
+            }
+            // Float arithmetic is one instruction on the vector registers, with
+            // a `movq` at each end. No guard: an answer too large is an
+            // infinity and zero into zero is a NaN, and both are values the
+            // program may go on to use — see `Instr::can_fail`.
+            Instr::Bin { num: Num::Float, op, dst, lhs, rhs } => {
+                self.load_vector(lhs, XMM0);
+                self.load_vector(rhs, XMM1);
+                let mnemonic = match op {
+                    BinOp::Add => "addsd",
+                    BinOp::Sub => "subsd",
+                    BinOp::Mul => "mulsd",
+                    BinOp::Div => "divsd",
+                    BinOp::Rem => unreachable!("sema rejects `%` on a float"),
+                };
+                self.asm.asm(&format!("{mnemonic} {XMM0}, {XMM1}"));
+                self.produce(*dst, |e, work| e.asm.asm(&format!("movq {work}, {XMM0}")));
+            }
             // One `idiv`, read from `rax` for the quotient or `rdx` for the
             // remainder.
-            Instr::Bin { op: BinOp::Div, dst, lhs, rhs } => self.division(*dst, RAX, lhs, rhs),
-            Instr::Bin { op: BinOp::Rem, dst, lhs, rhs } => self.division(*dst, RDX, lhs, rhs),
-            Instr::Bin { op, dst, lhs, rhs } => {
+            Instr::Bin { op: BinOp::Div, dst, lhs, rhs, .. } => self.division(*dst, RAX, lhs, rhs),
+            Instr::Bin { op: BinOp::Rem, dst, lhs, rhs, .. } => self.division(*dst, RDX, lhs, rhs),
+            Instr::Cast { dst, to, src } => self.cast(*dst, *to, src),
+            Instr::Bin { op, dst, lhs, rhs, .. } => {
                 // The result usually lands in a register that just held one of
                 // the operands — that is register reuse working as intended.
                 // Landing on `lhs` is free, because `mov work, lhs` then becomes
@@ -652,10 +714,23 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                         self.asm.asm(&format!("lea  {SCRATCH1}, [{}]", enum_table(*id)));
                         self.asm.asm(&format!("mov  {arg1}, [{SCRATCH1}+{SCRATCH0}*8]"));
                     }
+                    // A double travels to a variadic callee in a vector
+                    // register, and on Windows in the integer one for that
+                    // position as well — see `Abi::vector_arg`, which is where
+                    // the two conventions' one disagreement about this is
+                    // written down.
+                    Ty::Float => {
+                        self.asm.mov(SCRATCH0, &value);
+                        self.asm.asm(&format!("movq {}, {SCRATCH0}", self.abi.vector_arg));
+                        if self.abi.vector_arg_shadowed {
+                            self.asm.mov(arg1, SCRATCH0);
+                        }
+                    }
                     _ => self.asm.mov(arg1, &value),
                 }
                 let format = match ty {
                     Ty::Int => FMT_INT,
+                    Ty::Float => FMT_FLOAT,
                     Ty::Bool => FMT_BOOL,
                     // A string and a character left through the arm above.
                     _ => FMT_STR,
@@ -667,7 +742,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                     false => format.to_string(),
                 };
                 self.asm.asm(&format!("lea  {arg0}, [{format}]"));
-                self.asm.variadic(self.abi);
+                self.asm.variadic(self.abi, usize::from(*ty == Ty::Float));
                 self.asm.asm("call printf");
             }
         }
@@ -683,6 +758,73 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
             let src = self.value(arg);
             let dst = self.arg(index);
             self.asm.mov(dst, &src);
+        }
+    }
+
+    /// Put a value in a vector register, which is where a float has to be for
+    /// anything to be done to it.
+    ///
+    /// The value is a machine word wherever it lives — see [`Num`] — so this is
+    /// one `movq` out of a general register or a spill slot. An immediate is
+    /// the one case that takes two: no `movq` takes one, so the bits go through
+    /// [`SCRATCH1`] first.
+    ///
+    /// `SCRATCH1` and not `SCRATCH0`, because a caller may already be holding a
+    /// result there — [`Self::work_reg`] hands out `SCRATCH0` for a destination
+    /// that was spilled.
+    fn load_vector(&mut self, value: &Value, vector: &str) {
+        let operand = match value {
+            Value::Const(c) => {
+                self.asm.asm(&format!("mov  {SCRATCH1}, {c}"));
+                SCRATCH1.to_string()
+            }
+            other => self.value(other),
+        };
+        self.asm.asm(&format!("movq {vector}, {operand}"));
+    }
+
+    /// `float(n)` and `int(f)`: the one place a machine word changes what it
+    /// means rather than what it holds.
+    ///
+    /// `cvttsd2si` truncates toward zero — the second `t` — which is the
+    /// direction TinyC promises, and it is also the direction that makes the
+    /// range asymmetric: everything from `-2^63` up to but not including `2^63`
+    /// has an answer.
+    ///
+    /// For anything else the machine answers the "integer indefinite" value,
+    /// which is `i64::MIN` — and `i64::MIN` is also the right answer for the
+    /// one float that really is `-2^63`. So the guard cannot read the answer
+    /// alone: it asks whether the *source* was that number, and stops the
+    /// program when it was not. A NaN lands here too, and fails the question
+    /// twice over: `ucomisd` reports it as unordered, which sets the parity
+    /// flag as well as leaving the equality unmet.
+    fn cast(&mut self, dst: VReg, to: Num, src: &Value) {
+        match to {
+            // The source is an ordinary integer, so it goes straight in: this
+            // is the one instruction here that reads a general register.
+            Num::Float => {
+                let src = self.in_register(src, SCRATCH1);
+                self.asm.asm(&format!("cvtsi2sd {XMM0}, {src}"));
+                self.produce(dst, |e, work| e.asm.asm(&format!("movq {work}, {XMM0}")));
+            }
+            Num::Int => {
+                self.load_vector(src, XMM0);
+                let past = self.local_label("cast");
+                self.asm.asm(&format!("cvttsd2si {SCRATCH1}, {XMM0}"));
+                self.asm.asm(&format!("mov  {SCRATCH0}, {}", i64::MIN));
+                self.asm.asm(&format!("cmp  {SCRATCH1}, {SCRATCH0}"));
+                self.asm.asm(&format!("jne  .{past}"));
+                // `-2^63` as a double, which is the only source this answer may
+                // legitimately have come from.
+                let bound = (-9223372036854775808.0f64).to_bits() as i64;
+                self.asm.asm(&format!("mov  {SCRATCH0}, {bound}"));
+                self.asm.asm(&format!("movq {XMM1}, {SCRATCH0}"));
+                self.asm.asm(&format!("ucomisd {XMM0}, {XMM1}"));
+                self.asm.asm(&format!("jp   {ABORT_NO_INT}"));
+                self.asm.asm(&format!("jne  {ABORT_NO_INT}"));
+                self.asm.line(&format!(".{past}:"));
+                self.produce(dst, |e, work| e.asm.mov(work, SCRATCH1));
+            }
         }
     }
 

@@ -25,8 +25,9 @@ use tinyc::codegen::{Target, backend_for, regalloc};
 /// `examples/hello.tc` is deliberately absent: it is a scratch file for trying
 /// things out by hand, so it is allowed to be broken at any time. Anything that
 /// should stay working belongs in its own example listed here.
-const EXAMPLES: [&str; 12] = [
+const EXAMPLES: [&str; 13] = [
     "arith.tc",
+    "float.tc",
     "spill.tc",
     "reassign.tc",
     "bool.tc",
