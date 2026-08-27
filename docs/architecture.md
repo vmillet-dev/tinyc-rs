@@ -2305,6 +2305,46 @@ reaches, and the program compiles, links, runs, and quietly does nothing — whi
 `main` is the exception, and has to be: it is the name the C runtime startup
 calls. Nothing the backend generates is called `main`, so it is safe alone.
 
+## Adding a primitive type
+
+One row in `src/prim.rs`, and nothing else that is boilerplate:
+
+```rust
+/// A rational, held as a numerator over a denominator.
+Frac, "frac", "FRAC_KW", 'q';
+```
+
+That is the identifier, the spelling, what the editor plugin calls its token,
+and the letter that writes it in a format string. From it are generated the
+`Prim` variant, `Prim::ALL`, the `Ty` variant, the `TokenKind::Kw` payload, the
+spelling every diagnostic quotes, and the row the IntelliJ plugin's token table
+is built from. The doc comment above the row lands on both generated variants,
+so the row is where the type is *described* as well as declared.
+
+`primitives!` is an **X-macro**: it expands to nothing itself, it hands the
+table to a macro the caller names. That is the trick C compilers use, spelled in
+Rust rather than in the preprocessor — Clang's `TokenKinds.def` and
+`BuiltinTypes.def` are `#include`d a dozen times each behind a different
+`#define`, and GCC reads `tree.def` the same way.
+
+The compiler then refuses to build until **three decisions** have been made,
+and each one is a real question rather than a copy of the row:
+
+| Where | What it asks |
+|---|---|
+| `Ty::name` in `ast.rs` | is it one of the types the language spells? |
+| `domain_of` in `sema.rs` | may a `match` ask about one? |
+| `format_index` in `codegen/x64/mod.rs` | which `printf` format writes it? |
+
+Then `cargo run --bin export-vocabulary`, because the editor reads a checked-in
+file rather than running the compiler. A test says so if you forget.
+
+What is left after that is the type's *behaviour* — its literals in the lexer,
+its arithmetic in `sema`, its instructions in the backend — and none of it is
+paperwork. This is also where real compilers stop generating: `BuiltinTypes.def`
+gives Clang the variant, the name and the printer; what `float` **means** is
+thousands of hand-written lines elsewhere.
+
 ## Targeting another platform
 
 Everything up to and including register allocation is target-independent. A new

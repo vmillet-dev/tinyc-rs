@@ -43,7 +43,8 @@
 //! spec     <letter>  <what it writes>
 //! ```
 
-use crate::ast::{Builtin, Prim, SPECS};
+use crate::ast::{Builtin, Spec};
+use crate::prim::{Prim, primitives};
 use crate::token::{StrLit, TokenKind};
 
 /// Where the export lives, relative to the repository root.
@@ -149,17 +150,32 @@ impl Spelled {
     }
 }
 
-/// Every token with a fixed spelling, and what it is for.
+/// The rows for the type keywords, generated from the one table that declares
+/// them.
+///
+/// They used to be written out here beside the rest, and that was the last
+/// place a type could be added to the language and left out of the editor's
+/// vocabulary — a program the compiler accepts and the plugin colours as an
+/// undeclared name. A row that cannot be written cannot be forgotten.
+macro_rules! type_rows {
+    ($($(#[$meta:meta])* $variant:ident, $spelling:literal, $editor:literal, $letter:literal;)*) => {
+        static TYPE_KEYWORDS: &[Spelled] = &[
+            $(Spelled::new($editor, TokenKind::Kw(Prim::$variant), Role::Type),)*
+        ];
+    };
+}
+
+primitives!(type_rows);
+
+/// Every token spelled exactly one way, and what it is for.
+///
+/// The type keywords are [`TYPE_KEYWORDS`] and are not repeated here; use
+/// [`spelled`], which is the two runs read as one.
 ///
 /// The spelling is deliberately absent: it is [`TokenKind::text`]'s to give.
 /// `true` and `false` are here despite being [`TokenKind::Bool`], because the
 /// question this answers is which *words* a program may not take as a name.
 pub static SPELLED: &[Spelled] = &[
-    Spelled::new("INT_KW", TokenKind::KwInt, Role::Type),
-    Spelled::new("STRING_KW", TokenKind::KwString, Role::Type),
-    Spelled::new("CHAR_KW", TokenKind::KwChar, Role::Type),
-    Spelled::new("BOOL_KW", TokenKind::KwBool, Role::Type),
-    Spelled::new("FLOAT_KW", TokenKind::KwFloat, Role::Type),
     Spelled::new("IF_KW", TokenKind::KwIf, Role::Control),
     Spelled::new("ELSE_KW", TokenKind::KwElse, Role::Control),
     Spelled::new("WHILE_KW", TokenKind::KwWhile, Role::Control),
@@ -207,6 +223,16 @@ pub static SPELLED: &[Spelled] = &[
     Spelled::new("OR_OR", TokenKind::PipePipe, Role::Operator),
 ];
 
+/// Every token with a fixed spelling: the type keywords the table generated,
+/// then the rest.
+///
+/// Two runs rather than one array because only one of them can be generated,
+/// and everything that reads the vocabulary wants both — so this is the one
+/// place that knows they are kept apart.
+pub fn spelled() -> impl Iterator<Item = &'static Spelled> {
+    TYPE_KEYWORDS.iter().chain(SPELLED)
+}
+
 /// The token a word spells, if it spells one rather than being a name.
 ///
 /// The lexer asks this instead of matching on the word itself, which is what
@@ -214,8 +240,7 @@ pub static SPELLED: &[Spelled] = &[
 /// of them kept alongside — a word left out is not a keyword the editor forgot,
 /// it is not a keyword at all.
 pub fn keyword(word: &str) -> Option<TokenKind> {
-    SPELLED
-        .iter()
+    spelled()
         .find(|spelled| spelled.role.is_word() && spelled.text() == word)
         .map(|spelled| spelled.kind.clone())
 }
@@ -268,7 +293,7 @@ pub fn export() -> String {
     }
 
     out.push_str("\n# Every token spelled exactly one way.\n");
-    for spelled in SPELLED {
+    for spelled in spelled() {
         out.push_str(&format!(
             "token\t{}\t{}\t{}\n",
             spelled.name,
@@ -293,7 +318,7 @@ pub fn export() -> String {
     }
 
     out.push_str("\n# What a `%` in a format string may be followed by.\n");
-    for spec in SPECS {
+    for spec in Spec::all() {
         out.push_str(&format!("spec\t{}\t{}\n", spec.letter(), spec.writes()));
     }
 
@@ -339,7 +364,7 @@ mod tests {
     /// fails here, not in an editor three weeks later.
     #[test]
     fn every_spelled_token_lexes_back_to_itself() {
-        for spelled in SPELLED {
+        for spelled in spelled() {
             let text = spelled.text();
             let lexed = crate::lexer::lex(text)
                 .unwrap_or_else(|e| panic!("`{text}` should lex: {e:?}"));
@@ -365,14 +390,19 @@ mod tests {
     fn the_table_covers_every_token_that_has_a_spelling() {
         // Adding a `TokenKind` with a fixed spelling means adding a row here
         // *and* bumping this number, which is the moment to notice the row.
+        //
+        // Counted over the *hand-written* rows alone. The type keywords are
+        // generated from `primitives!` and cannot be forgotten, so adding a
+        // type must not make anyone bump a number — that would be the cost this
+        // whole arrangement exists to remove, charged by a test.
         assert_eq!(
             SPELLED.len(),
-            50,
+            45,
             "a token was added or removed; the table and this count both move"
         );
         for (_, kind) in valued() {
             assert!(
-                SPELLED.iter().all(|spelled| spelled.kind != kind),
+                spelled().all(|spelled| spelled.kind != kind),
                 "{kind:?} carries a value and does not belong in SPELLED"
             );
         }
@@ -386,7 +416,7 @@ mod tests {
     /// the noun it answers with, and that is what is checked.
     #[test]
     fn a_spelling_is_written_out_only_where_the_kind_has_none() {
-        for spelled in SPELLED.iter().filter(|s| s.written.is_some()) {
+        for spelled in spelled().filter(|s| s.written.is_some()) {
             let noun = spelled.kind.text();
             let lexed = crate::lexer::lex(noun).ok().and_then(|t| t.first().map(|t| t.kind.clone()));
             assert_ne!(
@@ -402,14 +432,14 @@ mod tests {
     fn no_two_tokens_are_spelled_the_same_way() {
         // Two sharing a spelling would make "expected `X`" ambiguous, and would
         // mean the lexer has to be guessing somewhere.
-        for (at, spelled) in SPELLED.iter().enumerate() {
-            let clash = SPELLED[at + 1..].iter().find(|other| other.text() == spelled.text());
+        for (at, row) in spelled().enumerate() {
+            let clash = spelled().skip(at + 1).find(|other| other.text() == row.text());
             assert!(
                 clash.is_none(),
                 "{} and {} are both `{}`",
-                spelled.name,
+                row.name,
                 clash.map_or("", |other| other.name),
-                spelled.text()
+                row.text()
             );
         }
     }
@@ -467,7 +497,7 @@ mod tests {
     #[test]
     fn the_type_keywords_are_exactly_the_primitive_types() {
         for prim in Prim::ALL {
-            let row = SPELLED.iter().find(|spelled| spelled.kind == prim.keyword());
+            let row = spelled().find(|spelled| spelled.kind == prim.keyword());
             let row = row.unwrap_or_else(|| {
                 panic!("`{}` is a type with no row in SPELLED; the editor cannot see it", prim.name())
             });
@@ -479,7 +509,7 @@ mod tests {
                 row.name
             );
         }
-        for spelled in SPELLED.iter().filter(|s| s.role == Role::Type) {
+        for spelled in spelled().filter(|s| s.role == Role::Type) {
             assert!(
                 Prim::of_keyword(&spelled.kind).is_some(),
                 "{} is coloured as a type and names none",
@@ -495,7 +525,7 @@ mod tests {
     fn no_role_is_declared_that_nothing_uses() {
         for role in Role::ALL {
             assert!(
-                SPELLED.iter().any(|spelled| spelled.role == role),
+                spelled().any(|spelled| spelled.role == role),
                 "no token has the role `{}`",
                 role.name()
             );
@@ -506,7 +536,7 @@ mod tests {
     /// the property the plugin colours by.
     #[test]
     fn every_word_in_the_table_is_a_word_no_program_can_name() {
-        for spelled in SPELLED.iter().filter(|s| s.role.is_word()) {
+        for spelled in spelled().filter(|s| s.role.is_word()) {
             assert_eq!(
                 keyword(spelled.text()),
                 Some(spelled.kind.clone()),
@@ -521,7 +551,7 @@ mod tests {
 
     #[test]
     fn a_token_with_a_spelling_is_described_by_quoting_it() {
-        for spelled in SPELLED {
+        for spelled in spelled() {
             assert_eq!(
                 spelled.kind.describe(),
                 format!("`{}`", spelled.text()),
@@ -535,7 +565,7 @@ mod tests {
     /// what separate one field and one record from the next.
     #[test]
     fn no_field_can_be_mistaken_for_the_separator() {
-        for spelled in SPELLED {
+        for spelled in spelled() {
             assert!(!spelled.text().contains(['\t', '\n']), "{} is unwritable", spelled.name);
             assert!(!spelled.name.contains(['\t', '\n']), "{} is unwritable", spelled.name);
         }

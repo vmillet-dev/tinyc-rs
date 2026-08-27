@@ -1,7 +1,8 @@
 //! The abstract syntax tree produced by the parser.
 
 use crate::diag::Span;
-use crate::token::TokenKind;
+pub use crate::prim::Prim;
+use crate::prim::primitives;
 
 /// Index of an enum in [`Program::enums`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -302,67 +303,81 @@ impl EnumInfo {
     }
 }
 
-/// The types of TinyC.
+/// Declare [`Ty`] and the two mappings between it and [`Prim`], from the one
+/// table in [`crate::prim`].
 ///
-/// Every variant is a type a *value* can have, which is why there is no `Void`:
-/// a function that returns nothing has no return type at all. See [`FnDecl::ret`].
+/// The primitive variants keep the identifiers they always had — `Ty::Int`,
+/// `Ty::Float` — so every `match` in the compiler reads exactly as before and
+/// nothing outside this macro knows they are generated. What has gone is the
+/// *list*: the five variants, the five arms turning a `Prim` into one, and the
+/// five turning one back.
 ///
-/// [`Ty::Enum`] holds an *index* rather than a name, which is what keeps `Ty`
-/// `Copy` and its equality an integer comparison. The price is that a `Ty`
-/// cannot name itself — see [`Ty::name`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Ty {
-    /// 64-bit signed integer.
-    Int,
-    /// A run of characters, held as the address of the first one.
-    ///
-    /// The characters are four bytes each and the count sits in the eight bytes
-    /// *before* them, so a string knows its own length and `len` is a load. A
-    /// literal is laid out the same way in `.data` as a built one is in the
-    /// arena, which is why nothing anywhere has to ask which kind it holds.
-    Str,
-    /// One Unicode scalar value: what a string is made of, and what indexing
-    /// one produces.
-    ///
-    /// A separate type rather than a small `int`, so that `+` cannot be applied
-    /// to it by accident and `print` knows to write a character rather than a
-    /// number. Going between the two is spelled out — see [`Prim`].
-    Char,
-    /// An IEEE-754 double.
-    ///
-    /// It is a machine word like everything else here, and that is the whole of
-    /// how a float is carried: what the word *holds* is the double's bits, and
-    /// only the instructions that do arithmetic on it or write it out ever have
-    /// to know that. See [`crate::ir::Num`], which is where that is said once.
-    ///
-    /// No arithmetic mixes it with an `int` — `float(n)` and `int(f)` are
-    /// written out, for the same reason `int(c)` is.
-    Float,
-    /// `true` or `false`.
-    Bool,
-    /// One of the variants of a declared enum, held as its index.
-    Enum(EnumId),
-    /// A fixed-length run of values, held as an index into the type table.
-    ///
-    /// The one type that does not fit in a register: a value of one lives in
-    /// the frame, and what travels in a register is its address.
-    Array(ArrayId),
-    /// A run of values whose length is only known while the program runs.
-    ///
-    /// Where an [`Ty::Array`] lives in the frame and carries its length in its
-    /// *type*, a list lives in the arena and carries its length in front of its
-    /// elements — exactly as a [`Ty::Str`] carries its own. So a list is one
-    /// pointer, it fits in a register, and `len` is a load rather than a
-    /// literal.
-    ///
-    /// It is the one **mutable** thing that is shared by address, which is why
-    /// assigning one copies its elements: without that, two names for one list
-    /// would be observable the moment either was written to.
-    List(ListId),
-    /// An instance of a declared class. Like an array, it lives in the frame
-    /// and travels as an address.
-    Class(ClassId),
+/// The types that are **not** primitives are written out below, because they
+/// are not interchangeable in any way a table could capture: three of them
+/// carry an index, and two of those do not fit in a register.
+macro_rules! declare_ty {
+    ($($(#[$meta:meta])* $variant:ident, $spelling:literal, $editor:literal, $letter:literal;)*) => {
+        /// The types of TinyC.
+        ///
+        /// Every variant is a type a *value* can have, which is why there is no
+        /// `Void`: a function that returns nothing has no return type at all.
+        /// See [`FnDecl::ret`].
+        ///
+        /// [`Ty::Enum`] holds an *index* rather than a name, which is what
+        /// keeps `Ty` `Copy` and its equality an integer comparison. The price
+        /// is that a `Ty` cannot name itself — see [`Ty::name`].
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        pub enum Ty {
+            $($(#[$meta])* $variant,)*
+            /// One of the variants of a declared enum, held as its index.
+            Enum(EnumId),
+            /// A fixed-length run of values, held as an index into the type
+            /// table.
+            ///
+            /// The one type that does not fit in a register: a value of one
+            /// lives in the frame, and what travels in a register is its
+            /// address.
+            Array(ArrayId),
+            /// A run of values whose length is only known while the program
+            /// runs.
+            ///
+            /// Where an [`Ty::Array`] lives in the frame and carries its length
+            /// in its *type*, a list lives in the arena and carries its length
+            /// in front of its elements — exactly as a [`Ty::Str`] carries its
+            /// own. So a list is one pointer, it fits in a register, and `len`
+            /// is a load rather than a literal.
+            ///
+            /// It is the one **mutable** thing that is shared by address, which
+            /// is why assigning one copies its elements: without that, two names
+            /// for one list would be observable the moment either was written to.
+            List(ListId),
+            /// An instance of a declared class. Like an array, it lives in the
+            /// frame and travels as an address.
+            Class(ClassId),
+        }
+
+        impl Prim {
+            /// The type this converts to, and the type this keyword names.
+            pub fn ty(self) -> Ty {
+                match self {
+                    $(Prim::$variant => Ty::$variant,)*
+                }
+            }
+
+            /// The other direction. `None` for an enum, a class, an array or a
+            /// list — the types whose names are the program's rather than the
+            /// language's.
+            pub fn of_ty(ty: Ty) -> Option<Prim> {
+                match ty {
+                    $(Ty::$variant => Some(Prim::$variant),)*
+                    Ty::Enum(_) | Ty::Class(_) | Ty::Array(_) | Ty::List(_) => None,
+                }
+            }
+        }
+    };
 }
+
+primitives!(declare_ty);
 
 impl Ty {
     /// This type's name, given the enum names of the program it belongs to,
@@ -498,114 +513,6 @@ pub enum Shape {
     Array(i64, Span),
     /// `int[]` — a list, whose length is not known until the program runs.
     List,
-}
-
-/// **The types the language spells with a word of its own.**
-///
-/// One enum, because it is one fact asked in four places: which words may start
-/// a declaration, which words name a type after a `:` or a `->`, which words
-/// may be written where a value is expected — `int(c)` is the code point of a
-/// character, `char(n)` the character with that code point — and which names
-/// [`crate::sema`] resolves without looking anything up. A word that is not
-/// here is an identifier, and an identifier followed by `(` is a call.
-///
-/// That is what makes adding a type a row in [`Prim::ALL`] rather than a list
-/// to find five copies of. What a new type still costs is every place the
-/// compiler has a *decision* to make about it — how it is written out, what
-/// arithmetic it does, which instruction compares two of them — and those are
-/// not copies of each other.
-///
-/// The point of the conversion form is that **there are no implicit conversions
-/// at all**. Where another language would quietly widen a character into an
-/// integer, this one makes you say which of the two you meant; and because the
-/// answer is spelled out, `char(n)` may reject at run time an `n` that names no
-/// character rather than inventing one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Prim {
-    Int,
-    Float,
-    Char,
-    Str,
-    Bool,
-}
-
-impl Prim {
-    /// Every one of them, in the order a diagnostic reads them out.
-    ///
-    /// Rust cannot be asked what an enum's variants are, so this is written
-    /// down — and [`tests::every_prim_is_in_prim_all`] is what holds it to the
-    /// enum, the same bargain [`crate::vocabulary::Role::ALL`] makes.
-    pub const ALL: [Prim; 5] = [Prim::Int, Prim::Float, Prim::Char, Prim::Str, Prim::Bool];
-
-    /// The type this converts to.
-    pub fn ty(self) -> Ty {
-        match self {
-            Prim::Int => Ty::Int,
-            Prim::Float => Ty::Float,
-            Prim::Char => Ty::Char,
-            Prim::Str => Ty::Str,
-            Prim::Bool => Ty::Bool,
-        }
-    }
-
-    /// The keyword that writes it.
-    ///
-    /// **The one place the type vocabulary and the token vocabulary meet**, and
-    /// the reason no type is spelled out anywhere in this file:
-    /// [`TokenKind::text`] owns every spelling in the language, and everything
-    /// here borrows it. Two copies of the word `float` are two places to forget
-    /// one.
-    pub fn keyword(self) -> TokenKind {
-        match self {
-            Prim::Int => TokenKind::KwInt,
-            Prim::Float => TokenKind::KwFloat,
-            Prim::Char => TokenKind::KwChar,
-            Prim::Str => TokenKind::KwString,
-            Prim::Bool => TokenKind::KwBool,
-        }
-    }
-
-    /// How the conversion is spelled, which is also its target type's name.
-    ///
-    /// [`Ty::name`] needs a [`TypeTable`] because a `Ty` may be an enum or a
-    /// class, whose names are the program's. None of these five is, so this one
-    /// needs nothing handed in.
-    pub fn name(self) -> &'static str {
-        self.keyword().text()
-    }
-
-    /// The type a keyword names, or `None` when the token is not one of them.
-    ///
-    /// What the parser asks instead of listing the keywords — in four places,
-    /// which is how many copies of that list there used to be.
-    pub fn of_keyword(kind: &TokenKind) -> Option<Prim> {
-        Prim::ALL.into_iter().find(|prim| prim.keyword() == *kind)
-    }
-
-    /// The same question asked of a name rather than a token, which is what
-    /// resolving a written type comes down to once enums and classes have been
-    /// ruled out.
-    pub fn of_name(name: &str) -> Option<Prim> {
-        Prim::ALL.into_iter().find(|prim| prim.name() == name)
-    }
-
-    /// The other direction, for a [`Ty`] that is one of these. `None` for an
-    /// enum, a class, an array or a list — the types whose names are the
-    /// program's rather than the language's.
-    pub fn of_ty(ty: Ty) -> Option<Prim> {
-        Prim::ALL.into_iter().find(|prim| prim.ty() == ty)
-    }
-
-    /// Them all, quoted and joined, for the diagnostic that has to say what a
-    /// type may be. Generated rather than written out, so it cannot come to
-    /// list four of five.
-    pub fn all_quoted() -> String {
-        let names: Vec<String> = Prim::ALL.iter().map(|prim| format!("`{}`", prim.name())).collect();
-        match names.split_last() {
-            Some((last, rest)) => format!("{}, {last}", rest.join(", ")),
-            None => String::new(),
-        }
-    }
 }
 
 /// A function the compiler provides rather than the program declaring.
@@ -962,38 +869,38 @@ pub struct Block {
 /// A run of values has no letter because it has no rendering: printing a list
 /// would show where its elements are rather than what they are. See
 /// [`Ty::is_printable`].
+/// The specifiers are **not** a list of their own. There is one per type the
+/// language spells, and one more for an enum — so this carries a [`Prim`]
+/// rather than repeating its variants, and the letter, the type it accepts and
+/// the noun a diagnostic uses all come from there. Adding a type used to mean
+/// five more lines here; it now means none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Spec {
-    Int,
-    Float,
-    Char,
-    Str,
-    Bool,
-    /// Writes the *name* of the variant, which is the only rendering an enum
-    /// has — its value is an index and would say nothing.
+    /// `%d`, `%f`, `%c`, `%s`, `%b` — the letter is [`Prim::letter`]'s.
+    Prim(Prim),
+    /// `%e`, which writes the *name* of the variant: the only rendering an enum
+    /// has, since its value is an index and would say nothing.
     Enum,
 }
 
-/// Every specifier, in the order the "unknown specifier" note lists them.
-///
-/// A specifier that is not in here is a specifier that does not exist:
-/// [`Spec::from_letter`] reads this list, so a variant left out of it is
-/// unreachable from any source text.
-pub const SPECS: [Spec; 6] =
-    [Spec::Int, Spec::Float, Spec::Char, Spec::Str, Spec::Bool, Spec::Enum];
-
 impl Spec {
+    /// Every specifier, in the order the "unknown specifier" note lists them.
+    ///
+    /// A specifier that is not in here is a specifier that does not exist:
+    /// [`Spec::from_letter`] reads this, so a type that grew no letter is
+    /// unreachable from any source text — which is what
+    /// [`tests::every_printable_type_has_exactly_one_specifier`] refuses.
+    pub fn all() -> impl Iterator<Item = Spec> {
+        Prim::ALL.into_iter().map(Spec::Prim).chain([Spec::Enum])
+    }
+
     pub fn from_letter(letter: char) -> Option<Spec> {
-        SPECS.into_iter().find(|spec| spec.letter() == letter)
+        Spec::all().find(|spec| spec.letter() == letter)
     }
 
     pub fn letter(self) -> char {
         match self {
-            Spec::Int => 'd',
-            Spec::Float => 'f',
-            Spec::Char => 'c',
-            Spec::Str => 's',
-            Spec::Bool => 'b',
+            Spec::Prim(prim) => prim.letter(),
             Spec::Enum => 'e',
         }
     }
@@ -1004,26 +911,17 @@ impl Spec {
     /// argument, and a format string that had to name it would have to be
     /// rewritten every time the argument's type did.
     pub fn accepts(self, ty: Ty) -> bool {
-        matches!(
-            (self, ty),
-            (Spec::Int, Ty::Int)
-                | (Spec::Char, Ty::Char)
-                | (Spec::Str, Ty::Str)
-                | (Spec::Bool, Ty::Bool)
-                | (Spec::Enum, Ty::Enum(_))
-                | (Spec::Float, Ty::Float)
-        )
+        match self {
+            Spec::Prim(prim) => prim.ty() == ty,
+            Spec::Enum => matches!(ty, Ty::Enum(_)),
+        }
     }
 
     /// What it writes, named the way a diagnostic wants to say it.
-    pub fn writes(self) -> &'static str {
+    pub fn writes(self) -> String {
         match self {
-            Spec::Int => "an int",
-            Spec::Char => "a char",
-            Spec::Str => "a string",
-            Spec::Bool => "a bool",
-            Spec::Enum => "a variant of an enum",
-            Spec::Float => "a float",
+            Spec::Prim(prim) => prim.with_article(),
+            Spec::Enum => "a variant of an enum".to_string(),
         }
     }
 }
@@ -1712,6 +1610,7 @@ pub fn fits_in_an_int(value: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::token::TokenKind;
 
     /// The tree a source produces, as [`dump`] renders it.
     ///
@@ -1866,10 +1765,10 @@ mod tests {
         let mut printable: Vec<Ty> = Prim::ALL.iter().map(|prim| prim.ty()).collect();
         printable.push(Ty::Enum(EnumId(0)));
         for ty in printable.iter().copied() {
-            let accepting = SPECS.iter().filter(|spec| spec.accepts(ty)).count();
+            let accepting = Spec::all().filter(|spec| spec.accepts(ty)).count();
             assert_eq!(accepting, 1, "{ty:?} should have exactly one specifier");
         }
-        for spec in SPECS {
+        for spec in Spec::all() {
             assert!(
                 printable.iter().any(|&ty| spec.accepts(ty)),
                 "`%{}` accepts nothing printable",
@@ -1878,31 +1777,19 @@ mod tests {
         }
         // And nothing unprintable slips in under one.
         for ty in [Ty::List(ListId(0)), Ty::Array(ArrayId(0)), Ty::Class(ClassId(0))] {
-            assert!(!SPECS.iter().any(|spec| spec.accepts(ty)), "{ty:?} should have none");
+            assert!(!Spec::all().any(|spec| spec.accepts(ty)), "{ty:?} should have none");
         }
     }
 
     // -- the primitive table ------------------------------------------------
 
-    /// [`Prim::ALL`] really is all of them, the way [`crate::vocabulary::Role`]
-    /// makes the same promise: the match below is exhaustive, so adding a
-    /// variant stops this file compiling until the new one is named.
-    #[test]
-    fn every_prim_is_in_prim_all() {
-        for prim in Prim::ALL {
-            match prim {
-                Prim::Int | Prim::Float | Prim::Char | Prim::Str | Prim::Bool => {}
-            }
-        }
-        // `[Prim; N]` already refuses a variant left out. What it cannot catch
-        // is one listed twice, which a duplicate name would be.
-        let names: Vec<&str> = Prim::ALL.iter().map(|prim| prim.name()).collect();
-        for (at, name) in names.iter().enumerate() {
-            assert!(!names[at + 1..].contains(name), "two primitives are called `{name}`");
-        }
-    }
+    // `Prim::ALL` needs no test of its own any more: the enum and the array are
+    // generated from one row each, in `crate::prim`, so a variant cannot be
+    // missing from the list it was written with. That test used to exist, and
+    // deleting it is the point — a guard against a mistake the code can no
+    // longer make is a guard nobody should have to read.
 
-    /// The four ways of naming a primitive all answer each other.
+    /// The three ways of naming a primitive all answer each other.
     ///
     /// This is what lets the parser ask `Prim::of_keyword` instead of listing
     /// the keywords, `sema` ask `Prim::of_name` instead of listing the names,
@@ -1926,25 +1813,11 @@ mod tests {
         assert_eq!(Prim::of_keyword(&TokenKind::KwIf), None);
     }
 
-    /// The diagnostic's list is generated from the table, so it cannot come to
-    /// name four types out of five — which is what `sema`'s "the built-in types
-    /// are …" note had quietly done.
-    #[test]
-    fn the_list_a_diagnostic_reads_out_is_the_table() {
-        let quoted = Prim::all_quoted();
-        for prim in Prim::ALL {
-            assert!(quoted.contains(&format!("`{}`", prim.name())), "{quoted} omits {prim:?}");
-        }
-        assert_eq!(quoted.matches('`').count(), Prim::ALL.len() * 2);
-        // Read as prose rather than as a comma-separated dump.
-        assert!(quoted.ends_with(&format!(", `{}`", Prim::ALL[Prim::ALL.len() - 1].name())));
-    }
-
     /// A letter is one specifier or none: the two directions of the mapping
     /// agree, so a diagnostic cannot name a letter the splitter would refuse.
     #[test]
     fn a_letter_and_a_specifier_name_each_other() {
-        for spec in SPECS {
+        for spec in Spec::all() {
             assert_eq!(Spec::from_letter(spec.letter()), Some(spec));
         }
         for letter in ['%', 'q', 'x', ' ', 'D'] {

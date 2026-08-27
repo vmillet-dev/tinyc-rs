@@ -23,6 +23,7 @@ pub mod ir;
 pub mod lexer;
 pub mod opt;
 pub mod parser;
+pub mod prim;
 pub mod sema;
 pub mod token;
 pub mod vocabulary;

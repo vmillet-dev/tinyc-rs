@@ -5407,13 +5407,13 @@ print(len(n));")[0].message.contains("`len` needs"));
     #[test]
     fn a_specifier_accepts_its_own_type_and_no_other() {
         let value_of = [
-            (Spec::Int, "1"),
-            (Spec::Char, "'a'"),
-            (Spec::Str, "\"s\""),
-            (Spec::Bool, "true"),
+            (Spec::Prim(Prim::Int), "1"),
+            (Spec::Prim(Prim::Char), "'a'"),
+            (Spec::Prim(Prim::Str), "\"s\""),
+            (Spec::Prim(Prim::Bool), "true"),
             (Spec::Enum, "Colour::Red"),
         ];
-        for spec in crate::ast::SPECS {
+        for spec in crate::ast::Spec::all() {
             for (of, value) in value_of {
                 let src = format!(
                     "enum Colour {{ Red, Green }}\n\

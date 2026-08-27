@@ -1538,7 +1538,7 @@ fn split_format(lit: &StrLit) -> PResult<Vec<Piece>> {
 /// one cannot leave this note behind.
 fn spec_list() -> String {
     let each: Vec<String> =
-        ast::SPECS.iter().map(|s| format!("`%{}` for {}", s.letter(), s.writes())).collect();
+        ast::Spec::all().map(|s| format!("`%{}` for {}", s.letter(), s.writes())).collect();
     format!("the specifiers are {}, and `%%` for a percent sign", each.join(", "))
 }
 
@@ -2461,7 +2461,7 @@ mod tests {
     /// error rather than as a wrong tree.
     #[test]
     fn every_specifier_is_recognised() {
-        for spec in ast::SPECS {
+        for spec in ast::Spec::all() {
             let body = format!("println(\"%{}\", 1);", spec.letter());
             let parsed = parse_src(&format!("fn main() {{\n{body}\n}}\n"));
             assert!(parsed.is_ok(), "`%{}` did not parse", spec.letter());

@@ -24,10 +24,10 @@ role	operator	symbol
 
 # Every token spelled exactly one way.
 token	INT_KW	int	type
-token	STRING_KW	string	type
-token	CHAR_KW	char	type
-token	BOOL_KW	bool	type
 token	FLOAT_KW	float	type
+token	CHAR_KW	char	type
+token	STRING_KW	string	type
+token	BOOL_KW	bool	type
 token	IF_KW	if	control
 token	ELSE_KW	else	control
 token	WHILE_KW	while	control

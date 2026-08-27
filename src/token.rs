@@ -1,6 +1,7 @@
 //! The token vocabulary produced by the lexer.
 
 use crate::diag::Span;
+use crate::prim::Prim;
 
 /// The characters of a string literal, and where each one was written.
 ///
@@ -82,12 +83,20 @@ pub enum TokenKind {
     Bool(bool),
     Ident(String),
 
+    /// A type keyword — `int`, `float`, `char`, `string`, `bool`.
+    ///
+    /// One variant carrying which, rather than one variant each, because
+    /// nothing that reads a token wants to know *which* type keyword it has
+    /// without also wanting the type: the parser asks whether a declaration or
+    /// a conversion starts here, and the answer is a [`Prim`] either way. Five
+    /// variants meant five arms in every one of those questions, and a sixth
+    /// type meant finding all of them.
+    ///
+    /// It also means a type keyword cannot be added here at all: the list is
+    /// [`primitives!`](crate::primitives)'s.
+    Kw(Prim),
+
     // Keywords.
-    KwInt,
-    KwString,
-    KwChar,
-    KwBool,
-    KwFloat,
     KwPrint,
     KwPrintln,
     KwIf,
@@ -172,12 +181,8 @@ impl TokenKind {
     /// keeping a copy.
     pub fn text(&self) -> &'static str {
         match self {
-            // Keywords.
-            TokenKind::KwInt => "int",
-            TokenKind::KwString => "string",
-            TokenKind::KwChar => "char",
-            TokenKind::KwBool => "bool",
-            TokenKind::KwFloat => "float",
+            // Keywords. A type keyword is spelled by the table it came from.
+            TokenKind::Kw(prim) => prim.name(),
             TokenKind::KwPrint => "print",
             TokenKind::KwPrintln => "println",
             TokenKind::KwIf => "if",
@@ -236,6 +241,26 @@ impl TokenKind {
             TokenKind::Float(_) => "float literal",
             TokenKind::Ident(_) => "identifier",
             TokenKind::Eof => "end of file",
+        }
+    }
+}
+
+impl Prim {
+    /// The keyword that writes it.
+    ///
+    /// There is nothing to look up: a type keyword *is* a `Prim`, which is
+    /// what [`TokenKind::Kw`] carries. This used to be five arms, and the
+    /// sixth type would have needed a sixth.
+    pub fn keyword(self) -> TokenKind {
+        TokenKind::Kw(self)
+    }
+
+    /// The type a token names, or `None` when it names none — which is what
+    /// the parser asks instead of listing the keywords.
+    pub fn of_keyword(kind: &TokenKind) -> Option<Prim> {
+        match kind {
+            TokenKind::Kw(prim) => Some(*prim),
+            _ => None,
         }
     }
 }

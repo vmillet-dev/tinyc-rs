@@ -437,6 +437,7 @@ fn is_ident_continue(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prim::Prim;
 
     fn kinds(src: &str) -> Vec<TokenKind> {
         lex(src).unwrap().into_iter().map(|t| t.kind).collect()
@@ -469,7 +470,7 @@ mod tests {
         assert_eq!(
             kinds("int x = 10;"),
             vec![
-                TokenKind::KwInt,
+                TokenKind::Kw(Prim::Int),
                 TokenKind::Ident("x".into()),
                 TokenKind::Eq,
                 TokenKind::Int(10),
@@ -484,7 +485,7 @@ mod tests {
         assert_eq!(
             kinds("float x = 4.5;"),
             vec![
-                TokenKind::KwFloat,
+                TokenKind::Kw(Prim::Float),
                 TokenKind::Ident("x".into()),
                 TokenKind::Eq,
                 TokenKind::Float(4.5),
@@ -551,7 +552,7 @@ mod tests {
         assert_eq!(
             kinds("bool b = true;"),
             vec![
-                TokenKind::KwBool,
+                TokenKind::Kw(Prim::Bool),
                 TokenKind::Ident("b".into()),
                 TokenKind::Eq,
                 TokenKind::Bool(true),
@@ -739,14 +740,14 @@ mod tests {
                 TokenKind::KwFn,
                 TokenKind::Ident("add".into()),
                 TokenKind::LParen,
-                TokenKind::KwInt,
+                TokenKind::Kw(Prim::Int),
                 TokenKind::Ident("a".into()),
                 TokenKind::Comma,
-                TokenKind::KwInt,
+                TokenKind::Kw(Prim::Int),
                 TokenKind::Ident("b".into()),
                 TokenKind::RParen,
                 TokenKind::Arrow,
-                TokenKind::KwInt,
+                TokenKind::Kw(Prim::Int),
                 TokenKind::LBrace,
                 TokenKind::KwReturn,
                 TokenKind::Ident("a".into()),
@@ -789,10 +790,10 @@ mod tests {
         assert_eq!(
             kinds("int string bool float print if else while for fn return break continue enum match"),
             vec![
-                TokenKind::KwInt,
-                TokenKind::KwString,
-                TokenKind::KwBool,
-                TokenKind::KwFloat,
+                TokenKind::Kw(Prim::Int),
+                TokenKind::Kw(Prim::Str),
+                TokenKind::Kw(Prim::Bool),
+                TokenKind::Kw(Prim::Float),
                 TokenKind::KwPrint,
                 TokenKind::KwIf,
                 TokenKind::KwElse,
@@ -954,7 +955,7 @@ mod tests {
     fn char_is_a_keyword() {
         assert_eq!(
             kinds("char c"),
-            vec![TokenKind::KwChar, TokenKind::Ident("c".to_string()), TokenKind::Eof]
+            vec![TokenKind::Kw(Prim::Char), TokenKind::Ident("c".to_string()), TokenKind::Eof]
         );
     }
 
@@ -1171,7 +1172,7 @@ mod tests {
         // lexer that did not skip it would fail on half the world's files.
         assert_eq!(
             kinds("int\r\nx\r\n"),
-            vec![TokenKind::KwInt, TokenKind::Ident("x".into()), TokenKind::Eof]
+            vec![TokenKind::Kw(Prim::Int), TokenKind::Ident("x".into()), TokenKind::Eof]
         );
         // Including at the end of a comment, which stops at the newline.
         assert_eq!(kinds("// hi\r\n1"), vec![TokenKind::Int(1), TokenKind::Eof]);
