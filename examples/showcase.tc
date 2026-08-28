@@ -1,0 +1,163 @@
+// A weather log, in one program: every feature TinyC has.
+
+// An enum is a type the compiler can count, so a `match` on one is checked.
+enum Level { Info, Warn, Error }
+
+// A class is data with behaviour. `self` is the object, borrowed from the caller.
+class Reading {
+  string place;
+  int degrees;
+
+  fn label(self) -> string {
+    return self.place + " " + string(self.degrees);   // nothing converts on its own
+  }
+  fn level(self) -> Level {
+    return Level::Info;
+  }
+}
+
+// A subclass may stand for its base. An override keeps its base's vtable slot,
+// so a call through a `Reading` lands here.
+class Frost : Reading {
+  int wind;
+  fn level(self) -> Level {
+    if (self.degrees < -10 || self.wind > 60) {   // `||` short-circuits
+      return Level::Error;
+    }
+    return Level::Warn;
+  }
+}
+
+// Composition: what a class holds, it holds *inside* — a whole array and a
+// whole object, never an address. `peak` reserves the room the biggest class in
+// the hierarchy needs, so it keeps answering as whatever was put in it.
+class Station {
+  string name;
+  int[3] samples;
+  Reading peak;
+
+  fn total(self) -> int {
+    int sum = 0;
+    for (int i = 0; i < len(self.samples); i = i + 1) {
+      sum = sum + self.samples[i];
+    }
+    return sum;
+  }
+}
+
+// A match is an expression, and it must cover every variant.
+fn tag(Level l) -> string {
+  return match (l) {
+    Level::Info => "ok",
+    Level::Warn => "watch",
+    Level::Error => "alert",
+  };
+}
+
+// Signatures are collected before any body is checked, so `fib` sees itself.
+fn fib(int n) -> int {
+  if (n < 2) {
+    return n;
+  }
+  return fib(n - 1) + fib(n - 2);
+}
+
+// A string is a run of *characters*, not bytes: `len` counts characters and
+// `text[i]` is one. A char list grows in place, then becomes a string once.
+fn shout(string text) -> string {
+  char[] out = [];
+  for (int i = 0; i < len(text); i = i + 1) {
+    char c = text[i];
+    if (c >= 'a' && c <= 'z') {
+      c = char(int(c) - 32);
+    }
+    push(out, c);
+  }
+  return string(out);
+}
+
+// A list's length is a fact about the data rather than the program, so it grows
+// and may be returned. `int[3]` and `int[]` are deliberately different types.
+fn readings() -> Reading[] {
+  Reading[] rs = [];
+  push(rs, Reading { place: "Nice", degrees: 21 });
+  push(rs, Frost { place: "Oslo", degrees: -12, wind: 40 });
+  push(rs, Frost { place: "Bergen", degrees: -2, wind: 70 });
+  return rs;
+}
+
+// No return type means no value: this can only be called as a statement.
+fn banner(string title) {
+  println("== " + shout(title) + " ==");
+}
+
+fn main() {
+  banner("weather log");
+
+  // Dispatch decided by the object, over a list nobody counted in advance.
+  Reading[] rs = readings();
+  int alerts = 0;
+  for (int i = 0; i < len(rs); i = i + 1) {
+    Level l = rs[i].level();
+    println(rs[i].label() + " -> " + tag(l));
+    if (l == Level::Error) {
+      alerts = alerts + 1;
+    }
+  }
+  println("alerts: " + string(alerts));
+
+  // An object literal, a field written through, and a method on a field.
+  Station s = Station {
+    name: "Alpha",
+    samples: [3, 1, 4],
+    peak: Frost { place: "Oslo", degrees: -12, wind: 40 }
+  };
+  println(s.name + ": " + string(s.total()));   // Alpha: 8
+  s.samples[0] = 30;
+  println(s.name + ": " + string(s.total()));   // Alpha: 35
+  println(tag(s.peak.level()));                 // alert — the vtable travelled with the copy
+
+  // if / else if / else, and a `!` that inverts a comparison rather than a value.
+  if (alerts > 2) {
+    println("storm");
+  } else if (!(alerts == 0)) {
+    println("watch");
+  } else {
+    println("clear");
+  }
+
+  // while, continue and break; `%` takes its sign from the dividend.
+  int n = 0;
+  while (n < 10) {
+    n = n + 1;
+    if (n % 2 == 0) {
+      continue;
+    }
+    if (n > 5) {
+      break;
+    }
+    println(n);            // 1, 3, 5
+  }
+
+  // Recursion, and arithmetic that stops the program rather than wrapping.
+  println(fib(10));        // 55
+  println(6 * 7 % 10);     // 2
+
+  // A match written as a statement runs its arms for effect.
+  match (rs[2].level()) {
+    Level::Info => { println("quiet"); }
+    Level::Warn => { println("cold"); }
+    Level::Error => { println("freezing"); }
+  }
+
+  // Input, when there is any: `eof()` looks without consuming, `read_line()`
+  // takes one line, `is_int` says whether it spells a number.
+  int extra = 0;
+  while (!eof()) {
+    string line = read_line();
+    if (is_int(line)) {
+      extra = extra + int(line);
+    }
+  }
+  println("piped in: " + string(extra));
+}

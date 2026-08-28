@@ -312,7 +312,7 @@ pub fn examples() -> PathBuf {
 /// live beside this one: it is a scratch file for trying things out by hand.
 /// Here it is included, because what it prints is checked against a file that
 /// is edited with it.
-pub const EXAMPLES: [&str; 18] = [
+pub const EXAMPLES: [&str; 19] = [
     "hello.tc",
     "format.tc",
     "arith.tc",
@@ -331,6 +331,8 @@ pub const EXAMPLES: [&str; 18] = [
     "lists.tc",
     "tree.tc",
     "interactive.tc",
+    // Every feature at once, which is also what the README points a newcomer at.
+    "showcase.tc",
 ];
 
 /// Trailing whitespace and line endings are the shell's business, not the

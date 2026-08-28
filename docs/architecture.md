@@ -2017,12 +2017,12 @@ int a = 6;  int b = 7;  int c = 2;  println(a + b * c);
 
 ```text
 --no-optimise            optimised
-  %a = const 6             print int 20
-  %b = const 7             print text0 "\n"
-  %c = const 2             return
+  %a = const 6             println int 20
+  %b = const 7             return
+  %c = const 2
   %t3 = mul %b, %c
   %t4 = add %a, %t3
-  print int %t4
+  println int %t4
 ```
 
 The lattice is three deep — unreached, one known value, no longer one value — so
