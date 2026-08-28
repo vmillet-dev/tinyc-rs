@@ -229,9 +229,9 @@ impl Lowering<'_> {
         };
 
         let join = self.new_block(BlockKind::Join);
-        self.finish(entry, Terminator::Branch { cond, then_blk, else_blk });
-        self.finish(rhs_exit, Terminator::Jump(join));
-        self.finish(short, Terminator::Jump(join));
+        self.finish(entry, Terminator::branch(cond, then_blk, else_blk));
+        self.finish(rhs_exit, Terminator::jump(join));
+        self.finish(short, Terminator::jump(join));
         self.switch_to(join);
     }
 

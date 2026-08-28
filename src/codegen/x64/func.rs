@@ -316,22 +316,22 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         let next = index + 1;
         match &block.term {
             Terminator::Jump(target) => {
-                if target.0 as usize != next {
-                    let label = self.function.block(*target).label();
+                if target.block.0 as usize != next {
+                    let label = self.function.block(target.block).label();
                     self.asm.comment(&format!("jump {label}"));
                     self.asm.asm(&format!("jmp  .{label}"));
                 }
             }
             Terminator::Branch { cond, then_blk, else_blk } => {
-                let then_label = self.function.block(*then_blk).label();
-                let else_label = self.function.block(*else_blk).label();
+                let then_label = self.function.block(then_blk.block).label();
+                let else_label = self.function.block(else_blk.block).label();
 
                 // A folded condition settles the branch outright.
                 if let Value::Const(c) = cond {
                     let (taken, label) =
                         if *c != 0 { (then_blk, &then_label) } else { (else_blk, &else_label) };
                     self.asm.comment(&format!("branch always taken to {label}"));
-                    if taken.0 as usize != next {
+                    if taken.block.0 as usize != next {
                         self.asm.asm(&format!("jmp  .{label}"));
                     }
                     return;
@@ -355,7 +355,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                         self.asm.asm(&format!("jz   .{else_label}"));
                     }
                 }
-                if then_blk.0 as usize != next {
+                if then_blk.block.0 as usize != next {
                     self.asm.asm(&format!("jmp  .{then_label}"));
                 }
             }

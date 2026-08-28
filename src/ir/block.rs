@@ -1,36 +1,113 @@
-//! Basic blocks: how one ends, what it is for, and dropping the ones nothing reaches.
+//! Basic blocks: how one ends, where it sends control, and dropping the ones
+//! nothing reaches.
 
-use super::{BlockId, Instr, Value, VReg};
+use super::{BlockId, Instr, VReg, Value};
+
+/// Where a terminator sends control, and what it hands the block on arrival.
+///
+/// `args` is one value per [`Block::params`] of `block`, and is empty
+/// everywhere outside SSA form — which is to say everywhere except between
+/// [`crate::ir::ssa::construct`] and [`crate::ir::ssa::destruct`]. Carrying the
+/// values on the *edge* rather than in a phi node at the top of the target is
+/// what keeps them in step with the graph: a pass that redirects a jump moves
+/// its arguments with it, and one that drops a block drops its arguments with
+/// it, neither of which is something to remember to do.
+#[derive(Clone, Debug)]
+pub struct Target {
+    pub block: BlockId,
+    pub args: Vec<Value>,
+}
+
+impl Target {
+    /// A jump that hands the block nothing, which is every jump outside SSA.
+    pub fn to(block: BlockId) -> Target {
+        Target { block, args: Vec::new() }
+    }
+}
+
+impl From<BlockId> for Target {
+    fn from(block: BlockId) -> Target {
+        Target::to(block)
+    }
+}
 
 /// How a basic block ends. Every block has exactly one.
 #[derive(Clone, Debug)]
 pub enum Terminator {
-    Jump(BlockId),
+    Jump(Target),
     /// Continue at `then_blk` when `cond` is non-zero, `else_blk` otherwise.
-    Branch { cond: Value, then_blk: BlockId, else_blk: BlockId },
+    Branch { cond: Value, then_blk: Target, else_blk: Target },
     /// Leave the function, with a value for a function that returns one.
     Return(Option<Value>),
 }
 
 impl Terminator {
-    pub fn successors(&self) -> Vec<BlockId> {
-        match self {
-            Terminator::Jump(target) => vec![*target],
-            Terminator::Branch { then_blk, else_blk, .. } => vec![*then_blk, *else_blk],
-            Terminator::Return(_) => Vec::new(),
+    /// A jump carrying no arguments.
+    pub fn jump(block: BlockId) -> Terminator {
+        Terminator::Jump(Target::to(block))
+    }
+
+    /// A two-way branch carrying no arguments on either edge.
+    pub fn branch(cond: Value, then_blk: BlockId, else_blk: BlockId) -> Terminator {
+        Terminator::Branch {
+            cond,
+            then_blk: Target::to(then_blk),
+            else_blk: Target::to(else_blk),
         }
     }
 
-    /// Show `visit` every virtual register the terminator reads.
+    pub fn successors(&self) -> Vec<BlockId> {
+        self.targets().map(|target| target.block).collect()
+    }
+
+    pub fn targets(&self) -> impl Iterator<Item = &Target> {
+        let (a, b) = match self {
+            Terminator::Jump(target) => (Some(target), None),
+            Terminator::Branch { then_blk, else_blk, .. } => (Some(then_blk), Some(else_blk)),
+            Terminator::Return(_) => (None, None),
+        };
+        a.into_iter().chain(b)
+    }
+
+    pub fn targets_mut(&mut self) -> impl Iterator<Item = &mut Target> {
+        let (a, b) = match self {
+            Terminator::Jump(target) => (Some(target), None),
+            Terminator::Branch { then_blk, else_blk, .. } => (Some(then_blk), Some(else_blk)),
+            Terminator::Return(_) => (None, None),
+        };
+        a.into_iter().chain(b)
+    }
+
+    /// Show `visit` every virtual register the terminator reads, the arguments
+    /// it hands its successors included.
     ///
     /// A callback rather than an iterator or a `Vec`: liveness asks this of
-    /// every terminator on every round of its fixpoint, and there is nothing to
-    /// allocate for at most one register.
+    /// every terminator on every round of its fixpoint.
     pub fn uses(&self, mut visit: impl FnMut(VReg)) {
-        if let Terminator::Branch { cond: Value::Reg(reg), .. }
-        | Terminator::Return(Some(Value::Reg(reg))) = self
-        {
-            visit(*reg);
+        self.values(|value| {
+            if let Value::Reg(reg) = value {
+                visit(*reg);
+            }
+        });
+    }
+
+    /// Show `visit` every operand, so that it may be read.
+    pub fn values(&self, mut visit: impl FnMut(&Value)) {
+        if let Terminator::Branch { cond, .. } | Terminator::Return(Some(cond)) = self {
+            visit(cond);
+        }
+        for target in self.targets() {
+            target.args.iter().for_each(&mut visit);
+        }
+    }
+
+    /// Show `visit` every operand, so that it may be replaced.
+    pub fn values_mut(&mut self, mut visit: impl FnMut(&mut Value)) {
+        if let Terminator::Branch { cond, .. } | Terminator::Return(Some(cond)) = self {
+            visit(cond);
+        }
+        for target in self.targets_mut() {
+            target.args.iter_mut().for_each(&mut visit);
         }
     }
 }
@@ -95,6 +172,9 @@ impl BlockKind {
 #[derive(Clone, Debug)]
 pub struct Block {
     pub kind: BlockKind,
+    /// Values this block is handed on arrival, one per argument every target
+    /// naming it carries. Empty outside SSA form.
+    pub params: Vec<VReg>,
     /// Position in [`Function::blocks`], repeated here so a block can name
     /// itself.
     pub index: u32,
@@ -150,15 +230,9 @@ pub fn prune_unreachable(blocks: Vec<Block>) -> Vec<Block> {
             // away, and the kind still says where the block came from.
             block.index = index as u32;
 
-            block.term = match block.term {
-                Terminator::Jump(target) => Terminator::Jump(renumber[target.0 as usize]),
-                Terminator::Branch { cond, then_blk, else_blk } => Terminator::Branch {
-                    cond,
-                    then_blk: renumber[then_blk.0 as usize],
-                    else_blk: renumber[else_blk.0 as usize],
-                },
-                term @ Terminator::Return(_) => term,
-            };
+            for target in block.term.targets_mut() {
+                target.block = renumber[target.block.0 as usize];
+            }
             block
         })
         .collect()

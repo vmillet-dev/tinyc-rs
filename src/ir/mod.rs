@@ -34,7 +34,7 @@ mod value;
 #[cfg(test)]
 mod tests;
 
-pub use block::{Block, BlockKind, Terminator, prune_unreachable};
+pub use block::{Block, BlockKind, Target, Terminator, prune_unreachable};
 pub use fold::{fold_bin, fold_cmp};
 pub(crate) use fold::{fold_logic, negate_const, zero_to_subtract_from};
 pub use func::{Function, Program};

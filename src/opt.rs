@@ -246,8 +246,9 @@ fn rewrite(function: &mut Function, entries: &[Facts]) -> bool {
             changed = true;
         }
         // A condition settled here is not a choice any more.
-        if let Terminator::Branch { cond: Value::Const(c), then_blk, else_blk } = block.term {
-            block.term = Terminator::Jump(if c != 0 { then_blk } else { else_blk });
+        if let Terminator::Branch { cond: Value::Const(c), then_blk, else_blk } = &block.term {
+            let taken = if *c != 0 { then_blk.clone() } else { else_blk.clone() };
+            block.term = Terminator::Jump(taken);
             changed = true;
         }
     }

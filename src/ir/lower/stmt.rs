@@ -290,16 +290,16 @@ impl Lowering<'_> {
         // A single-variant enum has nothing to test, so control simply runs
         // into the one arm.
         if tests.is_empty() {
-            self.finish(before, Terminator::Jump(entries[0]));
+            self.finish(before, Terminator::jump(entries[0]));
         }
         for (index, (test, cond, arm)) in tests.into_iter().enumerate() {
             self.finish(
                 test,
-                Terminator::Branch { cond, then_blk: arm, else_blk: entries[index + 1] },
+                Terminator::branch(cond, arm, entries[index + 1]),
             );
         }
         for exit in exits {
-            self.finish(exit, Terminator::Jump(join));
+            self.finish(exit, Terminator::jump(join));
         }
         self.switch_to(join);
     }
@@ -529,16 +529,12 @@ impl Lowering<'_> {
 
         self.finish(
             entry,
-            Terminator::Branch {
-                cond,
-                then_blk: then_id,
-                else_blk: alternative.map_or(join, |(id, _)| id),
-            },
+            Terminator::branch(cond, then_id, alternative.map_or(join, |(id, _)| id)),
         );
 
-        self.finish(then_exit, Terminator::Jump(join));
+        self.finish(then_exit, Terminator::jump(join));
         if let Some((_, exit)) = alternative {
-            self.finish(exit, Terminator::Jump(join));
+            self.finish(exit, Terminator::jump(join));
         }
 
         self.switch_to(join);
@@ -576,7 +572,7 @@ impl Lowering<'_> {
                 let body_exit = self.current;
                 let latch = self.new_block(BlockKind::Step);
                 self.stmt(step);
-                self.finish(body_exit, Terminator::Jump(latch));
+                self.finish(body_exit, Terminator::jump(latch));
                 latch
             }
             Some(step) => {
@@ -591,16 +587,16 @@ impl Lowering<'_> {
 
         let after = self.new_block(BlockKind::Done);
 
-        self.finish(before, Terminator::Jump(header));
-        self.finish(header_exit, Terminator::Branch { cond, then_blk: body_id, else_blk: after });
+        self.finish(before, Terminator::jump(header));
+        self.finish(header_exit, Terminator::branch(cond, body_id, after));
         // The back edge: this is what makes liveness need a fixpoint.
-        self.finish(latch_exit, Terminator::Jump(header));
+        self.finish(latch_exit, Terminator::jump(header));
 
         for block in frame.continues {
-            self.finish(block, Terminator::Jump(latch));
+            self.finish(block, Terminator::jump(latch));
         }
         for block in frame.breaks {
-            self.finish(block, Terminator::Jump(after));
+            self.finish(block, Terminator::jump(after));
         }
 
         self.switch_to(after);

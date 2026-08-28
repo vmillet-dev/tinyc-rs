@@ -367,6 +367,7 @@ impl Lowering<'_> {
             .enumerate()
             .map(|(index, block)| Block {
                 kind: block.kind,
+                params: Vec::new(),
                 index: index as u32,
                 instrs: block.instrs,
                 term: block.term.unwrap_or_else(|| {

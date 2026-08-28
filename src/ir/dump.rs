@@ -31,13 +31,13 @@ impl Program {
 
                 let text = match &block.term {
                     Terminator::Jump(target) => {
-                        format!("jump {}", function.block(*target).label())
+                        format!("jump {}", function.block(target.block).label())
                     }
                     Terminator::Branch { cond, then_blk, else_blk } => format!(
                         "branch {} ? {} : {}",
                         function.value_name(cond),
-                        function.block(*then_blk).label(),
-                        function.block(*else_blk).label()
+                        function.block(then_blk.block).label(),
+                        function.block(else_blk.block).label()
                     ),
                     Terminator::Return(None) => "return".to_string(),
                     Terminator::Return(Some(value)) => {

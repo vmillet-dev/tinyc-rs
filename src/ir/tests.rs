@@ -71,8 +71,8 @@ fn an_if_produces_a_diamond() {
     let main = &ir.functions[0];
     assert_eq!(labels(main), vec!["entry0", "then1", "else2", "join3"]);
     assert!(matches!(main.blocks[0].term, Terminator::Branch { .. }));
-    assert!(matches!(main.blocks[1].term, Terminator::Jump(BlockId(3))));
-    assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(3))));
+    assert!(matches!(main.blocks[1].term, Terminator::Jump(Target { block: BlockId(3), .. })));
+    assert!(matches!(main.blocks[2].term, Terminator::Jump(Target { block: BlockId(3), .. })));
 }
 
 #[test]
@@ -80,11 +80,11 @@ fn an_if_without_else_branches_straight_to_the_join() {
     let ir = lower_main("int n = 0;\nif (n < 1) {\n  n = 2;\n}\nprint(n);");
     let main = &ir.functions[0];
     assert_eq!(labels(main), vec!["entry0", "then1", "join2"]);
-    match main.blocks[0].term {
+    match &main.blocks[0].term {
         Terminator::Branch { then_blk, else_blk, .. } => {
-            assert_eq!((then_blk, else_blk), (BlockId(1), BlockId(2)));
+            assert_eq!((then_blk.block, else_blk.block), (BlockId(1), BlockId(2)));
         }
-        ref other => panic!("expected a branch, got {other:?}"),
+        other => panic!("expected a branch, got {other:?}"),
     }
 }
 
@@ -94,8 +94,8 @@ fn a_while_loop_closes_a_back_edge() {
     let main = &ir.functions[0];
     assert_eq!(labels(main), vec!["entry0", "loop1", "body2", "done3"]);
     // The body jumps back to the header, which re-tests the condition.
-    assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(1))));
-    assert!(matches!(main.blocks[0].term, Terminator::Jump(BlockId(1))));
+    assert!(matches!(main.blocks[2].term, Terminator::Jump(Target { block: BlockId(1), .. })));
+    assert!(matches!(main.blocks[0].term, Terminator::Jump(Target { block: BlockId(1), .. })));
 }
 
 #[test]
@@ -554,7 +554,7 @@ fn each_match_arm_reaches_the_same_join() {
     let join = BlockId(5);
     for arm in [1usize, 3, 4] {
         assert!(
-            matches!(main.blocks[arm].term, Terminator::Jump(target) if target == join),
+            matches!(&main.blocks[arm].term, Terminator::Jump(target) if target.block == join),
             "arm {arm}: {}",
             ir.dump()
         );
@@ -611,7 +611,7 @@ fn a_loop_jump_inside_an_arm_belongs_to_the_loop() {
         .position(|b| b.kind == BlockKind::Done)
         .expect("the loop has an exit");
     assert!(
-        main.blocks.iter().any(|b| matches!(b.term, Terminator::Jump(t) if t.0 as usize == done)),
+        main.blocks.iter().any(|b| matches!(&b.term, Terminator::Jump(t) if t.block.0 as usize == done)),
         "{}",
         ir.dump()
     );
@@ -790,11 +790,11 @@ fn or_lays_its_short_circuit_out_first() {
     let main = &ir.functions[0];
     assert_eq!(labels(main), vec!["entry0", "short1", "rhs2", "join3"]);
     assert!(matches!(main.blocks[1].instrs[0], Instr::Const { val: 1, .. }));
-    match main.blocks[0].term {
+    match &main.blocks[0].term {
         Terminator::Branch { then_blk, else_blk, .. } => {
-            assert_eq!((then_blk, else_blk), (BlockId(1), BlockId(2)));
+            assert_eq!((then_blk.block, else_blk.block), (BlockId(1), BlockId(2)));
         }
-        ref other => panic!("expected a branch, got {other:?}"),
+        other => panic!("expected a branch, got {other:?}"),
     }
 }
 
@@ -849,7 +849,7 @@ fn a_logical_operator_may_be_a_condition_of_its_own() {
     assert_eq!(labels(main), vec!["entry0", "loop1", "rhs2", "short3", "join4", "body5", "done6"]);
     // The loop is still a loop: the body jumps back to the header, not to
     // the join the condition finished in.
-    assert!(matches!(main.blocks[5].term, Terminator::Jump(BlockId(1))));
+    assert!(matches!(main.blocks[5].term, Terminator::Jump(Target { block: BlockId(1), .. })));
 }
 
 // -- break and continue ------------------------------------------------
@@ -861,7 +861,7 @@ fn break_jumps_to_the_block_after_the_loop() {
     // The block the `break` left was terminated by the loop on its way out,
     // and the unreachable block opened after it is gone.
     assert_eq!(labels(main), vec!["entry0", "loop1", "body2", "done3"]);
-    assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(3))));
+    assert!(matches!(main.blocks[2].term, Terminator::Jump(Target { block: BlockId(3), .. })));
 }
 
 #[test]
@@ -871,7 +871,7 @@ fn continue_in_a_while_jumps_back_to_the_header() {
     // A `while` has no step, so its header *is* its latch and no extra
     // block appears.
     assert_eq!(labels(main), vec!["entry0", "loop1", "body2", "done3"]);
-    assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(1))));
+    assert!(matches!(main.blocks[2].term, Terminator::Jump(Target { block: BlockId(1), .. })));
 }
 
 #[test]
@@ -882,8 +882,8 @@ fn continue_in_a_for_runs_the_step_on_its_way_past() {
     let main = &ir.functions[0];
     assert_eq!(labels(main), vec!["entry0", "loop1", "body2", "step3", "done4"]);
     assert!(matches!(main.blocks[3].instrs[0], Instr::Bin { op: BinOp::Add, .. }));
-    assert!(matches!(main.blocks[2].term, Terminator::Jump(BlockId(3))));
-    assert!(matches!(main.blocks[3].term, Terminator::Jump(BlockId(1))));
+    assert!(matches!(main.blocks[2].term, Terminator::Jump(Target { block: BlockId(3), .. })));
+    assert!(matches!(main.blocks[3].term, Terminator::Jump(Target { block: BlockId(1), .. })));
 }
 
 #[test]
