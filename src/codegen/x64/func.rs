@@ -160,7 +160,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
     /// is what works the limit out, and its own frame is taken before the
     /// answer exists. That is not a hole: `main` is entered exactly once, so
     /// the depth this guards against is the one thing it cannot reach. What
-    /// bounds *its* frame is [`crate::ir::MAX_FRAME_BYTES`], at compile time.
+    /// bounds *its* frame is the frame limit [`crate::target::Layout`] sets, at compile time.
     ///
     /// Checking in every other function rather than only in the ones that
     /// recurse is what keeps [`STACK_MARGIN`] small. What runs unchecked below

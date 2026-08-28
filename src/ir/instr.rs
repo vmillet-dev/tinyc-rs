@@ -49,10 +49,10 @@ pub enum Instr {
     /// indexing one always costs the check.
     ///
     /// `scale` is a word for everything that fits in a register,
-    /// [`CHAR_BYTES`] for the characters of a string, and the object.s room for
+    /// [`CHAR_BYTES`] for the characters of a string, and the object's room for
     /// an array or a list of them — so it is **any** number of bytes, not one
-    /// of a machine.s handful. Turning an arbitrary scale into an address is
-    /// the backend.s problem: one that has a scaled addressing mode uses it
+    /// of a machine's handful. Turning an arbitrary scale into an address is
+    /// the backend's problem: one that has a scaled addressing mode uses it
     /// where the number fits and multiplies where it does not, and one that has
     /// none multiplies every time.
     Elem { dst: VReg, base: Value, index: Value, len: Value, scale: u32 },

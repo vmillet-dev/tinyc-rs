@@ -18,12 +18,10 @@
 //! here on, so unless `%b` is wanted again later there is no moment where the
 //! two have to be different registers.
 //!
-//! This is where the cost of SSA is paid back. Without it, going into SSA and
-//! out again would leave a function with more `mov`s than it started with, and
-//! everything the form bought in the middle would be spent at the exit.
-//!
-//! It is not only for the copies destruction made. A copy lowering emitted —
-//! `int b = a;` — goes the same way, which the compiler never used to do.
+//! This is where the cost of SSA is paid back: without it, going in and out
+//! again would leave a function with more `mov`s than it started with. It is
+//! not only for the copies destruction made — a copy lowering emitted, `int b =
+//! a;`, goes the same way.
 
 use std::collections::HashSet;
 

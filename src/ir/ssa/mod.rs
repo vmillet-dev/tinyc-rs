@@ -2,10 +2,8 @@
 //!
 //! Lowering gives a variable **one** virtual register for its whole life and
 //! writes it as often as the program assigns it. That is the smallest thing
-//! that works, and it is what makes every interesting question about a value
-//! unanswerable: `%n` at one point and `%n` at another need not hold the same
-//! thing, so nothing can be said about `%n` — only about `%n` *here*, which
-//! takes one dataflow analysis to find out and another to use.
+//! that works, and it makes every question about a value unanswerable: `%n`
+//! here and `%n` there need not hold the same thing.
 //!
 //! [`construct`] rewrites the function so that **every virtual register is
 //! written exactly once**. Where two definitions meet, the block they meet in
@@ -25,11 +23,8 @@
 //!   print int %n                       print int %n.2
 //! ```
 //!
-//! Everything after it gets easier. A register now *has* a value rather than
-//! holding a different one at each point, so constant propagation is a walk
-//! over definitions rather than a fixpoint over blocks; a copy is removable by
-//! substituting its source everywhere; and a write nothing reads is dead on its
-//! own account rather than needing a backward liveness pass to prove it.
+//! A register now *has* a value rather than holding a different one at each
+//! point, which is what every pass in [`crate::opt`] is written around.
 //!
 //! [`destruct`] undoes it before the register allocator ever sees the function,
 //! by turning each edge's arguments into copies at the end of the block the

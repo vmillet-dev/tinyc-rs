@@ -620,8 +620,9 @@ fn a_loop_jump_inside_an_arm_belongs_to_the_loop() {
 
 #[test]
 fn every_value_arm_writes_the_same_register() {
-    // The trick `&&` already plays, with more arms: a non-SSA IR lets the
-    // join read one register that several blocks wrote.
+    // The trick `&&` already plays, with more arms: lowering emits a register
+    // per variable, so the join reads the one several blocks wrote. SSA turns
+    // that into a parameter afterwards — this is what it is handed.
     let ir = lower_colour(
         "string s = match (Colour::Red) {\n  Colour::Red => \"a\",\n  \
          Colour::Green => \"b\",\n  Colour::Blue => \"c\",\n};\nprint(s);",

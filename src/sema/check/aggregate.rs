@@ -68,6 +68,11 @@ impl FnChecker<'_, '_> {
         }
     }
 
+    /// Check `[1, 2, 3]` and answer the array type it has.
+    ///
+    /// Its length is its element count — there is nothing to infer and nothing
+    /// to declare. What a declaration does is *agree* with it, and the mismatch
+    /// is caught where the two meet.
     pub(super) fn array_literal(&mut self, elements: &[Expr], span: Span) -> Ty {
         if elements.is_empty() {
             self.error(

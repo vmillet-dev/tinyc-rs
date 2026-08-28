@@ -49,25 +49,18 @@ pub enum Value {
 /// its IEEE-754 double. Nothing about the word says which, so the two
 /// instructions that *interpret* one say so themselves.
 ///
-/// The price of the alternative is what makes this worth it. Giving a float its
-/// own kind of virtual register would mean a second register class in
-/// [`crate::codegen::regalloc`], a second set of spill slots, a second argument
-/// convention and a prologue that saves both — and it would buy nothing here,
-/// because a double is eight bytes and so is everything else. Copying, storing,
-/// spilling, passing, returning and holding a float in an array are all the
-/// same code as for an `int`, and stay that way.
+/// One class of virtual register is what that buys: copying, storing,
+/// spilling, passing, returning and holding a float in an array are the same
+/// code as for an `int`. It costs a move at each end of every float
+/// instruction, into the floating-point registers the backend keeps as scratch
+/// and back.
 ///
-/// What it costs instead is a move at each end of every float instruction: the
-/// operands come out of general registers into the two floating-point registers
-/// the backend keeps as scratch, and the answer goes back.
-///
-/// **This is the one portability decision in the IR.** Every other thing here
-/// describes what a machine must do and leaves how to it; this one has decided,
-/// on every machine's behalf, that floats live in general registers. Any target
-/// with its own floating-point registers pays the same two moves, and making
-/// them free is a second register class in [`crate::codegen::regalloc`] rather
-/// than a new backend module — see [`crate::target`], where what a second
-/// architecture would meet is written down.
+/// **This is the one portability decision in the IR.** Everything else here
+/// says what a machine must do and leaves how to it; this has decided, on every
+/// machine's behalf, that floats live in general registers. Making that free on
+/// a machine with its own is a second register class in
+/// [`crate::codegen::regalloc`] rather than a new backend — see
+/// [`crate::target`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Num {
     Int,

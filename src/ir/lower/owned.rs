@@ -16,13 +16,10 @@ use crate::sema::Types;
 /// growing a string *where it stands*, which bumps a count at `[p-8]` that
 /// every other name for it can see.
 ///
-/// So this asks the narrow question that makes that operation safe, and asks it
-/// the cautious way round: a name is owned only if it can be *proved* to be,
-/// and anything the analysis does not recognise means no. Being wrong in the
-/// permissive direction would be memory corruption; being wrong in the strict
-/// direction costs a program the optimisation it would have got.
-///
-/// A name is owned when all of this holds:
+/// So the question is asked the cautious way round: a name is owned only if it
+/// can be *proved* to be, and anything the analysis does not recognise means
+/// no. Wrong permissively is memory corruption; wrong strictly costs a program
+/// an optimisation. All of this has to hold:
 ///
 /// * It is a **local**, not a parameter — a parameter is a string the caller
 ///   still holds — and it is declared exactly once in the function, so the name
@@ -36,9 +33,9 @@ use crate::sema::Types;
 ///   field. Reading it — its length, one of its characters, printing it,
 ///   comparing it, joining it to something — is not keeping it.
 ///
-/// What this is *not* is ownership in the type system. Nothing about the
-/// language changes, no program is refused that was not refused before, and a
-/// name that fails any of these tests simply gets the code it got yesterday.
+/// This is not ownership in the type system: no program is refused that was not
+/// refused before, and a name failing any of these tests gets the code it
+/// always got.
 pub(super) fn owned_strings(function: &FnDecl, types: &Types) -> HashSet<String> {
     let mut facts = Owned {
         types,

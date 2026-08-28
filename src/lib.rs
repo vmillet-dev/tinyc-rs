@@ -4,13 +4,19 @@
 //!
 //! ```text
 //! source text
-//!   -> lexer   -> tokens          (lexer.rs, token.rs)
-//!   -> parser  -> AST             (parser.rs, ast.rs)
-//!   -> sema    -> types           (sema.rs)
-//!   -> ir      -> three-address code (ir.rs)
-//!   -> opt     -> the same, with less of it (opt.rs)
-//!   -> codegen -> assembly        (codegen/)
+//!   -> lexer    -> tokens               (lexer.rs, token.rs)
+//!   -> parser   -> AST                  (parser.rs, ast.rs)
+//!   -> sema     -> types                (sema/)
+//!   -> ir       -> three-address code   (ir/)
+//!   -> ir::ssa  -> one definition per register
+//!   -> opt      -> the same graph, with less in it (opt/)
+//!   -> ir::ssa  -> back out of SSA, for the allocator
+//!   -> codegen  -> assembly             (codegen/)
 //! ```
+//!
+//! [`target::Machine`] is what the front end is told about the machine it is
+//! building for, so the sizes it lays out with are not one backend's answer
+//! written into nine places.
 //!
 //! Every stage reports failures as [`diag::Diagnostic`]s carrying a source span,
 //! which [`diag::SourceFile::render`] turns into a message with a line, a column
@@ -131,7 +137,7 @@ pub fn compile_with(
     }
 
     // How big a word is and how many arguments fit in registers are the
-    // target.s business, not the type checker.s; the front end only asks.
+    // target's business, not the type checker's; the front end only asks.
     let types = sema::check(&ast, backend.machine())?;
     let mut ir = ir::lower(&ast, &types)?;
 

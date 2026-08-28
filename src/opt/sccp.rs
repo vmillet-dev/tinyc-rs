@@ -263,22 +263,19 @@ fn rewrite(function: &mut Function, facts: &Facts) -> bool {
 ///
 /// ## The index that is deliberately left alone
 ///
-/// An [`Instr::Elem`] whose index *and* length are both constants carries no
-/// bounds check: `sema` settled it while the program was being checked, so
-/// there is nothing left to ask. That bargain holds for an index written as a
-/// literal. It does not hold for one this pass worked out — nobody proved it is
-/// in range, and substituting it would delete the very check that catches it.
+/// An [`Instr::Elem`] whose index *and* length are constants carries no bounds
+/// check: `sema` settled it. That holds for an index written as a literal, not
+/// for one this pass worked out — nobody proved that one is in range, and
+/// substituting it would delete the check that catches it.
 ///
 /// ```text
 /// int i = 5;  int[3] xs = [1, 2, 3];  println(xs[i]);
 /// ```
 ///
-/// So an index known to be out of range is left as the register it was. The
-/// program stops at exactly the place and with exactly the message it would
-/// have without this pass — which is the rule, and is why this is not instead
-/// reported as an error the compiler could now see: an optimiser that refused
-/// programs would make `--no-optimise` a different language, and would refuse
-/// code on a path nothing ever takes.
+/// So an index known to be out of range stays the register it was, and the
+/// program stops where it would have without this pass. Nor is it reported as
+/// an error: an optimiser that refused programs would make `--no-optimise` a
+/// different language, and would refuse code on a path nothing takes.
 fn substitute(instr: &mut Instr, facts: &Facts) -> bool {
     if let Instr::Elem { base, index, len, .. } = instr {
         let mut changed = fold_value(base, facts) | fold_value(len, facts);

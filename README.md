@@ -83,13 +83,18 @@ rather than answering wrongly.
 
 **The compiler**
 
-* **Constant propagation and dead code elimination** as real passes over the
-  control flow graph, plus folding, dead-function elimination,
-  compare-and-branch fusion and frameless leaf functions — each small enough to
-  read in one sitting, and `--no-optimise` shows you the difference as a diff.
-  A pass may change how long a program takes, never where it stops: an
-  operation whose answer does not fit is not folded, and one that can fail is
-  never dead.
+* **The middle of the compiler is in SSA form.** Every virtual register has one
+  definition, and where two of them meet the block grows a *parameter* —
+  `--emit ssa` shows it. That is what four real passes are written against:
+  sparse conditional constant propagation, copy propagation, global value
+  numbering and dead code elimination, which now catches a dead *store* and not
+  only a dead temporary. Leaving SSA costs copies, and coalescing them against a
+  real interference graph is what pays for it.
+* Plus folding while lowering, dead-function elimination, compare-and-branch
+  fusion and frameless leaf functions — each small enough to read in one
+  sitting, and `--no-optimise` shows the difference as a diff. A pass may change
+  how long a program takes, never where it stops: an operation whose answer does
+  not fit is not folded, and one that can fail is never dead.
 * **`s = s + x` in a loop is linear, not quadratic.** A string's length lives
   with its characters, so growing one where it stands is only safe when nothing
   else is holding it — and the compiler works out, per variable, where that is
@@ -97,9 +102,13 @@ rather than answering wrongly.
   finishes in the low hundreds of kilobytes. Nothing about the language changed;
   a variable the analysis cannot vouch for gets exactly the code it got before.
 * Linear-scan register allocation over live ranges computed by a backward
-  dataflow pass on the control flow graph, run once per function.
-* Target-independent up to and including register allocation: a backend
-  describes its own register file and emits its own text.
+  dataflow pass on the control flow graph, run once per function, with copy
+  coalescing ahead of it.
+* Target-independent up to and including register allocation. A backend
+  describes its own register file, emits its own text, and reports a
+  `target::Machine` — how big a word is, how many arguments arrive in registers
+  — that the type checker and the lowering lay everything out from, so no size
+  is one backend's answer written into the front end.
 * Two targets, **Windows and Linux**, from one x86-64 code generator — and
   either can be emitted from either machine.
 * Tested end to end — the integration suite assembles both targets and **runs**
@@ -166,7 +175,7 @@ cargo run -- examples/hello.tc --emit ir
 | Flag | Meaning |
 |------|---------|
 | `-o, --output <FILE>` | where to write the assembly (default: input path with `.asm`) |
-| `--emit tokens\|ast\|ir\|asm` | stop after a stage and print its result |
+| `--emit tokens\|ast\|ssa\|ir\|asm` | stop after a stage and print its result |
 | `--target <NAME>` | `x86_64-windows` or `x86_64-linux` (default: this machine's) |
 | `--dump-regalloc` | print live intervals and register assignments |
 | `--no-optimise` | hand the backend the IR exactly as lowering produced it |
@@ -179,9 +188,11 @@ Each arrow is a module, and each stage can be inspected with `--emit`:
 |-------|--------|----------|
 | lexing | [`src/lexer.rs`](src/lexer.rs), [`src/token.rs`](src/token.rs) | tokens with source spans |
 | parsing | [`src/parser.rs`](src/parser.rs), [`src/ast.rs`](src/ast.rs) | an AST |
-| type checking | [`src/sema.rs`](src/sema.rs) | the type of every expression |
-| lowering | [`src/ir.rs`](src/ir.rs) | a control flow graph of three-address code |
-| optimisation | [`src/opt.rs`](src/opt.rs) | the same graph, with less in it |
+| type checking | [`src/sema/`](src/sema) | the type of every expression |
+| lowering | [`src/ir/lower/`](src/ir/lower) | a control flow graph of three-address code |
+| SSA construction | [`src/ir/ssa/`](src/ir/ssa) | one definition per virtual register |
+| optimisation | [`src/opt/`](src/opt) | the same graph, with less in it |
+| SSA destruction | [`src/ir/ssa/`](src/ir/ssa) | a graph the allocator can read |
 | register allocation | [`src/codegen/regalloc.rs`](src/codegen/regalloc.rs) | a machine register or stack slot per value |
 | emission | [`src/codegen/x64/`](src/codegen/x64/) | NASM assembly, for either platform |
 

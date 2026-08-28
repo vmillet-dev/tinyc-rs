@@ -14,16 +14,10 @@ impl Lowering<'_> {
     /// if (c) { int[1000] a = ...; } else { int[1000] b = ...; }
     /// ```
     ///
-    /// takes eight kilobytes rather than sixteen. That is sound for the same
-    /// reason nothing in this language dangles: **no address ever travels
-    /// outward**, and inside a function that means no frame address is ever
-    /// stored into memory or kept in a variable declared outside — assignment
-    /// copies. So when a block's names go out of scope, so does every way of
-    /// reaching what they named.
-    ///
-    /// A block inside a loop is lowered once and re-entered at run time, so its
-    /// room is the same room on every iteration, which is what a local in a loop
-    /// body has always been.
+    /// takes eight kilobytes rather than sixteen. Sound for the same reason
+    /// nothing here dangles: **no address ever travels outward**, so when a
+    /// block's names go out of scope, so does every way of reaching what they
+    /// named.
     pub(super) fn block_stmts(&mut self, block: &AstBlock) {
         let outer = self.frame_bytes;
         self.scopes.push(HashMap::new());
@@ -220,9 +214,10 @@ impl Lowering<'_> {
     /// "none of the above", because there is no such case.
     ///
     /// When `dst` is given, every value arm writes it before jumping to the
-    /// join — the same trick `&&` plays, and the same one a non-SSA IR is what
-    /// allows. A block arm writes nothing: `sema` has established that control
-    /// never reaches its end.
+    /// join — the same trick `&&` plays, and one lowering can play because it
+    /// emits a register per *variable*. [`crate::ir::ssa`] turns those writes
+    /// into a parameter on the join afterwards. A block arm writes nothing:
+    /// `sema` has established that control never reaches its end.
     ///
     /// A jump table would beat the chain on a large enum. It would need an
     /// indirect terminator, which nothing else in this IR wants yet.
@@ -306,7 +301,7 @@ impl Lowering<'_> {
 
     /// The tag a `Color::Red` expression stands for, which `sema` has already
     /// established exists.
-    /// Bytes in front of a boxed enum.s payload, holding its tag, and the room
+    /// Bytes in front of a boxed enum's payload, holding its tag, and the room
     /// one payload slot takes.
     ///
     /// The same word a string and a list spend on their length, and it sits in

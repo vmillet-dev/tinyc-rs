@@ -9,10 +9,8 @@ use super::{Num, Value};
 /// operation the CPU would trap on stays an instruction, so the program still
 /// fails where it was written instead of in the compiler.
 ///
-/// [`crate::sema`] has usually rejected such a program already — it evaluates
-/// the same constants through the same [`BinOp::apply`]. What reaches here is
-/// what sema could not see, such as an operand that only became a constant
-/// during lowering.
+/// [`crate::sema`] has usually rejected such a program already, through the
+/// same [`BinOp::apply`]; what reaches here is what it could not see.
 /// What `-x` subtracts `x` from, which is the zero of whichever kind of number
 /// it is.
 ///

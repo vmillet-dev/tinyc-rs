@@ -157,11 +157,6 @@ impl FnChecker<'_, '_> {
         None
     }
 
-    /// Check `[1, 2, 3]` and answer the array type it has.
-    ///
-    /// Its length is its element count — there is nothing to infer and nothing
-    /// to declare. What a declaration does is *agree* with it, and the mismatch
-    /// is caught where the two meet.
     /// Check a value against the type it is being given to.
     ///
     /// Exactly one thing needs this, and it needs it because nothing in the

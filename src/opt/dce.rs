@@ -14,21 +14,11 @@
 //!   names the register it defines, so dropping it would leave a parameter
 //!   named by nothing.
 //!
-//! ## What SSA changed here
-//!
 //! "Read" used to mean *anywhere in the function*, which caught every dead
-//! temporary and no dead assignment at all: a variable kept one register for
-//! its whole life, so a write nothing read before the next write still had that
-//! register read somewhere, and stayed. In SSA the write **is** the register,
-//! and a dead store is as visible as a dead temporary:
-//!
-//! ```text
-//! int n = expensive();  n = 0;  println(n);
-//! ```
-//!
-//! A block parameter is swept the same way, and takes the arguments every edge
-//! hands it out with it — which is how a value only a dead parameter kept alive
-//! becomes dead in turn.
+//! temporary and no dead assignment at all. In SSA the write **is** the
+//! register, so `int n = expensive(); n = 0; println(n);` loses the first
+//! assignment. A block parameter is swept the same way, taking the arguments
+//! every edge hands it out with it.
 
 use crate::ir::{BlockId, Function, Instr, VReg};
 

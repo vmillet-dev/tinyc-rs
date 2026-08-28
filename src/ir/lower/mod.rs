@@ -227,26 +227,24 @@ fn prune_unreachable_functions(
 
 /// Whether the room being written into is brand new, or already has a name.
 ///
-/// It decides one thing, and it is the difference between two and four
-/// instructions per element: whether an aggregate **literal** may be built where
-/// it is going, rather than somewhere else and then copied over.
+/// It decides whether an aggregate **literal** may be built where it is going,
+/// rather than somewhere else and then copied over: two instructions per
+/// element against four.
 ///
 /// * [`Room::Fresh`] — a field of an object being constructed, an element of an
 ///   array literal, the room a declaration just reserved, the room a caller
-///   passed for a return. Nothing can name it yet, so the expression filling it
-///   cannot read it, and filling it piece by piece is not observable.
-/// * [`Room::Named`] — the target of an assignment. Here it very much can:
+///   passed for a return. Nothing can name it yet, so filling it piece by piece
+///   is not observable.
+/// * [`Room::Named`] — the target of an assignment, where it very much is:
 ///
 ///   ```text
 ///   int[2] a = [1, 2];
 ///   a = [a[1], a[0]];      // a swap
 ///   ```
 ///
-///   Filling `a` element by element would write `a[1]` into `a[0]` and then
-///   read it straight back out, and the swap would answer `[2, 2]`. So an
-///   assignment builds the literal elsewhere and copies it, which is what makes
-///   the whole value change at once — the same reason assignment copies rather
-///   than aliasing in the first place.
+///   Filling `a` element by element would write `a[1]` into `a[0]` and read it
+///   straight back, answering `[2, 2]`. So an assignment builds the literal
+///   elsewhere and copies it, and the whole value changes at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Room {
     Fresh,
