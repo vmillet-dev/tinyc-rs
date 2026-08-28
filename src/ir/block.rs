@@ -122,6 +122,8 @@ impl Terminator {
 pub enum BlockKind {
     /// Where the function starts. Always block 0.
     Entry,
+    /// A block interposed on an edge, to hold the copies SSA leaves behind.
+    Edge,
     Then,
     Else,
     /// Where the arms of an `if` meet again.
@@ -153,6 +155,7 @@ impl BlockKind {
     fn prefix(self) -> &'static str {
         match self {
             BlockKind::Entry => "entry",
+            BlockKind::Edge => "edge",
             BlockKind::Then => "then",
             BlockKind::Else => "else",
             BlockKind::Join => "join",

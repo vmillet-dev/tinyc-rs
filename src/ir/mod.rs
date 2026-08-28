@@ -24,6 +24,8 @@
 //! arithmetic on a word have to be told which — see [`Num`].
 
 mod block;
+mod liveness;
+pub mod ssa;
 mod dump;
 mod fold;
 mod func;
@@ -38,6 +40,7 @@ pub use block::{Block, BlockKind, Target, Terminator, prune_unreachable};
 pub use fold::{fold_bin, fold_cmp};
 pub(crate) use fold::{fold_logic, negate_const, zero_to_subtract_from};
 pub use func::{Function, Program};
+pub use liveness::{Liveness, VRegSet, liveness};
 pub use instr::{DivGuards, Instr, Runtime};
 pub use lower::lower;
 pub use value::{

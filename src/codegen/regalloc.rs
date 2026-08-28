@@ -43,7 +43,7 @@
 
 use std::collections::HashMap;
 
-use crate::ir::{Function, VReg};
+use crate::ir::{Function, VReg, liveness};
 
 /// Index of a machine register, interpreted by the backend that supplied the
 /// [`RegisterFile`].
@@ -182,130 +182,6 @@ impl Layout {
         }
         Layout { start, end, call_sites }
     }
-}
-
-/// A set of virtual registers, one bit each.
-///
-/// [`VReg`]s are dense indices from zero, which is exactly what a bitmap wants.
-/// The dataflow below unions and subtracts these sets on every round of its
-/// fixpoint, and here that is a handful of word operations rather than a hash
-/// per register.
-#[derive(Clone, PartialEq, Eq)]
-struct VRegSet {
-    words: Vec<u64>,
-}
-
-impl VRegSet {
-    fn new(registers: usize) -> VRegSet {
-        VRegSet { words: vec![0; registers.div_ceil(64)] }
-    }
-
-    fn insert(&mut self, reg: VReg) {
-        let (word, bit) = (reg.0 as usize / 64, reg.0 as usize % 64);
-        self.words[word] |= 1 << bit;
-    }
-
-    fn contains(&self, reg: VReg) -> bool {
-        let (word, bit) = (reg.0 as usize / 64, reg.0 as usize % 64);
-        self.words[word] & (1 << bit) != 0
-    }
-
-    /// `self |= other`, answering whether that added anything.
-    fn union_with(&mut self, other: &VRegSet) -> bool {
-        let mut grew = false;
-        for (mine, theirs) in self.words.iter_mut().zip(&other.words) {
-            let merged = *mine | theirs;
-            grew |= merged != *mine;
-            *mine = merged;
-        }
-        grew
-    }
-
-    /// `self |= other - excluded`, answering whether that added anything.
-    fn union_without(&mut self, other: &VRegSet, excluded: &VRegSet) -> bool {
-        let mut grew = false;
-        for ((mine, theirs), gone) in
-            self.words.iter_mut().zip(&other.words).zip(&excluded.words)
-        {
-            let merged = *mine | (theirs & !gone);
-            grew |= merged != *mine;
-            *mine = merged;
-        }
-        grew
-    }
-
-    fn iter(&self) -> impl Iterator<Item = VReg> + '_ {
-        self.words.iter().enumerate().flat_map(|(word, bits)| {
-            (0..64).filter(move |bit| bits & (1 << bit) != 0).map(move |bit| VReg((word * 64 + bit) as u32))
-        })
-    }
-}
-
-/// Live-in and live-out sets, one per block.
-struct Liveness {
-    live_in: Vec<VRegSet>,
-    live_out: Vec<VRegSet>,
-}
-
-/// Which registers are live where, by backward dataflow over the CFG.
-///
-/// A single forward pass was enough while the program was one straight run of
-/// instructions, but a loop's back edge means a value can be live *before* the
-/// instruction that defines it is reached again. The standard answer is to
-/// iterate to a fixpoint:
-///
-/// ```text
-/// live_out(B) = union of live_in(S) for every successor S of B
-/// live_in(B)  = used_before_written(B) + (live_out(B) - written(B))
-/// ```
-fn liveness(function: &Function) -> Liveness {
-    let count = function.blocks.len();
-    let registers = function.vreg_count();
-
-    // Per block: registers read before being written, and registers written.
-    let mut upward_exposed = vec![VRegSet::new(registers); count];
-    let mut written = vec![VRegSet::new(registers); count];
-    for (b, block) in function.blocks.iter().enumerate() {
-        let (exposed, written) = (&mut upward_exposed[b], &mut written[b]);
-        for instr in &block.instrs {
-            instr.uses(|used| {
-                if !written.contains(used) {
-                    exposed.insert(used);
-                }
-            });
-            if let Some(def) = instr.def() {
-                written.insert(def);
-            }
-        }
-        block.term.uses(|used| {
-            if !written.contains(used) {
-                exposed.insert(used);
-            }
-        });
-    }
-
-    // Both sets only ever grow, so the fixpoint can accumulate in place: a round
-    // that adds nothing anywhere is the last one.
-    let mut live_in = upward_exposed;
-    let mut live_out = vec![VRegSet::new(registers); count];
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        // Blocks are emitted roughly in forward order, so walking backwards
-        // reaches the fixpoint in few passes.
-        for b in (0..count).rev() {
-            for successor in function.blocks[b].term.successors() {
-                // Two different vectors, so both can be borrowed at once.
-                let (out, entering) = (&mut live_out[b], &live_in[successor.0 as usize]);
-                changed |= out.union_with(entering);
-            }
-            let (entering, leaving) = (&mut live_in[b], &live_out[b]);
-            changed |= entering.union_without(leaving, &written[b]);
-        }
-    }
-
-    Liveness { live_in, live_out }
 }
 
 /// Compute one live interval per virtual register, in order of definition.

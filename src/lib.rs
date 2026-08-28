@@ -70,6 +70,9 @@ pub struct Compiled {
 pub enum Stage<'a> {
     Tokens(&'a [token::Token]),
     Ast(&'a ast::Program),
+    /// The IR in SSA form, as the optimiser leaves it.
+    Ssa(&'a ir::Program),
+    /// The IR out of SSA form, as the backend is handed it.
     Ir(&'a ir::Program),
 }
 
@@ -129,12 +132,23 @@ pub fn compile_with(
     // How many arguments fit in registers is the target's business, not the
     // type checker's; the front end only asks.
     let types = sema::check(&ast, backend.register_file().max_args)?;
-    // Optimised before it is shown, not after: `--emit ir` is meant to print
-    // what the backend is about to be handed, not a draft of it.
     let mut ir = ir::lower(&ast, &types)?;
+
+    // SSA is the form the middle of the compiler works in: lowering does not
+    // produce it and the backend cannot read it, so it is put on here and taken
+    // off again below. Everything between the two is written knowing that a
+    // register has one definition.
+    ir::ssa::construct(&mut ir);
     if options.optimise {
         opt::optimise(&mut ir);
     }
+    if !observe(Stage::Ssa(&ir)) {
+        return Ok(None);
+    }
+    ir::ssa::destruct(&mut ir);
+
+    // Optimised before it is shown, not after: `--emit ir` is meant to print
+    // what the backend is about to be handed, not a draft of it.
     if !observe(Stage::Ir(&ir)) {
         return Ok(None);
     }

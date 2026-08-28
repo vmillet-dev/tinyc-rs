@@ -1,7 +1,7 @@
 //! Rendering the IR as text, for `--emit ir` and for the comments the backend echoes.
 
 use crate::ast::{BinOp, Prim};
-use super::{Function, Instr, Num, Program, Terminator, Value};
+use super::{Function, Instr, Num, Program, Target, Terminator, Value};
 
 impl Program {
     /// Render the IR for `--emit ir`.
@@ -22,22 +22,37 @@ impl Program {
             // allocator works with.
             let mut index = 0;
             for block in &function.blocks {
-                out.push_str(&format!("{}:\n", block.label()));
+                let params: Vec<String> =
+                    block.params.iter().map(|&r| format!("%{}", function.name_of(r))).collect();
+                let taken = match params.is_empty() {
+                    true => String::new(),
+                    false => format!("({})", params.join(", ")),
+                };
+                out.push_str(&format!("{}{taken}:\n", block.label()));
                 for instr in &block.instrs {
                     let text = self.instr_text(function, instr);
                     out.push_str(&format!("{index:>3}  {text}\n"));
                     index += 1;
                 }
 
-                let text = match &block.term {
-                    Terminator::Jump(target) => {
-                        format!("jump {}", function.block(target.block).label())
+                // A target names a block and, in SSA form, the values it hands
+                // it: `jump join3(%n.1)` reads as the call it is.
+                let target_text = |target: &Target| {
+                    let args: Vec<String> =
+                        target.args.iter().map(|a| function.value_name(a)).collect();
+                    let label = function.block(target.block).label();
+                    match args.is_empty() {
+                        true => label,
+                        false => format!("{label}({})", args.join(", ")),
                     }
+                };
+                let text = match &block.term {
+                    Terminator::Jump(target) => format!("jump {}", target_text(target)),
                     Terminator::Branch { cond, then_blk, else_blk } => format!(
                         "branch {} ? {} : {}",
                         function.value_name(cond),
-                        function.block(then_blk.block).label(),
-                        function.block(else_blk.block).label()
+                        target_text(then_blk),
+                        target_text(else_blk)
                     ),
                     Terminator::Return(None) => "return".to_string(),
                     Terminator::Return(Some(value)) => {

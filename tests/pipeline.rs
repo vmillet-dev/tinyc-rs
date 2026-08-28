@@ -129,6 +129,7 @@ fn an_observer_that_says_no_stops_the_pipeline_where_it_said_so() {
         seen.push(match stage {
             Stage::Tokens(_) => "tokens",
             Stage::Ast(_) => "ast",
+            Stage::Ssa(_) => "ssa",
             Stage::Ir(_) => "ir",
         });
         false
@@ -152,6 +153,10 @@ fn the_stages_arrive_in_the_order_the_pipeline_runs_them() {
                 seen.push("ast");
                 assert_eq!(ast.functions.len(), 1);
             }
+            Stage::Ssa(ir) => {
+                seen.push("ssa");
+                assert_eq!(ir.functions.len(), 1);
+            }
             Stage::Ir(ir) => {
                 seen.push("ir");
                 assert_eq!(ir.functions.len(), 1);
@@ -160,7 +165,7 @@ fn the_stages_arrive_in_the_order_the_pipeline_runs_them() {
         true
     });
 
-    assert_eq!(seen, vec!["tokens", "ast", "ir"]);
+    assert_eq!(seen, vec!["tokens", "ast", "ssa", "ir"]);
     let compiled = compiled.expect("it should compile").expect("nothing stopped it");
     assert!(!compiled.asm.is_empty());
     assert_eq!(compiled.allocations.len(), compiled.ir.functions.len());
@@ -181,6 +186,7 @@ fn a_stage_that_fails_shows_nothing_after_it() {
         seen.push(match stage {
             Stage::Tokens(_) => "tokens",
             Stage::Ast(_) => "ast",
+            Stage::Ssa(_) => "ssa",
             Stage::Ir(_) => "ir",
         });
         true
