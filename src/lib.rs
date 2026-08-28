@@ -25,6 +25,7 @@ pub mod opt;
 pub mod parser;
 pub mod prim;
 pub mod sema;
+pub mod target;
 pub mod token;
 pub mod vocabulary;
 
@@ -129,9 +130,9 @@ pub fn compile_with(
         return Ok(None);
     }
 
-    // How many arguments fit in registers is the target's business, not the
-    // type checker's; the front end only asks.
-    let types = sema::check(&ast, backend.register_file().max_args)?;
+    // How big a word is and how many arguments fit in registers are the
+    // target.s business, not the type checker.s; the front end only asks.
+    let types = sema::check(&ast, backend.machine())?;
     let mut ir = ir::lower(&ast, &types)?;
 
     // SSA is the form the middle of the compiler works in: lowering does not

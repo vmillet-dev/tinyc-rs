@@ -103,6 +103,7 @@ mod tests;
 use crate::ast::{CmpOp, Ty};
 use crate::codegen::{Allocation, Backend, PhysReg, RegisterFile};
 use crate::ir::{Program, Runtime};
+use crate::target::{Layout, Machine};
 
 use asm::Asm;
 pub use linux::Linux;
@@ -150,6 +151,15 @@ const XMM1: &str = "xmm1";
 /// A language limit rather than an ABI one — see the module docs for why the
 /// System V backend does not claim the six it could pass.
 pub const MAX_ARGS: usize = 4;
+
+/// Bytes of header in front of a string's characters, holding the count.
+///
+/// A word, and this backend's word is eight — the same eight
+/// [`Backend::machine`] reports as [`Layout::LP64`]. It lives here rather than
+/// beside the IR because only code that emits instructions ever reads it: the
+/// header is a `[p-8]` in an addressing mode, not something the lowering has an
+/// opinion about.
+const STR_HEADER: u32 = Layout::LP64.word;
 
 /// The registers a runtime routine may keep a value in across a call it makes.
 ///
@@ -372,7 +382,6 @@ impl X64 {
                 // allocatable.
                 caller_saved: Vec::new(),
                 callee_saved: abi.allocatable.to_vec(),
-                max_args: MAX_ARGS,
             },
         }
     }
@@ -397,6 +406,13 @@ impl Backend for X64 {
 
     fn register_file(&self) -> &RegisterFile {
         &self.registers
+    }
+
+    fn machine(&self) -> Machine {
+        // Both platforms are x86-64: eight-byte words, and four arguments in
+        // registers because that is what the narrower of the two conventions
+        // passes — see [`MAX_ARGS`].
+        Machine { layout: Layout::LP64, max_args: MAX_ARGS }
     }
 
     fn emit(&self, program: &Program, allocations: &[Allocation]) -> String {

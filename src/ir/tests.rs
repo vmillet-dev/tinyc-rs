@@ -1,6 +1,7 @@
 use super::*;
 use crate::ast::{BinOp, ClassId, CmpOp, Ty};
 use crate::diag::Result;
+use crate::target::Machine;
 use crate::{lexer, parser, sema};
 
 fn lower_src(src: &str) -> Program {
@@ -9,7 +10,7 @@ fn lower_src(src: &str) -> Program {
 
 fn try_lower(src: &str) -> Result<Program> {
     let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
-    let types = sema::check(&ast, 4).unwrap();
+    let types = sema::check(&ast, crate::target::Machine::TEST).unwrap();
     lower(&ast, &types)
 }
 
@@ -403,7 +404,7 @@ fn arrays_worth(bytes: u32) -> String {
 
 #[test]
 fn a_frame_no_stack_would_hold_is_refused() {
-    let Err(errors) = try_lower(&arrays_worth(MAX_FRAME_BYTES + 1)) else {
+    let Err(errors) = try_lower(&arrays_worth(Machine::TEST.layout.max_frame + 1)) else {
         panic!("past the limit is past the limit");
     };
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -415,8 +416,8 @@ fn a_frame_no_stack_would_hold_is_refused() {
 
 #[test]
 fn a_frame_that_only_just_fits_is_not() {
-    let ir = try_lower(&arrays_worth(MAX_FRAME_BYTES)).expect("exactly the limit is allowed");
-    assert_eq!(ir.functions[0].frame_bytes, MAX_FRAME_BYTES);
+    let ir = try_lower(&arrays_worth(Machine::TEST.layout.max_frame)).expect("exactly the limit is allowed");
+    assert_eq!(ir.functions[0].frame_bytes, Machine::TEST.layout.max_frame);
 }
 
 #[test]
@@ -425,7 +426,7 @@ fn a_frame_is_measured_in_the_function_that_declares_it() {
     // one call's, and these two are never on the stack at the same time
     // unless one calls the other — which is what the *runtime* check is
     // for, and it is a question about depth, not about size.
-    let half = MAX_FRAME_BYTES / 2;
+    let half = Machine::TEST.layout.max_frame / 2;
     let mut src = arrays_worth(half).replace("fn main()", "fn other()");
     src.push_str(&arrays_worth(half));
     try_lower(&src).expect("two half-sized frames are two frames, not one");

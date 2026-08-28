@@ -10,8 +10,6 @@ use crate::diag::{Diagnostic, Span};
 
 use super::{Declared, MAX_ARRAY_LEN, Signature, already_declared};
 
-/// Bytes an object spends on its vtable pointer, which sits at offset 0.
-pub(super) const VPTR_SIZE: u32 = 8;
 
 /// How much room one object may take.
 ///
@@ -80,8 +78,8 @@ pub(super) fn collect_classes(program: &Program, declared: &mut Declared, errors
             base: None,
             fields: Vec::new(),
             methods: Vec::new(),
-            size: VPTR_SIZE,
-            storage: VPTR_SIZE,
+            size: declared.table.layout.vptr(),
+            storage: declared.table.layout.vptr(),
         });
         for &at in &class.methods {
             declared.method_of.insert(at, id);
@@ -318,7 +316,7 @@ pub(super) fn lay_out(
         // bounds. It is settled here, before anything containing one of these
         // classes is measured.
         let storage =
-            hierarchy.iter().map(|&id| declared.class(id).size).max().unwrap_or(VPTR_SIZE);
+            hierarchy.iter().map(|&id| declared.class(id).size).max().unwrap_or(declared.table.layout.vptr());
         for &id in &hierarchy {
             declared.table.classes[id.0 as usize].storage = storage;
         }
@@ -340,7 +338,8 @@ pub(super) fn lay_out_class(
     };
     // A subclass's own fields start where its base's stop, which is what makes
     // the base a *prefix* of it: one address serves as both.
-    let mut offset = base.map_or(VPTR_SIZE, |base| declared.class(base).size);
+    // An object spends its first word on the pointer to its method table.
+    let mut offset = base.map_or(declared.table.layout.vptr(), |base| declared.class(base).size);
 
     let name = declared.class(id).name.clone();
     for field in fields {

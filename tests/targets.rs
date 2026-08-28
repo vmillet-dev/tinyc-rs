@@ -136,7 +136,7 @@ fn every_target_describes_a_usable_register_file() {
         let registers = backend.register_file();
 
         assert!(!backend.name().is_empty(), "{name} has no name");
-        assert!(registers.max_args > 0, "{name} passes no arguments in registers at all");
+        assert!(backend.machine().max_args > 0, "{name} passes no arguments in registers");
         assert!(
             !registers.caller_saved.is_empty() || !registers.callee_saved.is_empty(),
             "{name} gives the allocator nothing to hand out"
@@ -214,7 +214,7 @@ fn the_tree_the_front_end_builds_is_the_same_for_every_target() {
 #[test]
 fn the_parameter_limit_is_the_targets_own() {
     for (name, target) in every_target() {
-        let max = backend_for(target).register_file().max_args;
+        let max = backend_for(target).machine().max_args;
 
         let parameters =
             |n: usize| (0..n).map(|i| format!("int p{i}")).collect::<Vec<_>>().join(", ");

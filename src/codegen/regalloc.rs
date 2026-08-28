@@ -60,13 +60,6 @@ pub struct RegisterFile {
     /// Allocatable registers that survive a call, at the cost of being saved
     /// and restored in the prologue and epilogue.
     pub callee_saved: Vec<PhysReg>,
-    /// How many arguments this target passes in registers, and therefore the
-    /// most parameters a function may declare.
-    ///
-    /// It lives here rather than in [`crate::sema`] because it is an ABI fact,
-    /// not a language one: the type checker enforces the number the target
-    /// reports instead of hard-coding one backend's answer.
-    pub max_args: usize,
 }
 
 impl RegisterFile {
@@ -436,13 +429,12 @@ mod tests {
             names: vec!["v0", "v1", "s0", "s1"],
             caller_saved: vec![PhysReg(0), PhysReg(1)],
             callee_saved: vec![PhysReg(2), PhysReg(3)],
-            max_args: 4,
         }
     }
 
     fn ir_of(src: &str) -> Program {
         let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
-        let types = sema::check(&ast, 4).unwrap();
+        let types = sema::check(&ast, crate::target::Machine::TEST).unwrap();
         crate::ir::lower(&ast, &types).expect("the frames should fit")
     }
 
@@ -776,7 +768,6 @@ mod tests {
             names: vec!["only"],
             caller_saved: Vec::new(),
             callee_saved: vec![PhysReg(0)],
-            max_args: 4,
         };
         let ir = ir_of_main(
             "int a = 1;\nint b = 2;\nint c = 3;\nint d = 4;\nprint(a + b + c + d);",
@@ -797,7 +788,6 @@ mod tests {
             names: vec!["v0", "v1"],
             caller_saved: vec![PhysReg(0), PhysReg(1)],
             callee_saved: Vec::new(),
-            max_args: 4,
         };
         let ir = ir_of_main("string s = \"hi\";\nprint(1 + 2);\nprint(s);");
         let main = &ir.functions[0];

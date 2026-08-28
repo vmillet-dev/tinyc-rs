@@ -306,11 +306,15 @@ impl Lowering<'_> {
 
     /// The tag a `Color::Red` expression stands for, which `sema` has already
     /// established exists.
-    /// Bytes in front of a boxed enum's payload, holding its tag.
+    /// Bytes in front of a boxed enum.s payload, holding its tag, and the room
+    /// one payload slot takes.
     ///
-    /// The same eight a string and a list spend on their length, and it sits in
+    /// The same word a string and a list spend on their length, and it sits in
     /// the same place: at the front, where the value points.
-    const TAG_BYTES: u32 = 8;
+    pub(super) fn payload_at(&self, index: u32) -> u32 {
+        let word = self.table.layout.word;
+        self.table.layout.tag() + index * word
+    }
 
     /// Build `Enum::Variant(...)` into `dst`.
     ///
@@ -347,7 +351,7 @@ impl Lowering<'_> {
         }
 
         let slots = info.slots() as u32;
-        let bytes = Self::TAG_BYTES + slots * 8;
+        let bytes = self.payload_at(slots);
         self.emit(Instr::RtCall {
             dst: Some(dst),
             callee: Runtime::Alloc,
@@ -359,7 +363,7 @@ impl Lowering<'_> {
             self.emit(Instr::Field {
                 dst: at,
                 base: Value::Reg(dst),
-                offset: Self::TAG_BYTES + index as u32 * 8,
+                offset: self.payload_at(index as u32),
             });
             // `Room::Fresh`, and through the same path a field takes: what goes
             // into a variant is the variant's from then on, so a list is copied
@@ -408,7 +412,7 @@ impl Lowering<'_> {
             self.emit(Instr::Field {
                 dst: at,
                 base: value,
-                offset: Self::TAG_BYTES + index as u32 * 8,
+                offset: self.payload_at(index as u32),
             });
             self.emit(Instr::Load { dst, addr: Value::Reg(at) });
             if let Ty::List(list) = ty {

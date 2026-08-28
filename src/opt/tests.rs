@@ -4,7 +4,7 @@ use crate::{lexer, parser, sema};
 
 fn ir_of(src: &str) -> Program {
     let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
-    let types = sema::check(&ast, 4).unwrap();
+    let types = sema::check(&ast, crate::target::Machine::TEST).unwrap();
     lower(&ast, &types).expect("the frames should fit")
 }
 

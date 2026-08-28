@@ -15,7 +15,7 @@ use crate::diag::{Diagnostic, Result};
 use crate::sema::Types;
 
 use super::{
-    Block, BlockId, BlockKind, CHAR_BYTES, Function, FuncId, Instr, MAX_FRAME_BYTES, Num, Program,
+    Block, BlockId, BlockKind, CHAR_BYTES, Function, FuncId, Instr, Num, Program,
     Runtime, StrId, Terminator, TextId, VReg, Value, fold_bin, fold_cmp, fold_logic,
     negate_const, prune_unreachable, zero_to_subtract_from,
 };
@@ -77,8 +77,8 @@ pub fn lower(ast: &Ast, types: &Types) -> Result<Program> {
         let mut lowered =
             lowering.run(decl, types.ret_of(index), types.params_of(index));
         lowered.name = names[index].clone();
-        if lowered.frame_bytes > MAX_FRAME_BYTES {
-            errors.push(too_much_stack(&lowered, decl));
+        if lowered.frame_bytes > types.table().layout.max_frame {
+            errors.push(too_much_stack(&lowered, decl, types.table().layout.max_frame));
         }
         functions.push(lowered);
     }
@@ -113,14 +113,14 @@ pub fn lower(ast: &Ast, types: &Types) -> Result<Program> {
 
 
 /// A function whose locals no stack would hold.
-fn too_much_stack(lowered: &Function, decl: &FnDecl) -> Diagnostic {
+fn too_much_stack(lowered: &Function, decl: &FnDecl, limit: u32) -> Diagnostic {
     let bytes = lowered.frame_bytes;
     let size = match bytes == u32::MAX {
         true => "more than four gigabytes".to_string(),
         false => format!("{bytes} bytes"),
     };
     Diagnostic::new(format!("`{}` needs too much stack", decl.name), decl.name_span)
-        .with_label(format!("{size} of locals, and at most {MAX_FRAME_BYTES} are supported"))
+        .with_label(format!("{size} of locals, and at most {limit} are supported"))
         .with_note(
             "every value too big for a register lives in the frame, and the frame is reserved \
              for the whole call; `int[]` is what holds a quantity the stack cannot",

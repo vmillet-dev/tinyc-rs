@@ -31,8 +31,8 @@ pub enum Instr {
     /// names a value; this names a place, and it exists because an array is the
     /// one thing too big to live in a register.
     ///
-    /// The frame region is reserved once, in the prologue, so this costs a
-    /// single `lea` and never allocates.
+    /// The frame region is reserved once, in the prologue, so this is an
+    /// address computation and never an allocation.
     Frame { dst: VReg, offset: u32 },
     /// `dst = base + offset`: the address of a field.
     ///
@@ -48,13 +48,16 @@ pub enum Instr {
     /// division. An array's length is always known; a string's never is, so
     /// indexing one always costs the check.
     ///
-    /// `scale` is eight for everything that fits in a register, four for the
-    /// characters of a string, and the object's room for an array or a list
-    /// of them — which is the one case where the address is not a single
-    /// `lea`, because x86 scales by 1, 2, 4 or 8 and nothing else.
+    /// `scale` is a word for everything that fits in a register,
+    /// [`CHAR_BYTES`] for the characters of a string, and the object.s room for
+    /// an array or a list of them — so it is **any** number of bytes, not one
+    /// of a machine.s handful. Turning an arbitrary scale into an address is
+    /// the backend.s problem: one that has a scaled addressing mode uses it
+    /// where the number fits and multiplies where it does not, and one that has
+    /// none multiplies every time.
     Elem { dst: VReg, base: Value, index: Value, len: Value, scale: u32 },
-    /// `dst = len(of)`: the count that a string or a list carries in the eight
-    /// bytes in front of its elements.
+    /// `dst = len(of)`: the count that a string or a list carries in the word
+    /// in front of its elements.
     ///
     /// The one place the compiler reads *behind* an address it was given. That
     /// is the whole reason the count lives there: the value stays one pointer,
@@ -379,8 +382,8 @@ impl Instr {
             // nothing keeping a float computation nobody reads alive.
             Instr::Bin { num: Num::Float, .. } => false,
             Instr::Bin { op, lhs, rhs, .. } if op.divides() => DivGuards::of(lhs, rhs).any(),
-            // `add`, `sub` and `imul` are all guarded; a folded result never
-            // reaches an instruction in the first place.
+            // Addition, subtraction and multiplication are all guarded; a
+            // folded result never reaches an instruction in the first place.
             Instr::Bin { .. } => true,
             // The other direction cannot: every `int` has a `float` nearest it,
             // while a float too large, or no number at all, has no `int`.

@@ -44,6 +44,7 @@ use crate::ast::{
     Program, Ty, TypeTable,
 };
 use crate::diag::{Diagnostic, Result, Span};
+use crate::target::{Layout, Machine};
 
 /// The name of the entry point.
 pub const ENTRY_POINT: &str = "main";
@@ -164,9 +165,9 @@ impl Declared {
 /// Enums come before signatures because a signature may mention one, and before
 /// bodies because a declaration may. Nothing in an enum can refer to anything
 /// else, so one pass over them is enough.
-fn collect_enums(program: &Program, errors: &mut Vec<Diagnostic>) -> Declared {
+fn collect_enums(program: &Program, layout: Layout, errors: &mut Vec<Diagnostic>) -> Declared {
     let mut enums = Declared {
-        table: TypeTable::default(),
+        table: TypeTable::new(layout),
         enum_spans: Vec::new(),
         enums_by_name: HashMap::new(),
         arrays_by_shape: HashMap::new(),
@@ -317,11 +318,11 @@ fn came_from(name: &str, at: Option<Span>) -> (String, Option<Span>) {
 /// `max_params` is how many arguments the target can pass in registers; the
 /// front end has no opinion of its own about that, it just enforces what
 /// [`crate::codegen::RegisterFile::max_args`] reports.
-pub fn check(program: &Program, max_params: usize) -> Result<Types> {
+pub fn check(program: &Program, machine: Machine) -> Result<Types> {
     let mut errors = Vec::new();
 
     // Pass 0: the declared types, before anything can mention one.
-    let mut declared = collect_enums(program, &mut errors);
+    let mut declared = collect_enums(program, machine.layout, &mut errors);
     collect_classes(program, &mut declared, &mut errors);
     // Last of the three, because a payload may name either of the others.
     resolve_payloads(program, &mut declared, &mut errors);
@@ -330,7 +331,7 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
     // rather than in the program's namespace.
     let mut method_signatures: HashMap<usize, Signature> = HashMap::new();
     let signatures =
-        collect_signatures(program, &mut declared, max_params, &mut method_signatures, &mut errors);
+        collect_signatures(program, &mut declared, machine.max_args, &mut method_signatures, &mut errors);
     collect_methods(program, &mut declared, &method_signatures, &mut errors);
     check_entry_point(program, &signatures, &declared, &mut errors);
 
@@ -353,7 +354,7 @@ pub fn check(program: &Program, max_params: usize) -> Result<Types> {
             expr_ty: vec![Ty::Int; program.node_count],
             fn_ret,
             fn_params,
-            table: TypeTable::default(),
+            table: TypeTable::new(machine.layout),
         },
         signatures: &signatures,
         declared,

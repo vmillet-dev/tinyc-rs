@@ -40,7 +40,7 @@ fn frame_of(allocation: &Allocation, frame_bytes: u32, leaf: bool) -> func::Fram
 
 fn compile_src(src: &str) -> String {
     let ast = parser::parse(&lexer::lex(src).unwrap()).unwrap();
-    let types = sema::check(&ast, 4).unwrap();
+    let types = sema::check(&ast, crate::target::Machine::TEST).unwrap();
     let ir = crate::ir::lower(&ast, &types).expect("the frames should fit");
     let backend = X64::windows();
     let allocations: Vec<Allocation> =
@@ -1349,7 +1349,7 @@ fn every_platform_passes_at_least_the_arguments_the_language_allows() {
             platform.name(),
             platform.abi().args.len()
         );
-        assert_eq!(X64::new(platform).register_file().max_args, MAX_ARGS);
+        assert_eq!(X64::new(platform).machine().max_args, MAX_ARGS);
     }
 }
 

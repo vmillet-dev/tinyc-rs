@@ -5,7 +5,7 @@ use crate::parser::parse;
 
 fn check_src(src: &str) -> Result<Types> {
     // Four is what every backend in the tree reports today.
-    check(&parse(&lex(src)?)?, 4)
+    check(&parse(&lex(src)?)?, crate::target::Machine::TEST)
 }
 
 /// Wrap statements in a `main`, so the tests about statements stay about

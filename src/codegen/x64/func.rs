@@ -10,7 +10,7 @@
 use crate::ast::{BinOp, CmpOp, Ty};
 use crate::codegen::{Allocation, Location, RegisterFile};
 use crate::ir::{
-    Block, DivGuards, Function, Instr, Num, Program, STR_HEADER, Terminator, VReg, Value,
+    Block, DivGuards, Function, Instr, Num, Program, Terminator, VReg, Value,
 };
 
 use super::asm::Asm;
@@ -24,7 +24,8 @@ use super::runtime::{
 use super::used::{Used, enum_table, text_label, variant_value, vtable_label};
 use super::{
     Abi, ENTRY_POINT, PAGE_BYTES, Platform, RAX, RDX, SCRATCH0, SCRATCH0_8, SCRATCH1, SCRATCH1_8,
-    XMM0, XMM1, float_setcc, half, jump_if_false, narrow, runtime_symbol, setcc, symbol,
+    STR_HEADER, XMM0, XMM1, float_setcc, half, jump_if_false, narrow, runtime_symbol, setcc,
+    symbol,
 };
 
 pub struct FnEmitter<'a, 'o> {

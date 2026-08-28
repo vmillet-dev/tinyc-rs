@@ -7,10 +7,11 @@ impl Lowering<'_> {
 
     /// The address of `array[index]`, in a fresh register.
     ///
-    /// One `Elem` and nothing else: the multiply-and-add that turns an index
-    /// into an offset is an addressing mode on x86, not arithmetic, so it is
-    /// not lowered as arithmetic and never picks up the overflow guard that
-    /// `Bin` carries.
+    /// One `Elem` and nothing else. The multiply-and-add that turns an index
+    /// into an offset is *addressing*, not arithmetic the program wrote, so it
+    /// is not lowered as arithmetic and never picks up the overflow guard `Bin`
+    /// carries — an index `sema` or the backend has already bounds-checked
+    /// cannot put the address anywhere but inside the object.
     pub(super) fn element_address(&mut self, array: &Expr, index: &Expr) -> VReg {
         let ty = self.types.of(array.id);
         let base = self.expr(array);

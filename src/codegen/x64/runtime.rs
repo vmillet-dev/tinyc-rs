@@ -15,11 +15,11 @@
 //! because on Windows they belong to the caller.
 
 use crate::ast::{ClassId, Ty, TypeTable};
-use crate::ir::{CHAR_BYTES, Runtime, STR_HEADER};
+use crate::ir::{CHAR_BYTES, Runtime};
 
 use super::asm::{Asm, StubFrame};
 use super::used::{Used, fixup_label};
-use super::{Abi, Platform, RAX, RDX, STDERR, half, runtime_symbol};
+use super::{Abi, Platform, RAX, RDX, STDERR, STR_HEADER, half, runtime_symbol};
 
 // -- where a program can stop ----------------------------------------------
 

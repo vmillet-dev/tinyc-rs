@@ -45,5 +45,5 @@ pub use liveness::{Liveness, VRegSet, liveness};
 pub use instr::{DivGuards, Instr, Runtime};
 pub use lower::lower;
 pub use value::{
-    BlockId, CHAR_BYTES, FuncId, MAX_FRAME_BYTES, Num, STR_HEADER, StrId, TextId, VReg, Value,
+    BlockId, CHAR_BYTES, FuncId, Num, StrId, TextId, VReg, Value,
 };

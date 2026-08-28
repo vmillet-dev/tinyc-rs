@@ -15,23 +15,6 @@ pub struct VReg(pub u32);
 /// other way round, and the reason UTF-8 stays at the edges of the language.
 pub const CHAR_BYTES: u32 = 4;
 
-/// Bytes of header in front of a string's characters, holding the count.
-pub const STR_HEADER: u32 = 8;
-
-/// Bytes of frame one function's locals may take.
-///
-/// The stack is the one resource a program is handed rather than asking for,
-/// and it is the smaller of the two machines that decides how much: a Windows
-/// thread gets a megabyte by default, a Linux one eight. A single function that
-/// wants a quarter of the smaller is not a program that will run and be
-/// unlucky — it is one that cannot recurse at all, and the compiler can see
-/// that before it emits a `sub rsp` no stack could satisfy.
-///
-/// This is [`crate::sema::MAX_OBJECT_BYTES`] one level up. That one bounds a
-/// single object; this one bounds what a function declares, which containment
-/// and repetition can push far past any single object's size.
-pub const MAX_FRAME_BYTES: u32 = 256 * 1024;
-
 /// Index into [`Program::strings`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StrId(pub u32);
@@ -74,11 +57,17 @@ pub enum Value {
 /// spilling, passing, returning and holding a float in an array are all the
 /// same code as for an `int`, and stay that way.
 ///
-/// What it costs instead is a `movq` at each end of every float instruction:
-/// the operands come out of general registers into the two vector registers the
-/// backend keeps as scratch, and the answer goes back. That is the trade, and
-/// it is written down here because nothing else in the compiler should have to
-/// rediscover it.
+/// What it costs instead is a move at each end of every float instruction: the
+/// operands come out of general registers into the two floating-point registers
+/// the backend keeps as scratch, and the answer goes back.
+///
+/// **This is the one portability decision in the IR.** Every other thing here
+/// describes what a machine must do and leaves how to it; this one has decided,
+/// on every machine's behalf, that floats live in general registers. Any target
+/// with its own floating-point registers pays the same two moves, and making
+/// them free is a second register class in [`crate::codegen::regalloc`] rather
+/// than a new backend module — see [`crate::target`], where what a second
+/// architecture would meet is written down.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Num {
     Int,
