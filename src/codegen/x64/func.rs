@@ -10,7 +10,7 @@
 use crate::ast::{BinOp, CmpOp, Ty};
 use crate::codegen::{Allocation, Location, RegisterFile};
 use crate::ir::{
-    Block, DivGuards, Function, Instr, Num, Program, STR_HEADER, Terminator, VReg, Value,
+    Block, DivGuards, Function, Instr, Num, Program, Terminator, VReg, Value,
 };
 
 use super::asm::Asm;
@@ -24,7 +24,8 @@ use super::runtime::{
 use super::used::{Used, enum_table, text_label, variant_value, vtable_label};
 use super::{
     Abi, ENTRY_POINT, PAGE_BYTES, Platform, RAX, RDX, SCRATCH0, SCRATCH0_8, SCRATCH1, SCRATCH1_8,
-    XMM0, XMM1, float_setcc, half, jump_if_false, narrow, runtime_symbol, setcc, symbol,
+    STR_HEADER, XMM0, XMM1, float_setcc, half, jump_if_false, narrow, runtime_symbol, setcc,
+    symbol,
 };
 
 pub struct FnEmitter<'a, 'o> {
@@ -159,7 +160,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
     /// is what works the limit out, and its own frame is taken before the
     /// answer exists. That is not a hole: `main` is entered exactly once, so
     /// the depth this guards against is the one thing it cannot reach. What
-    /// bounds *its* frame is [`crate::ir::MAX_FRAME_BYTES`], at compile time.
+    /// bounds *its* frame is the frame limit [`crate::target::Layout`] sets, at compile time.
     ///
     /// Checking in every other function rather than only in the ones that
     /// recurse is what keeps [`STACK_MARGIN`] small. What runs unchecked below
@@ -316,22 +317,22 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
         let next = index + 1;
         match &block.term {
             Terminator::Jump(target) => {
-                if target.0 as usize != next {
-                    let label = self.function.block(*target).label();
+                if target.block.0 as usize != next {
+                    let label = self.function.block(target.block).label();
                     self.asm.comment(&format!("jump {label}"));
                     self.asm.asm(&format!("jmp  .{label}"));
                 }
             }
             Terminator::Branch { cond, then_blk, else_blk } => {
-                let then_label = self.function.block(*then_blk).label();
-                let else_label = self.function.block(*else_blk).label();
+                let then_label = self.function.block(then_blk.block).label();
+                let else_label = self.function.block(else_blk.block).label();
 
                 // A folded condition settles the branch outright.
                 if let Value::Const(c) = cond {
                     let (taken, label) =
                         if *c != 0 { (then_blk, &then_label) } else { (else_blk, &else_label) };
                     self.asm.comment(&format!("branch always taken to {label}"));
-                    if taken.0 as usize != next {
+                    if taken.block.0 as usize != next {
                         self.asm.asm(&format!("jmp  .{label}"));
                     }
                     return;
@@ -355,7 +356,7 @@ impl<'a, 'o> FnEmitter<'a, 'o> {
                         self.asm.asm(&format!("jz   .{else_label}"));
                     }
                 }
-                if then_blk.0 as usize != next {
+                if then_blk.block.0 as usize != next {
                     self.asm.asm(&format!("jmp  .{then_label}"));
                 }
             }

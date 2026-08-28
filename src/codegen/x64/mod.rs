@@ -33,23 +33,13 @@
 //!
 //! ### Why nothing is allocatable and caller-saved
 //!
-//! `r8` and `r9` used to be handed out by the allocator. They are also
-//! argument registers, and that is a contradiction as soon as calls exist:
-//! setting up `f(x, y, z)` writes `r8`, which may be exactly where `z` is still
-//! waiting to be read. Solving that in general is the *parallel move* problem —
-//! you have to order the moves, and break cycles with a temporary.
-//!
-//! Withdrawing every argument register from the pool sidesteps it entirely.
-//! Every value the allocator hands out lives in a callee-saved register or a
-//! spill slot, so no source of an argument move can ever be an argument
-//! register, and the moves can be emitted in any order. The cost is a
-//! `push`/`pop` pair in the prologue for each register used, which is a good
-//! trade for a compiler this size.
-//!
-//! Linux pays more for it than Windows does: `rsi` and `rdi` are argument
-//! registers there, so the pool is five registers rather than seven and a
-//! crowded function spills sooner. The alternative is the parallel move
-//! problem, and it is not worth two registers.
+//! An argument register in the pool is a contradiction as soon as calls exist:
+//! setting up `f(x, y, z)` writes `r8`, which may be where `z` is still waiting
+//! to be read. Ordering those moves and breaking their cycles is the *parallel
+//! move* problem. Withdrawing every argument register sidesteps it — no source
+//! of an argument move can then be an argument register — at the cost of a
+//! `push`/`pop` pair per register used. Linux pays more: `rsi` and `rdi` are
+//! argument registers there, so the pool is five rather than seven.
 //!
 //! ## How many arguments a TinyC function may take
 //!
@@ -63,11 +53,10 @@
 //! ## Symbol names
 //!
 //! Every TinyC function is emitted as `tc$name`. Without that, `fn printf()`
-//! would define a label the `print` statement's own `call printf` then reaches
-//! — a program that compiles, links, runs, and silently does the wrong thing —
-//! and `fn str0()` would collide with a string literal's label outright.
-//! A `$` is a valid character in a NASM identifier and is not one TinyC's lexer
-//! will ever produce, so the two namespaces cannot meet.
+//! would define a label the `print` statement's own `call printf` then reaches,
+//! and `fn str0()` would collide with a string literal's label. A `$` is valid
+//! in a NASM identifier and is not one TinyC's lexer can produce, so the two
+//! namespaces cannot meet.
 //!
 //! `main` is the exception, and has to be: it is the name the C runtime startup
 //! calls, on both platforms. Nothing this backend generates is called `main`,
@@ -75,13 +64,11 @@
 //!
 //! ## The runtime
 //!
-//! Everything under `tc$rt$` is emitted here and called like an ordinary
-//! function. There are two families. The *aborts* are jumped to, never called,
-//! and never return — see `runtime::abort_stubs`. The rest are real routines,
-//! and they exist for one reason each: they are **loops**. Everything a string
-//! does in a straight line is emitted inline; joining two, comparing two,
-//! encoding one for output and writing a number out have to walk characters, so
-//! they become calls.
+//! Everything under `tc$rt$` is emitted here. The *aborts* are jumped to, never
+//! called, and never return — see `runtime::abort_stubs`. The rest exist for one
+//! reason each: they are **loops**. Everything a string does in a straight line
+//! is emitted inline; joining two, comparing two, encoding one for output and
+//! writing a number out have to walk characters, so they become calls.
 //!
 //! Their memory comes from an arena that never frees — see `runtime::arena`,
 //! which is also where the trade that buys it is written down.
@@ -103,6 +90,7 @@ mod tests;
 use crate::ast::{CmpOp, Ty};
 use crate::codegen::{Allocation, Backend, PhysReg, RegisterFile};
 use crate::ir::{Program, Runtime};
+use crate::target::{Layout, Machine};
 
 use asm::Asm;
 pub use linux::Linux;
@@ -151,6 +139,15 @@ const XMM1: &str = "xmm1";
 /// System V backend does not claim the six it could pass.
 pub const MAX_ARGS: usize = 4;
 
+/// Bytes of header in front of a string's characters, holding the count.
+///
+/// A word, and this backend's word is eight — the same eight
+/// [`Backend::machine`] reports as [`Layout::LP64`]. It lives here rather than
+/// beside the IR because only code that emits instructions ever reads it: the
+/// header is a `[p-8]` in an addressing mode, not something the lowering has an
+/// opinion about.
+const STR_HEADER: u32 = Layout::LP64.word;
+
 /// The registers a runtime routine may keep a value in across a call it makes.
 ///
 /// Callee-saved in *both* conventions and an argument register in *neither*, so
@@ -159,15 +156,10 @@ pub const MAX_ARGS: usize = 4;
 /// keeps a routine from quietly acquiring a register that only works on one of
 /// them.
 ///
-/// The rule the routine bodies follow, and the reason this list is short:
-///
-/// * `rax`, `rcx`, `rdx`, `r8`-`r11` are destroyed by a call on both platforms,
-///   so between calls they are free scratch — an argument register only matters
-///   at a call boundary, and `rcx` in the middle of a copy loop is not one.
-/// * `rsi` and `rdi` are **not** scratch. They are callee-saved on Windows,
-///   where the allocator hands them out, so a routine that clobbered one would
-///   corrupt a variable of whichever function called it.
-/// * Anything that has to survive a call goes in this list and is pushed.
+/// The list is short because `rax`, `rcx`, `rdx` and `r8`-`r11` are destroyed
+/// by a call on both platforms and so are free scratch between calls, while
+/// `rsi` and `rdi` are callee-saved on Windows and would corrupt a caller's
+/// variable. Anything that has to survive a call goes here and is pushed.
 const RUNTIME_LOCALS: [&str; 5] = ["rbx", "r12", "r13", "r14", "r15"];
 
 /// What every TinyC function's symbol starts with. See the module docs.
@@ -372,7 +364,6 @@ impl X64 {
                 // allocatable.
                 caller_saved: Vec::new(),
                 callee_saved: abi.allocatable.to_vec(),
-                max_args: MAX_ARGS,
             },
         }
     }
@@ -397,6 +388,13 @@ impl Backend for X64 {
 
     fn register_file(&self) -> &RegisterFile {
         &self.registers
+    }
+
+    fn machine(&self) -> Machine {
+        // Both platforms are x86-64: eight-byte words, and four arguments in
+        // registers because that is what the narrower of the two conventions
+        // passes — see [`MAX_ARGS`].
+        Machine { layout: Layout::LP64, max_args: MAX_ARGS }
     }
 
     fn emit(&self, program: &Program, allocations: &[Allocation]) -> String {

@@ -4,13 +4,19 @@
 //!
 //! ```text
 //! source text
-//!   -> lexer   -> tokens          (lexer.rs, token.rs)
-//!   -> parser  -> AST             (parser.rs, ast.rs)
-//!   -> sema    -> types           (sema.rs)
-//!   -> ir      -> three-address code (ir.rs)
-//!   -> opt     -> the same, with less of it (opt.rs)
-//!   -> codegen -> assembly        (codegen/)
+//!   -> lexer    -> tokens               (lexer.rs, token.rs)
+//!   -> parser   -> AST                  (parser.rs, ast.rs)
+//!   -> sema     -> types                (sema/)
+//!   -> ir       -> three-address code   (ir/)
+//!   -> ir::ssa  -> one definition per register
+//!   -> opt      -> the same graph, with less in it (opt/)
+//!   -> ir::ssa  -> back out of SSA, for the allocator
+//!   -> codegen  -> assembly             (codegen/)
 //! ```
+//!
+//! [`target::Machine`] is what the front end is told about the machine it is
+//! building for, so the sizes it lays out with are not one backend's answer
+//! written into nine places.
 //!
 //! Every stage reports failures as [`diag::Diagnostic`]s carrying a source span,
 //! which [`diag::SourceFile::render`] turns into a message with a line, a column
@@ -25,6 +31,7 @@ pub mod opt;
 pub mod parser;
 pub mod prim;
 pub mod sema;
+pub mod target;
 pub mod token;
 pub mod vocabulary;
 
@@ -70,6 +77,9 @@ pub struct Compiled {
 pub enum Stage<'a> {
     Tokens(&'a [token::Token]),
     Ast(&'a ast::Program),
+    /// The IR in SSA form, as the optimiser leaves it.
+    Ssa(&'a ir::Program),
+    /// The IR out of SSA form, as the backend is handed it.
     Ir(&'a ir::Program),
 }
 
@@ -126,15 +136,26 @@ pub fn compile_with(
         return Ok(None);
     }
 
-    // How many arguments fit in registers is the target's business, not the
-    // type checker's; the front end only asks.
-    let types = sema::check(&ast, backend.register_file().max_args)?;
-    // Optimised before it is shown, not after: `--emit ir` is meant to print
-    // what the backend is about to be handed, not a draft of it.
+    // How big a word is and how many arguments fit in registers are the
+    // target's business, not the type checker's; the front end only asks.
+    let types = sema::check(&ast, backend.machine())?;
     let mut ir = ir::lower(&ast, &types)?;
+
+    // SSA is the form the middle of the compiler works in: lowering does not
+    // produce it and the backend cannot read it, so it is put on here and taken
+    // off again below. Everything between the two is written knowing that a
+    // register has one definition.
+    ir::ssa::construct(&mut ir);
     if options.optimise {
         opt::optimise(&mut ir);
     }
+    if !observe(Stage::Ssa(&ir)) {
+        return Ok(None);
+    }
+    ir::ssa::destruct(&mut ir);
+
+    // Optimised before it is shown, not after: `--emit ir` is meant to print
+    // what the backend is about to be handed, not a draft of it.
     if !observe(Stage::Ir(&ir)) {
         return Ok(None);
     }

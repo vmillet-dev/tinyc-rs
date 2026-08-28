@@ -1,6 +1,7 @@
 //! The abstract syntax tree produced by the parser.
 
 use crate::diag::Span;
+use crate::target::Layout;
 pub use crate::prim::Prim;
 use crate::prim::primitives;
 
@@ -148,8 +149,11 @@ impl ClassInfo {
 /// `Ty` is deliberately small enough to be `Copy` and to compare as an integer,
 /// which means it cannot carry a name or an element type. This is where those
 /// live, and why naming a type takes a second argument.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TypeTable {
+    /// How big the machine being built for makes things. Every size below is
+    /// derived from it rather than written down again.
+    pub layout: Layout,
     pub enums: Vec<EnumInfo>,
     pub arrays: Vec<ArrayInfo>,
     /// What each list type holds. A list has no length in its type — that is
@@ -160,6 +164,17 @@ pub struct TypeTable {
 }
 
 impl TypeTable {
+    /// An empty table for a machine of this shape.
+    pub fn new(layout: Layout) -> TypeTable {
+        TypeTable {
+            layout,
+            enums: Vec::new(),
+            arrays: Vec::new(),
+            lists: Vec::new(),
+            classes: Vec::new(),
+        }
+    }
+
     pub fn array(&self, id: ArrayId) -> ArrayInfo {
         self.arrays[id.0 as usize]
     }
@@ -208,7 +223,7 @@ impl TypeTable {
                 let info = self.array(id);
                 info.len.saturating_mul(self.size_of(info.elem))
             }
-            _ => 8,
+            _ => self.layout.word,
         }
     }
 
@@ -592,7 +607,7 @@ impl Builtin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -677,7 +692,7 @@ impl BinOp {
 
 /// Comparison operators. These take two values of the same type and produce a
 /// `bool`, which is what `if` and the loops consume.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -1634,7 +1649,7 @@ mod tests {
     /// any syntax: `sema` is what fills one in from a program, and going
     /// through it would test that instead.
     fn table() -> (TypeTable, ClassId, ClassId, EnumId) {
-        let mut table = TypeTable::default();
+        let mut table = TypeTable::new(Layout::LP64);
         table.enums.push(EnumInfo {
             name: "Colour".to_string(),
             variants: ["Red", "Green"]
@@ -1708,7 +1723,7 @@ mod tests {
     #[test]
     fn the_aggregates_are_the_types_that_answer_no_equality() {
         // One enum whose variants carry nothing, and one whose first does.
-        let mut types = TypeTable::default();
+        let mut types = TypeTable::new(Layout::LP64);
         types.enums.push(EnumInfo {
             name: "Plain".to_string(),
             variants: vec![VariantInfo { name: "A".to_string(), payload: Vec::new() }],
@@ -2014,7 +2029,7 @@ mod tests {
             (Prim::Bool, Ty::Bool),
         ] {
             assert_eq!(prim.ty(), ty);
-            assert_eq!(prim.name(), ty.name(&TypeTable::default()));
+            assert_eq!(prim.name(), ty.name(&TypeTable::new(Layout::LP64)));
         }
     }
 

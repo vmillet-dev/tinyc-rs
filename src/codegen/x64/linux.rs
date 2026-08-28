@@ -190,7 +190,7 @@ mod tests {
 
     fn compile_src(src: &str) -> String {
         let ast = crate::parser::parse(&crate::lexer::lex(src).unwrap()).unwrap();
-        let types = crate::sema::check(&ast, super::super::MAX_ARGS).unwrap();
+        let types = crate::sema::check(&ast, crate::target::Machine::TEST).unwrap();
         let ir = crate::ir::lower(&ast, &types).expect("the frames should fit");
         let backend = X64::linux();
         let allocations: Vec<Allocation> =

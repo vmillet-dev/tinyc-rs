@@ -19,6 +19,7 @@ pub mod regalloc;
 pub mod x64;
 
 use crate::ir::Program;
+use crate::target::Machine;
 pub use regalloc::{Allocation, Location, PhysReg, RegisterFile};
 
 pub trait Backend {
@@ -27,6 +28,14 @@ pub trait Backend {
 
     /// The machine registers the allocator may hand out.
     fn register_file(&self) -> &RegisterFile;
+
+    /// What the front end has to be told before it lays anything out: how big a
+    /// word is, and how many arguments arrive in registers.
+    ///
+    /// Separate from [`Backend::register_file`] because it is answered much
+    /// earlier — `sema` lays a class out with it, long before anything knows
+    /// which register anything lands in.
+    fn machine(&self) -> Machine;
 
     /// Produce assembly text for an allocated program: one [`Allocation`] per
     /// function, in the same order as [`Program::functions`].
@@ -112,7 +121,7 @@ mod tests {
         let tokens = crate::lexer::lex(src).expect("the source should lex");
         let ast = crate::parser::parse(&tokens).expect("the source should parse");
         let backend = backend_for(Target::X86_64Windows);
-        let types = crate::sema::check(&ast, backend.register_file().max_args)
+        let types = crate::sema::check(&ast, backend.machine())
             .expect("the source should check");
         crate::ir::lower(&ast, &types).expect("the frames should fit")
     }
@@ -155,7 +164,7 @@ mod tests {
         let registers = backend.register_file();
 
         assert!(!backend.name().is_empty());
-        assert!(registers.max_args > 0, "a target has to pass at least one argument");
+    
         assert!(
             !registers.caller_saved.is_empty() || !registers.callee_saved.is_empty(),
             "the allocator needs something to hand out"

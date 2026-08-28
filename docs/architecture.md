@@ -33,9 +33,11 @@ Each arrow is a module, and each stage can be inspected on its own with
 |-------|--------|----------|
 | lexing | [`src/lexer.rs`](../src/lexer.rs), [`src/token.rs`](../src/token.rs) | tokens with source spans |
 | parsing | [`src/parser.rs`](../src/parser.rs), [`src/ast.rs`](../src/ast.rs) | an AST |
-| type checking | [`src/sema.rs`](../src/sema.rs) | the type of every expression |
-| lowering | [`src/ir.rs`](../src/ir.rs) | a control flow graph of three-address code |
-| optimisation | [`src/opt.rs`](../src/opt.rs) | the same graph, with less in it |
+| type checking | [`src/sema/`](../src/sema) | the type of every expression |
+| lowering | [`src/ir/lower/`](../src/ir/lower) | a control flow graph of three-address code |
+| SSA construction | [`src/ir/ssa/`](../src/ir/ssa) | one definition per virtual register |
+| optimisation | [`src/opt/`](../src/opt) | the same graph, with less in it |
+| SSA destruction | [`src/ir/ssa/`](../src/ir/ssa) | a graph the allocator can read |
 | register allocation | [`src/codegen/regalloc.rs`](../src/codegen/regalloc.rs) | a machine register or stack slot per value |
 | emission | [`src/codegen/x64/`](../src/codegen/x64/) | NASM assembly |
 
@@ -76,7 +78,7 @@ Options:
 | Flag | Meaning |
 |------|---------|
 | `-o, --output <FILE>` | where to write the assembly (default: input path with `.asm`) |
-| `--emit tokens\|ast\|ir\|asm` | stop after a stage and print its result |
+| `--emit tokens\|ast\|ssa\|ir\|asm` | stop after a stage and print its result |
 | `--target <NAME>` | `x86_64-windows` or `x86_64-linux` (default: this machine's) |
 | `--dump-regalloc` | print live intervals and register assignments |
 
@@ -624,7 +626,7 @@ writes one value, so it refuses an array.
 ### What arrays changed underneath
 
 **The IR learned about memory.** Until now every value lived in a virtual
-register or in a spill slot the backend owned, and nothing in `ir.rs` named a
+register or in a spill slot the backend owned, and nothing in `ir` named a
 *place*. Arrays add four instructions that do:
 
 ```
@@ -764,7 +766,7 @@ string value, which would stop a string fitting in a register, or knowing that
 nothing else points at `s`.
 
 **So the compiler works out where nothing else does.** `owned_strings` in
-`ir.rs` asks one narrow question per function, and asks it the cautious way
+`ir` asks one narrow question per function, and asks it the cautious way
 round — a name is owned only if it can be *proved* to be, and anything the
 analysis does not recognise means no. A string local is owned when:
 
@@ -1657,9 +1659,11 @@ join3:
   6  print bool %ok
 ```
 
-Writing one register from two blocks is only expressible because the IR is not
-in SSA form — the same property that let `if (c) { n = 1; } else { n = 2; }`
-work without phi nodes.
+Writing one register from two blocks is expressible because **lowering** emits
+a register per variable rather than per definition — the same property that
+lets `if (c) { n = 1; } else { n = 2; }` need nothing at the join. The stage
+after it turns those two writes into a block parameter; see
+[SSA](#ssa-one-definition-per-register).
 
 Two details earn their keep:
 
@@ -1694,8 +1698,10 @@ every register had exactly one definition. Two things broke at once:
 
 * **Variables need one home.** After `if (c) { n = 1; } else { n = 2; }` there is
   no single register that holds `n` unless both branches write the same one.
-  Resolving that in SSA needs phi nodes; instead a variable now keeps one
-  register for its whole life and may be written many times.
+  So lowering gives a variable one register for its whole life and writes it as
+  often as the program assigns it. [SSA](#ssa-one-definition-per-register)
+  splits them apart again immediately afterwards, which is where every question
+  about a value gets answered.
 * **Live ranges need real analysis.** A single forward pass cannot see that a
   value assigned at the bottom of a loop is read again at the top. The allocator
   now computes live-in/live-out sets per block by iterating to a fixpoint.
@@ -1858,14 +1864,102 @@ order. The cost is a `push`/`pop` pair per register used, which is a good trade
 at this size — and it is the kind of decision a register allocator exists to
 make explicit.
 
+## SSA: one definition per register
+
+Lowering gives a variable **one** virtual register for its whole life and writes
+it as often as the program assigns it. That is the smallest thing that works
+across a join — `if (c) { n = 1; } else { n = 2; }` needs nothing at the meet if
+both arms write `%n` — and it makes every question about a value unanswerable.
+`%n` here and `%n` there need not hold the same thing, so nothing can be said
+about `%n`, only about `%n` *at a point*, which takes one dataflow analysis to
+find out and another to use.
+
+`ir::ssa::construct` rewrites each function so that **every virtual register is
+written exactly once**. Where two definitions meet, the block they meet in grows
+a *parameter*, and each edge into it carries the definition that reaches along
+that edge:
+
+```
+$ cargo run -- examples/control_flow.tc --emit ssa --no-optimise
+...
+done9:
+ 19  %total = const 0
+ 20  %j = const 1
+ 21  jump loop10(%total, %j)
+loop10(%total.1, %j.1):
+ 22  %t7 = cmp <= %j.1, 5
+ 23  branch %t7 ? body11 : done12
+body11:
+ 24  %total.2 = add %total.1, %j.1
+ 25  %j.2 = add %j.1, 1
+ 26  jump loop10(%total.2, %j.2)
+```
+
+A parameter rather than a phi node. The two are the same idea; carrying the
+values on the **edge** is what keeps them in step with the graph, since a pass
+that redirects a jump moves its arguments with it and one that drops a block
+drops its arguments with it. A phi's predecessor list has to be resynchronised
+by hand every time `prune_unreachable` renumbers.
+
+### Where the parameters go
+
+At the **iterated dominance frontier** of a variable's definitions — the one
+place a value written on one path can meet a value written on another.
+`ir::ssa::dom` computes dominators by Cooper, Harvey and Kennedy's iterative
+algorithm, and the frontier from them. Two refinements keep the result small:
+
+* Only variables written in more than one block are considered at all. A
+  temporary is written once, and one definition cannot meet another. This is why
+  `%t2` above is still `%t2` and not `%t2.1`: renaming everything would have
+  changed every dump in the test suite for no reason a reader could see.
+* A parameter is placed only where the variable is **live**. Without that, a
+  value computed inside a loop grows a parameter on a header it is not live on,
+  and the entry edge has to hand it a value that does not exist yet.
+
+Renaming then walks the dominator tree with a stack of the names each variable
+currently goes by. The stack *is* dominance: a definition is pushed when its
+block is entered and popped when that block's subtree is left, so whatever is on
+top is the definition reaching there.
+
+### And back out again
+
+Machines have no block parameters, so `ir::ssa::destruct` turns each edge's
+arguments into copies at the end of the block the edge leaves, before the
+register allocator ever sees the function. Two things it has to get right:
+
+* **The copies on one edge happen at once.** A block whose parameters are
+  `(%a, %b)` reached with `(%b, %a)` is a swap, and writing `%a = %b` first
+  loses `%b`. A source that is also a destination is read into a register of its
+  own before anything is written.
+* **An edge leaving a block by one of several exits gets a block of its own.**
+  Copies at the end of a branching block would run on the other edge too. It
+  also keeps them out of the block where the backend fuses the comparison into
+  the jump.
+
+### What it costs, and why it does not
+
+Left there, those copies are a `mov` each — `%i.1 = copy %i.2` at the bottom of
+a loop body is the counter being handed back to the header, on every iteration.
+Measured across `examples/`, going into SSA and out again *added* 177
+instructions to the 6800 the compiler emitted before any of this.
+
+`ir::coalesce` gives the two ends of a copy one register wherever they are never
+both live, from an interference graph built by walking each block backwards from
+what leaves it. The rule that makes it work is one line in that walk: at
+`%a = copy %b`, `%a` is written and `%b` read, so the two interfere only if `%b`
+is wanted again *after* the copy. With it, the same examples come out at 6785 —
+below where they started, because the passes SSA unlocked more than pay for what
+is left.
+
 ## What gets optimised
 
-Six things, each small enough to read in one sitting, and each visible in the
-output of some `--emit`. Two happen while the tree is being lowered, two are
-passes over the finished graph, and two belong to the backend.
+Eight things, each small enough to read in one sitting, and each visible in the
+output of some `--emit`. Two happen while the tree is being lowered, four are
+passes over the graph in [SSA form](#ssa-one-definition-per-register), and two
+belong to the backend.
 
 `--no-optimise` hands the backend the IR exactly as lowering produced it, which
-makes the middle two readable as a diff:
+makes the four readable as a diff:
 
 ```bash
 cargo run -- examples/arith.tc --emit ir --no-optimise   # the arithmetic
@@ -1880,7 +1974,7 @@ not change what the program does — including where it stops.**
 That is a platitude in most languages and a real constraint in this one, because
 TinyC stops rather than answer wrongly, so *an overflow is observable
 behaviour*. Two things follow that a language with wrapping arithmetic never has
-to think about, and they are the reason `src/opt.rs` is the shape it is:
+to think about, and they are the reason `src/opt/` is the shape it is:
 
 * **Folding is allowed exactly when the answer exists.** `ir::fold_bin` is the
   same function lowering uses and answers `None` for anything the machine would
@@ -1904,13 +1998,18 @@ picks up.
 and renumbers the `FuncId`s the survivors call each other by. A helper nobody
 calls costs a label, a prologue and an epilogue otherwise.
 
-### The two passes
+### The four passes
 
-**Constant propagation** is a forward dataflow analysis over the control flow
-graph: for each block, what is known on entry, met over its predecessors and
-carried through its instructions. Where lowering asked "is this operand a
-literal", the pass asks "what reaches here", which is a different question as
-soon as a variable exists:
+All four are written knowing that a register has exactly one definition. They
+run in a loop, because each makes work for the others: a folded branch leaves a
+block unreachable, whose disappearance leaves a block parameter with one
+incoming value, whose removal makes a variable constant.
+
+**Sparse conditional constant propagation** answers two questions at once —
+what each register is, and which edges can be taken — because neither can be
+answered alone. A block nothing can reach still hands its successors a value,
+and that value has no business making a variable look unknown; and a variable is
+only constant once the block that disagreed has been ruled out.
 
 ```
 int a = 6;  int b = 7;  int c = 2;  println(a + b * c);
@@ -1918,33 +2017,60 @@ int a = 6;  int b = 7;  int c = 2;  println(a + b * c);
 
 ```text
 --no-optimise            optimised
-  %a = const 6             print int 20
-  %b = const 7             print text0 "\n"
-  %c = const 2             return
+  %a = const 6             println int 20
+  %b = const 7             return
+  %c = const 2
   %t3 = mul %b, %c
   %t4 = add %a, %t3
-  print int %t4
+  println int %t4
 ```
 
-A branch whose condition it settles becomes a jump, and a block nothing can
-reach any more goes away — through the same `prune_unreachable` lowering
-already used. That is what makes the pass worth running twice: a folded branch
-can leave a variable constant on the only path that is left.
+The lattice is three deep — unreached, one known value, no longer one value — so
+the rounds run out. Starting at *unreached* rather than *unknown* is what makes
+a loop answerable: the back edge says nothing on the first round and contributes
+properly once the body has been walked.
 
-Every block starts out knowing *nothing* rather than knowing everything is
-unknown, which is what makes a loop answerable: the back edge contributes
-nothing on the first round and properly once the body has been walked. The
-lattice is three deep — unreached, one known value, no longer one value — so
-the rounds run out.
+Executability is tracked per **edge**, not per block. A block four edges lead
+into has four answers to give its parameters and they arrive one at a time;
+taking "this block can run" as the signal settles a parameter on whichever arm
+was shown executable first and never looks at the rest — which is a `match`
+returning its first arm's value whatever it matched. That was a real
+miscompilation, and `tests/execution.rs` is what caught it.
 
-**Dead code elimination** removes every instruction whose destination nothing in
-the function reads and which cannot fail, is not a call, and is not a
-parameter's arrival. Read means *anywhere*, not "after this point": a variable
-keeps one register for its whole life and may be written many times, so a write
-nothing reads before the next one is dead and is kept anyway. Seeing that needs
-the backward liveness the register allocator computes, and this pass does not
-have it. Every dead *temporary* is caught regardless, because a temporary is
-written exactly once.
+**Copy propagation** replaces every use of `%b` in `%b = copy %a` with `%a`.
+Out of SSA that was not safe at all — `%a` could be written between the copy and
+the use — which is why nothing did it before. The same pass drops a block
+parameter every edge hands the *same* value: it is not a choice, so it is not a
+parameter. An edge handing the parameter back to itself does not count, which is
+what a loop variable nothing in the body touches looks like.
+
+**Global value numbering** replaces a computation with a dominating identical
+one. Two instructions are the same computation when they are the same operation
+on the same operands, which is a question about registers only because SSA makes
+a register stand for a value. Dominance is the whole of the safety argument, and
+it is what makes this sound for an operation that can *fail*: reusing an earlier
+`mul %a, %b` is fine precisely because the earlier one is on every path here — if
+it was going to overflow, the program already stopped. That is also why this
+pass removes the redundant instruction itself rather than leaving it to the
+eliminator below, which would have to keep it.
+
+Anything that reads memory is left alone: `load`, `loadchar` and `count` answer
+whatever was written last, and nothing here tracks what a `store` or a call did.
+
+**Dead code elimination** marks from the instructions that matter *whatever* is
+read of them — the ones with an effect, the ones that can fail, a parameter's
+arrival — back along the operands feeding them, and sweeps the rest. "Read" used
+to mean *anywhere in the function*, which caught every dead temporary and no
+dead assignment at all. In SSA the write **is** the register:
+
+```
+int n = expensive();  n = 0;  println(n);
+```
+
+now loses the first assignment, keeping the call — which reads a line, and an
+unread answer does not undo that. A block parameter is swept the same way, and
+takes the arguments every edge hands it out with it, which is how a value only a
+dead parameter kept alive becomes dead in turn.
 
 ### The index that is deliberately left alone
 
@@ -1972,9 +2098,9 @@ Across `examples/`, counting instructions:
 
 | | IR | assembly |
 |---|---|---|
-| `arith.tc` | 47 → 21 | 251 → 69 |
-| `control_flow.tc` | 112 → 90 | 299 → 238 |
-| every example | 1483 → 1402 | 6814 → 6509 |
+| `arith.tc` | 37 → 11 | 181 → 34 |
+| `control_flow.tc` | 101 → 79 | 235 → 168 |
+| every example | 1751 → 1582 | 7765 → 7374 |
 
 The totals are modest because most of an example's assembly is the runtime it
 carries — the arena, the UTF-8 encoder, the list routines — and no pass here
@@ -1982,10 +2108,10 @@ touches those. Where a program's own code is arithmetic, the reduction is what
 `arith.tc` shows.
 
 Nothing here helps a *loop*, which is where a real program spends its time.
-Loop-invariant hoisting, strength reduction and common subexpression
-elimination are the obvious next passes, and the infrastructure they need now
-exists: a pass is a function from a `Function` to a changed one, and the rule it
-must obey is written above.
+Loop-invariant hoisting and strength reduction are the obvious next passes, and
+SSA is most of what they need: a value defined outside a loop is now a register
+with one definition, so asking whether it is invariant is asking where that
+definition is.
 
 **Compare-and-branch fusion, in the backend.** x86 compares by setting flags and
 `jcc` reads them straight back, so a comparison whose only reader is the branch
@@ -2149,7 +2275,7 @@ error: `main` needs too much stack
      reserved for the whole call; `int[]` is what holds a quantity the stack cannot
 ```
 
-`MAX_FRAME_BYTES` is a quarter of the smallest stack a TinyC program is given —
+`Layout::max_frame` is a quarter of the smallest stack a TinyC program is given —
 a Windows thread's megabyte. It is `MAX_OBJECT_BYTES` one level up: that one
 bounds a single object, this one bounds what a whole function declares, which
 copying and repetition push far past any single object's size.
@@ -2261,7 +2387,7 @@ could be a quarter of a megabyte on its own.
 The entry point is the exception, and cannot be otherwise: it is what works the
 limit out, and its own frame is taken before the answer exists. That is not a
 hole, because `main` is entered exactly once — the depth this guards against is
-the one thing it cannot reach — and `MAX_FRAME_BYTES` is what bounds its frame.
+the one thing it cannot reach — and `Layout::max_frame` is what bounds its frame.
 
 ### Where the limit comes from
 
@@ -2333,7 +2459,7 @@ and each one is a real question rather than a copy of the row:
 | Where | What it asks |
 |---|---|
 | `Ty::name` in `ast.rs` | is it one of the types the language spells? |
-| `domain_of` in `sema.rs` | may a `match` ask about one? |
+| `domain_of` in `sema` | may a `match` ask about one? |
 | `format_index` in `codegen/x64/mod.rs` | which `printf` format writes it? |
 
 Then `cargo run --bin export-vocabulary`, because the editor reads a checked-in

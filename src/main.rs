@@ -49,6 +49,9 @@ struct Cli {
 enum Emit {
     Tokens,
     Ast,
+    /// The IR in SSA form: one definition per register, and a block parameter
+    /// wherever two of them meet.
+    Ssa,
     Ir,
     Asm,
 }
@@ -110,7 +113,7 @@ fn run(cli: &Cli) -> Result<(), String> {
             print!("{}", ast::dump(ast));
             false
         }
-        (Stage::Ir(ir), Emit::Ir) => {
+        (Stage::Ssa(ir), Emit::Ssa) | (Stage::Ir(ir), Emit::Ir) => {
             print!("{}", ir.dump());
             false
         }
