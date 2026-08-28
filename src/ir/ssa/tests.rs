@@ -153,9 +153,15 @@ fn a_temporary_written_once_keeps_the_name_it_had() {
 #[test]
 fn arguments_become_copies_in_the_block_the_edge_leaves() {
     let printed = back("int n = 1;\nif (n < 5) {\n  n = n + 1;\n} else {\n  n = n + 2;\n}\nprintln(n);");
-    assert!(printed.contains("%n.1 = copy %n.3"), "{printed}");
-    assert!(printed.contains("%n.1 = copy %n.2"), "{printed}");
     assert!(!printed.contains('('), "a target kept its arguments:\n{printed}");
+    // Each arm writes the value the join reads, in the block it leaves — which
+    // after coalescing is the arm's own arithmetic writing straight into it,
+    // and not a `mov` afterwards.
+    assert_eq!(printed.matches("copy").count(), 0, "{printed}");
+    assert_eq!(printed.matches(" add ").count(), 2, "{printed}");
+    let joined = printed.lines().find(|l| l.contains("println")).expect("the print");
+    let register = joined.split_whitespace().last().expect("its operand");
+    assert_eq!(printed.matches(&format!("{register} = add")).count(), 2, "{printed}");
 }
 
 #[test]

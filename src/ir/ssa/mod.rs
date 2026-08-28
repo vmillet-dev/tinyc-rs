@@ -59,6 +59,7 @@ use dom::Dominators;
 use names::Names;
 
 use super::{
+    coalesce,
     Block, BlockId, BlockKind, Function, Instr, Program, Target, Terminator, VReg, Value, liveness,
 };
 
@@ -67,6 +68,14 @@ pub fn construct(program: &mut Program) {
     for function in &mut program.functions {
         construct_function(function);
     }
+}
+
+/// The dominator tree of one function, as the children of each block.
+///
+/// Handed out because a pass that replaces one computation with an earlier one
+/// is only sound where the earlier one dominates it — see [`crate::opt::gvn`].
+pub fn dominator_children(function: &Function) -> Vec<Vec<BlockId>> {
+    Dominators::of(function).children()
 }
 
 /// Take every function back out of SSA form.
@@ -248,7 +257,7 @@ fn substitute(value: &mut Value, reaching: &[Vec<VReg>], original: usize) {
     }
 }
 
-fn set_def(instr: &mut Instr, to: VReg) {
+pub(super) fn set_def(instr: &mut Instr, to: VReg) {
     match instr {
         Instr::Const { dst, .. }
         | Instr::StrAddr { dst, .. }
@@ -310,6 +319,11 @@ fn destruct_function(function: &mut Function) {
         }
     }
     function.vreg_names = names.finish();
+
+    // Most of the copies just emitted are between two names for one variable,
+    // and cost a `mov` each if left as written. This is where the price of the
+    // form is paid back.
+    coalesce::copies(function);
 }
 
 /// Give every argument-carrying edge that leaves a block by one of several

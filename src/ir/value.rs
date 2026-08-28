@@ -79,7 +79,7 @@ pub enum Value {
 /// backend keeps as scratch, and the answer goes back. That is the trade, and
 /// it is written down here because nothing else in the compiler should have to
 /// rediscover it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Num {
     Int,
     Float,

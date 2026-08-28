@@ -24,6 +24,7 @@
 //! arithmetic on a word have to be told which — see [`Num`].
 
 mod block;
+mod coalesce;
 mod liveness;
 pub mod ssa;
 mod dump;

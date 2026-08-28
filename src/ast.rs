@@ -592,7 +592,7 @@ impl Builtin {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NodeId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
     Add,
     Sub,
@@ -677,7 +677,7 @@ impl BinOp {
 
 /// Comparison operators. These take two values of the same type and produce a
 /// `bool`, which is what `if` and the loops consume.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Eq,
     Ne,
